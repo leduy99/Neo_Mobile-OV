@@ -1,0 +1,50 @@
+bridge:
+  smolvlm2_ckpt_path: checkpoints/smolvlm2_500m/smolvlm2_500m.pt
+  adapter_ckpt_dir:
+  tokenizer_model_id: HuggingFaceTB/SmolVLM-Instruct
+  max_length: 512
+  sana_model_max_length: 300
+  caption_channels: 2304
+  projector_type: mcp_lexical_gated
+  mcp_num_fuse_layers: 2
+  mcp_use_refine: true
+  mcp_refine_kernel_size: 3
+  mcp_lexical_gate_init: 0.2
+  strict_sana_parity_text_path: true
+  strict_sana_use_full_text_window: true
+  strict_sana_token_select_strategy: head_uniform_tail
+  strict_sana_head_tokens: 96
+  strict_sana_tail_tokens: 96
+  fail_fast_mask: true
+
+backend:
+  name: mobile_o_sana_0_5b
+  model_path: /share_4/users/duy/project/unified_video/Mobile-O/checkpoints/Mobile-O-0.5B
+  dtype: bf16
+
+motion:
+  latent_channels: 16
+  text_dim: 2304
+  hidden_dim: 512
+  temporal_len: 21
+  num_blocks: 10
+  mlp_ratio: 4
+  temporal_kernel: 3
+  temporal_dilation_cycle: [1, 2, 4]
+
+data:
+  latent_manifest: data/lmw_smoke/manifest.csv
+  output_dir: output/mobile_o_sana_0_5b_lmw_projection
+  frame_num: 81
+  height: 480
+  width: 832
+
+train:
+  batch_size: 1
+  lr: 0.0001
+  total_steps: 1000
+  motion_weight: 0.5
+  accel_weight: 0.0
+  log_every: 10
+  save_every: 500
+  dtype: bf16
