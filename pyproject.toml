@@ -11,6 +11,7 @@ dependencies = [
   "accelerate",
   "diffusers>=0.34.0",
   "einops",
+  "hf-xet",
   "opencv-python",
   "pandas",
   "pillow",
