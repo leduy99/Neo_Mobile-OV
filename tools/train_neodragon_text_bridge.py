@@ -266,6 +266,12 @@ def main() -> None:
     parser.add_argument("--deepspeed-zero-stage", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--clip-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--keep-step-checkpoints",
+        action="store_true",
+        default=env_flag("KEEP_STEP_CHECKPOINTS", False),
+        help="Also save neodragon_text_bridge_stepXXXXXX.pt at each save interval.",
+    )
     args = parser.parse_args()
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -415,27 +421,27 @@ def main() -> None:
         if step % args.save_every == 0 or step == args.steps:
             state = full_state_dict(bridge_model, args.parallel)
             if ctx.is_main:
-                torch.save(
-                    {
-                        "step": step,
-                        "bridge": state,
-                        "config": cfg,
-                        "args": vars(args),
-                        "history": history,
-                        "target": "neodragon_dit_condition_direct",
-                        "parallel": {
-                            "backend": args.parallel,
-                            "world_size": ctx.world_size,
-                            "deepspeed_zero_stage": args.deepspeed_zero_stage if args.parallel == "deepspeed" else None,
-                        },
-                        "shapes": {
-                            "prompt_embeds": [None, 128, 1536],
-                            "prompt_mask": [None, 128],
-                            "pooled_prompt_embeds": [None, 2048],
-                        },
+                payload = {
+                    "step": step,
+                    "bridge": state,
+                    "config": cfg,
+                    "args": vars(args),
+                    "history": history,
+                    "target": "neodragon_dit_condition_direct",
+                    "parallel": {
+                        "backend": args.parallel,
+                        "world_size": ctx.world_size,
+                        "deepspeed_zero_stage": args.deepspeed_zero_stage if args.parallel == "deepspeed" else None,
                     },
-                    out_dir / "neodragon_text_bridge_latest.pt",
-                )
+                    "shapes": {
+                        "prompt_embeds": [None, 128, 1536],
+                        "prompt_mask": [None, 128],
+                        "pooled_prompt_embeds": [None, 2048],
+                    },
+                }
+                torch.save(payload, out_dir / "neodragon_text_bridge_latest.pt")
+                if args.keep_step_checkpoints:
+                    torch.save(payload, out_dir / f"neodragon_text_bridge_step{step:06d}.pt")
                 (out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
             barrier()
 
