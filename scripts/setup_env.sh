@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ENV_NAME="${ENV_NAME:-new_mobile_ov}"
+ENV_NAME="${ENV_NAME:-neo_mobileov}"
 CONDA_SH="${CONDA_SH:-/share_0/conda/etc/profile.d/conda.sh}"
 
 source "$CONDA_SH"

@@ -9,7 +9,7 @@ description = "New Mobile-OV research branch with current Mobile-OV and Mobile-O
 requires-python = ">=3.10"
 dependencies = [
   "accelerate",
-  "diffusers>=0.34.0",
+  "diffusers>=0.32.2,<0.35",
   "einops",
   "hf-xet",
   "opencv-python",

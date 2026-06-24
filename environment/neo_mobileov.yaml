@@ -124,7 +124,6 @@ dependencies:
       - openai==1.65.4
       - opencv-python==4.11.0.86
       - opencv-python-headless==4.11.0.86
-      - openvid-dataops==0.1.0
       - orjson==3.10.15
       - packaging==24.2
       - pandas==2.2.3
