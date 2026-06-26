@@ -28,45 +28,21 @@ fi
 cd "${ROOT}"
 mkdir -p logs output/cache output/neodragon_text_bridge_recaption_distill checkpoints
 
-if [[ -z "${CONDA_ENV:-}" ]]; then
-  if [[ -d "/proj/cvl/users/x_fahkh2/envs/neo_mobileov" ]]; then
-    CONDA_ENV="/proj/cvl/users/x_fahkh2/envs/neo_mobileov"
-  elif [[ -d "/proj/cvl/users/x_fahkh2/envs/mobileov" ]]; then
-    CONDA_ENV="/proj/cvl/users/x_fahkh2/envs/mobileov"
-  elif [[ -d "/share_4/users/duy/.conda/envs/neo_mobileov" ]]; then
-    CONDA_ENV="/share_4/users/duy/.conda/envs/neo_mobileov"
-  else
-    CONDA_ENV="neo_mobileov"
-  fi
-fi
-
-if [[ -f "${CONDA_SH:-}" ]]; then
-  source "${CONDA_SH}"
-  conda activate "${CONDA_ENV}"
-elif [[ -f "/share_0/conda/etc/profile.d/conda.sh" ]]; then
-  source /share_0/conda/etc/profile.d/conda.sh
-  conda activate "${CONDA_ENV}"
-elif [[ -f "/software/sse/easybuild/prefix/software/Anaconda3/2021.05-nsc1/etc/profile.d/conda.sh" ]]; then
-  source /software/sse/easybuild/prefix/software/Anaconda3/2021.05-nsc1/etc/profile.d/conda.sh
-  conda activate "${CONDA_ENV}"
-elif [[ -x "${CONDA_ENV}/bin/python" ]]; then
-  export PATH="${CONDA_ENV}/bin:${PATH}"
-else
-  echo "Could not activate CONDA_ENV=${CONDA_ENV}" >&2
-  echo "Set CONDA_ENV=/path/to/env or CONDA_SH=/path/to/conda.sh before sbatch." >&2
+# Keep env handling intentionally simple for SLURM batch shells.
+# Do not source conda.sh here: some cluster conda scripts read PS1 and fail
+# under `set -u` with "PS1: unbound variable".
+CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
+if [[ ! -x "${CONDA_ENV}/bin/python" ]]; then
+  echo "Missing python at CONDA_ENV=${CONDA_ENV}" >&2
+  echo "Create it first or submit with CONDA_ENV=/path/to/env." >&2
   exit 1
 fi
-
-if [[ -d "${CONDA_ENV}/bin" ]]; then
-  export PATH="${CONDA_ENV}/bin:${PATH}"
-fi
-PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
-TORCHRUN_BIN="${TORCHRUN_BIN:-$(command -v torchrun)}"
-if [[ -x "${CONDA_ENV}/bin/python" ]]; then
-  PYTHON_BIN="${CONDA_ENV}/bin/python"
-fi
-if [[ -x "${CONDA_ENV}/bin/torchrun" ]]; then
-  TORCHRUN_BIN="${CONDA_ENV}/bin/torchrun"
+export PATH="${CONDA_ENV}/bin:${PATH}"
+PYTHON_BIN="${PYTHON_BIN:-${CONDA_ENV}/bin/python}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-${CONDA_ENV}/bin/torchrun}"
+if [[ ! -x "${TORCHRUN_BIN}" ]]; then
+  echo "Missing torchrun at ${TORCHRUN_BIN}" >&2
+  exit 1
 fi
 
 RECAPTION_CSV="${RECAPTION_CSV:-/proj/cvl/users/x_fahkh2/Mobile-OV_Alpha/download_data/data/openvid/manifests/openvid_all_recaptions.csv}"
@@ -168,11 +144,15 @@ echo "Caption aug: enabled=${MOBILEOV_CAPTION_AUG} columns=${MOBILEOV_CAPTION_AU
 date
 nvidia-smi || true
 
-echo "Preparing checkpoints with GPU heartbeat enabled..."
-start_gpu_heartbeat
-"${PYTHON_BIN}" tools/prepare_checkpoints.py --config "${CONFIG}"
-stop_gpu_heartbeat
-echo "Checkpoint preparation finished."
+if [[ "${PREPARE_CHECKPOINTS:-1}" != "0" ]]; then
+  echo "Preparing checkpoints with GPU heartbeat enabled..."
+  start_gpu_heartbeat
+  "${PYTHON_BIN}" tools/prepare_checkpoints.py --config "${CONFIG}"
+  stop_gpu_heartbeat
+  echo "Checkpoint preparation finished."
+else
+  echo "Skipping checkpoint preparation because PREPARE_CHECKPOINTS=0."
+fi
 
 "${TORCHRUN_BIN}" \
   --standalone \
