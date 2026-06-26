@@ -16,12 +16,11 @@ set -euo pipefail
 #   sbatch scripts/train_neodragon_text_bridge_recaption_1node8gpu_200k.sbatch
 
 CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
-PYTHON_BIN="${PYTHON_BIN:-${CONDA_ENV}/bin/python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-${CONDA_ENV}/bin/torchrun}"
 RECAPTION_CSV="${RECAPTION_CSV:-/proj/cvl/users/x_fahkh2/Mobile-OV_Alpha/download_data/data/openvid/manifests/openvid_all_recaptions.csv}"
 
 CONFIG="${CONFIG:-configs/mobile_ov_neodragon.yaml}"
-OUT="${OUT:-output/neodragon_text_bridge_recaption_distill/1node8gpu_200k_${SLURM_JOB_ID:-local}/bridge}"
+OUT="${OUT:-output/neo_bridge_8gpu_200k/${SLURM_JOB_ID:-local}}"
 STEPS="${STEPS:-200000}"
 SAVE_EVERY="${SAVE_EVERY:-10000}"
 LOG_EVERY="${LOG_EVERY:-100}"
