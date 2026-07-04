@@ -7,3 +7,4 @@ logs/
 output/
 checkpoints/
 data/
+download_data/

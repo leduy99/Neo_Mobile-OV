@@ -67,9 +67,21 @@ if [[ -x "${CONDA_ENV}/bin/torchrun" ]]; then
   TORCHRUN_BIN="${CONDA_ENV}/bin/torchrun"
 fi
 
-RECAPTION_CSV="${RECAPTION_CSV:-/proj/cvl/users/x_fahkh2/Mobile-OV_Alpha/download_data/data/openvid/manifests/openvid_all_recaptions.csv}"
+LOCAL_OPENVID_ROOT="${LOCAL_OPENVID_ROOT:-${ROOT}/download_data/data/openvid}"
+if [[ -z "${RECAPTION_CSV:-}" ]]; then
+  if [[ -f "${LOCAL_OPENVID_ROOT}/manifests/openvid_all_recaptions_merged.csv" ]]; then
+    RECAPTION_CSV="${LOCAL_OPENVID_ROOT}/manifests/openvid_all_recaptions_merged.csv"
+  elif [[ -f "${LOCAL_OPENVID_ROOT}/manifests/openvid_all_recaptions.csv" ]]; then
+    RECAPTION_CSV="${LOCAL_OPENVID_ROOT}/manifests/openvid_all_recaptions.csv"
+  elif [[ -f "${LOCAL_OPENVID_ROOT}/manifests/openvid_all.csv" ]]; then
+    RECAPTION_CSV="${LOCAL_OPENVID_ROOT}/manifests/openvid_all.csv"
+  else
+    RECAPTION_CSV="${LOCAL_OPENVID_ROOT}/manifests/openvid_all_recaptions_merged.csv"
+  fi
+fi
 if [[ ! -f "${RECAPTION_CSV}" ]]; then
   echo "Missing recaption CSV: ${RECAPTION_CSV}" >&2
+  echo "Run first: bash scripts/import_openvid_data_to_repo.sh" >&2
   echo "Override with: RECAPTION_CSV=/path/to/openvid_all_recaptions.csv sbatch $0" >&2
   exit 1
 fi

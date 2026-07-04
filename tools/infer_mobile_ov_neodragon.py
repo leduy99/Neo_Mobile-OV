@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from new_mobile_ov.bridge import MobileOVNeodragonTextBridge, MobileOVTextBridge
+from new_mobile_ov.checkpoints import ensure_neodragon_assets
 from new_mobile_ov.config import load_config
 from new_mobile_ov.generation import build_generation_backend
 
@@ -34,6 +35,21 @@ def safe_stem(text: str, max_len: int = 80) -> str:
     return (text[:max_len] or "prompt").strip("_")
 
 
+def load_neodragon_prompt_modifier(cfg) -> str:
+    repo_path, _, _ = ensure_neodragon_assets(
+        repo_path=cfg.backend.extra.get("repo_path"),
+        cache_dir=cfg.backend.extra.get("cache_dir"),
+        model_id=cfg.backend.extra.get("model_id", "karnewar/Neodragon"),
+        repo_url=cfg.backend.extra.get("repo_url"),
+    )
+    repo_path = Path(repo_path).expanduser().resolve()
+    if str(repo_path) not in sys.path:
+        sys.path.insert(0, str(repo_path))
+    from neodragon.utils.generation_utils import DEFAULT_PROMPT_MODIFIER
+
+    return DEFAULT_PROMPT_MODIFIER
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/mobile_ov_neodragon.yaml")
@@ -48,6 +64,12 @@ def main() -> None:
     parser.add_argument("--skip-bridge", action="store_true")
     parser.add_argument("--condition-source", choices=["native", "bridge"], default="native")
     parser.add_argument("--bridge-ckpt", default=None, help="Optional Neodragon-shaped bridge checkpoint.")
+    parser.add_argument(
+        "--bridge-append-prompt-modifier",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Append Neodragon DEFAULT_PROMPT_MODIFIER before bridge encoding. Defaults to true for mobile_ov_neodragon.",
+    )
     args = parser.parse_args()
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -75,6 +97,14 @@ def main() -> None:
     bridge_outputs = None
     if not args.skip_bridge:
         t0 = time.time()
+        bridge_prompt = args.prompt
+        append_modifier = (
+            cfg.backend.name == "mobile_ov_neodragon"
+            if args.bridge_append_prompt_modifier is None
+            else args.bridge_append_prompt_modifier
+        )
+        if append_modifier and cfg.backend.name == "mobile_ov_neodragon":
+            bridge_prompt = bridge_prompt + load_neodragon_prompt_modifier(cfg)
         if cfg.backend.name == "mobile_ov_neodragon":
             bridge = MobileOVNeodragonTextBridge(cfg.bridge, device=device, dtype=dtype).eval()
         else:
@@ -87,11 +117,13 @@ def main() -> None:
             metrics["bridge_ckpt_missing"] = len(missing)
             metrics["bridge_ckpt_unexpected"] = len(unexpected)
         with torch.no_grad():
-            prompt_embeds, prompt_mask, pooled = bridge.encode([args.prompt])
+            prompt_embeds, prompt_mask, pooled = bridge.encode([bridge_prompt])
         bridge_outputs = (prompt_embeds, prompt_mask, pooled)
         metrics.update(
             {
                 "bridge_seconds": time.time() - t0,
+                "bridge_prompt": bridge_prompt,
+                "bridge_append_prompt_modifier": append_modifier,
                 "bridge_prompt_embeds_shape": list(prompt_embeds.shape),
                 "bridge_prompt_mask_shape": list(prompt_mask.shape),
                 "bridge_pooled_shape": list(pooled.shape),

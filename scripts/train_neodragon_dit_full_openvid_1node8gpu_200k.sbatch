@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=neo-recap-8gpu
+#SBATCH --job-name=neo-dit-full
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -12,40 +12,42 @@
 
 set -euo pipefail
 
-# Submit from the repo root:
-#   sbatch scripts/train_neodragon_text_bridge_recaption_1node8gpu_200k.sbatch
+# Submit from the repo root after preparing data:
+#   bash scripts/prepare_openvid_neodragon_2s.sh
+#   sbatch scripts/train_neodragon_dit_full_openvid_1node8gpu_200k.sbatch
 
 CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-${CONDA_ENV}/bin/torchrun}"
-LOCAL_OPENVID_ROOT="${LOCAL_OPENVID_ROOT:-download_data/data/openvid}"
-if [[ -z "${RECAPTION_CSV:-}" ]]; then
-  if [[ -f "${LOCAL_OPENVID_ROOT}/manifests/openvid_all_recaptions_merged.csv" ]]; then
-    RECAPTION_CSV="${LOCAL_OPENVID_ROOT}/manifests/openvid_all_recaptions_merged.csv"
-  elif [[ -f "${LOCAL_OPENVID_ROOT}/manifests/openvid_all_recaptions.csv" ]]; then
-    RECAPTION_CSV="${LOCAL_OPENVID_ROOT}/manifests/openvid_all_recaptions.csv"
-  elif [[ -f "${LOCAL_OPENVID_ROOT}/manifests/openvid_all.csv" ]]; then
-    RECAPTION_CSV="${LOCAL_OPENVID_ROOT}/manifests/openvid_all.csv"
-  else
-    RECAPTION_CSV="${LOCAL_OPENVID_ROOT}/manifests/openvid_all_recaptions_merged.csv"
-  fi
-fi
 
 CONFIG="${CONFIG:-configs/mobile_ov_neodragon.yaml}"
-OUT="${OUT:-output/neo_bridge_8gpu_200k/${SLURM_JOB_ID:-local}}"
+MANIFEST="${MANIFEST:-data/openvid_neodragon_2s_latents/latent_manifest.csv}"
+BRIDGE_CKPT="${BRIDGE_CKPT:-checkpoints/hf_mobile_ov/neo_bridge_8gpu_200k_merged_caps/17002399/neodragon_text_bridge_latest.pt}"
+OUT="${OUT:-output/neo_dit_full/${SLURM_JOB_ID:-local}}"
+
 STEPS="${STEPS:-200000}"
 SAVE_EVERY="${SAVE_EVERY:-10000}"
 LOG_EVERY="${LOG_EVERY:-100}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
-LR="${LR:-1e-4}"
+LR="${LR:-5e-6}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 PARALLEL="${PARALLEL:-fsdp}"
 
 mkdir -p logs "${OUT}"
 
-if [[ ! -f "${RECAPTION_CSV}" ]]; then
-  echo "Missing RECAPTION_CSV=${RECAPTION_CSV}" >&2
-  echo "Run first: bash scripts/import_openvid_data_to_repo.sh" >&2
-  echo "Or set: RECAPTION_CSV=/path/to/openvid_all_recaptions_merged.csv sbatch $0" >&2
+if [[ ! -x "${TORCHRUN_BIN}" ]]; then
+  echo "Missing torchrun: ${TORCHRUN_BIN}" >&2
+  exit 1
+fi
+if [[ ! -f "${MANIFEST}" ]]; then
+  echo "Missing MANIFEST=${MANIFEST}" >&2
+  echo "Run first:" >&2
+  echo "  bash scripts/prepare_openvid_neodragon_2s.sh" >&2
+  echo "  sbatch scripts/encode_neodragon_vae_latents_1node8gpu.sbatch" >&2
+  exit 1
+fi
+if [[ ! -f "${BRIDGE_CKPT}" ]]; then
+  echo "Missing BRIDGE_CKPT=${BRIDGE_CKPT}" >&2
   exit 1
 fi
 
@@ -64,7 +66,8 @@ export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${PWD}/output/cache/triton}"
 
 echo "PWD=${PWD}"
 echo "CONDA_ENV=${CONDA_ENV}"
-echo "RECAPTION_CSV=${RECAPTION_CSV}"
+echo "MANIFEST=${MANIFEST}"
+echo "BRIDGE_CKPT=${BRIDGE_CKPT}"
 echo "OUT=${OUT}"
 echo "STEPS=${STEPS} SAVE_EVERY=${SAVE_EVERY} BATCH_SIZE=${BATCH_SIZE} LR=${LR} PARALLEL=${PARALLEL}"
 nvidia-smi || true
@@ -72,22 +75,27 @@ nvidia-smi || true
 "${TORCHRUN_BIN}" \
   --standalone \
   --nnodes=1 \
-  --nproc_per_node=8 \
-  tools/train_neodragon_text_bridge.py \
+  --nproc_per_node="${NPROC_PER_NODE}" \
+  tools/train_neodragon_dit_bridge.py \
   --config "${CONFIG}" \
-  --prompts "${RECAPTION_CSV}" \
-  --output-dir "${OUT}" \
+  --manifest "${MANIFEST}" \
+  --bridge-ckpt "${BRIDGE_CKPT}" \
+  --output-dir "${OUT}/dit" \
   --steps "${STEPS}" \
   --batch-size "${BATCH_SIZE}" \
   --lr "${LR}" \
+  --train-last-n-blocks 0 \
   --parallel "${PARALLEL}" \
   --gradient-accumulation-steps "${GRAD_ACCUM_STEPS}" \
   --log-every "${LOG_EVERY}" \
   --save-every "${SAVE_EVERY}" \
+  --target-fps 24 \
+  --use-precomputed-latents \
+  --caption-aug \
   --caption-variant-columns caption_short,caption_medium,caption_long \
   --caption-variant-weights 1,1,1 \
   --caption-fallback-column caption \
   --keep-step-checkpoints \
   ${EXTRA_ARGS:-}
 
-find "${OUT}" -maxdepth 1 -type f -print -exec ls -lh {} \;
+find "${OUT}" -maxdepth 3 -type f -print -exec ls -lh {} \;
