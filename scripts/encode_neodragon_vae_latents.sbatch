@@ -1,16 +1,25 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=neo-vae-enc
-#SBATCH --partition=gpu
+#SBATCH --job-name=mobile-ov
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
+#SBATCH --ntasks-per-node=8
+#SBATCH --time=72:00:00
+#SBATCH --output=logs/slurmm1.0-%j.out
+#SBATCH --error=logs/slurmm1.0-%j.out
+#SBATCH --account=berzelius-2026-196
 #SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=900G
-#SBATCH --time=2-00:00:00
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.out
+##SBATCH --gres=gpu:A100-SXM4-80GB:8
 
 set -euo pipefail
+
+module load buildenv-nvhpc/24.5-cuda12.4
+#module load buildenv-gcccuda/12.9.1-gcc11
+
+export PYTHONPATH="./:${PYTHONPATH:-}"
+export HF_HOME=/proj/cvl/users/x_fahkh2/caches
+export TORCH_HOME=/proj/cvl/users/x_fahkh2/caches
+export PIP_CACHE_DIR=/proj/cvl/users/x_fahkh2/caches
+export TMPDIR=/proj/cvl/users/x_fahkh2/caches
+export TRITON_CACHE_DIR=/proj/cvl/users/x_fahkh2/caches
 
 # Simple public entrypoint:
 #   sbatch scripts/encode_neodragon_vae_latents.sbatch
@@ -21,9 +30,6 @@ set -euo pipefail
 #     scripts/encode_neodragon_vae_latents.sbatch
 
 CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
-if [[ ! -x "${CONDA_ENV}/bin/torchrun" && -x "/share_4/users/duy/.conda/envs/neo_mobileov/bin/torchrun" ]]; then
-  CONDA_ENV="/share_4/users/duy/.conda/envs/neo_mobileov"
-fi
 TORCHRUN_BIN="${TORCHRUN_BIN:-${CONDA_ENV}/bin/torchrun}"
 
 CONFIG="${CONFIG:-configs/mobile_ov_neodragon.yaml}"
@@ -48,7 +54,7 @@ if ! [[ "${NPROC_PER_NODE}" =~ ^[0-9]+$ ]] || [[ "${NPROC_PER_NODE}" -lt 1 ]]; t
   exit 1
 fi
 
-mkdir -p logs "${OUT}"
+mkdir -p logs "${OUT}" "${HF_HOME}" "${TORCH_HOME}" "${PIP_CACHE_DIR}" "${TMPDIR}" "${TRITON_CACHE_DIR}"
 
 if [[ ! -x "${TORCHRUN_BIN}" ]]; then
   echo "Missing torchrun: ${TORCHRUN_BIN}" >&2
@@ -68,16 +74,13 @@ if [[ ! -f "${CLIP_MANIFEST}" ]]; then
 fi
 
 export PATH="${CONDA_ENV}/bin:${PATH}"
-export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+export PYTHONPATH="${PWD}:${PYTHONPATH}"
 export PYTHONNOUSERSITE=1
 export TOKENIZERS_PARALLELISM=false
 export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export TORCH_DIST_TIMEOUT_MINUTES="${TORCH_DIST_TIMEOUT_MINUTES:-60}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-export HF_HOME="${HF_HOME:-${PWD}/checkpoints/hf_home}"
-export TORCH_HOME="${TORCH_HOME:-${PWD}/checkpoints/torch_home}"
-export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${PWD}/output/cache/triton}"
 
 echo "PWD=${PWD}"
 echo "CONDA_ENV=${CONDA_ENV}"
