@@ -33,19 +33,19 @@ def _run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
-def _download_file(url: str, out_path: Path) -> None:
+def _download_file(url: str, out_path: Path, *, skip_existing: bool = True) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.exists() and out_path.stat().st_size > 0:
+    if skip_existing and out_path.exists() and out_path.stat().st_size > 0:
         return
     if shutil.which("wget"):
-        _run(["wget", "-c", url, "-O", str(out_path)])
+        _run(["wget", "-c", "--progress=dot:giga", url, "-O", str(out_path)])
     else:
         _run(["curl", "-L", "-C", "-", url, "-o", str(out_path)])
 
 
-def _try_download_file(url: str, out_path: Path) -> bool:
+def _try_download_file(url: str, out_path: Path, *, skip_existing: bool = True) -> bool:
     try:
-        _download_file(url, out_path)
+        _download_file(url, out_path, skip_existing=skip_existing)
         return out_path.exists() and out_path.stat().st_size > 0
     except subprocess.CalledProcessError:
         try:
@@ -103,10 +103,9 @@ def _download_openvid_part(part: int, zips_root: Path, split_index: dict[int, li
     zip_path = zips_root / f"OpenVid_part{part}.zip"
     if _is_valid_zip(zip_path):
         return zip_path
-    if zip_path.exists():
-        zip_path.unlink()
 
-    if _try_download_file(OPENVID_ZIP_URL.format(part), zip_path) and _is_valid_zip(zip_path):
+    # Keep partial zips from interrupted jobs; wget/curl can resume them.
+    if _try_download_file(OPENVID_ZIP_URL.format(part), zip_path, skip_existing=False) and _is_valid_zip(zip_path):
         return zip_path
     try:
         zip_path.unlink()
@@ -117,7 +116,7 @@ def _download_openvid_part(part: int, zips_root: Path, split_index: dict[int, li
     split_paths: list[Path] = []
     for suffix in suffixes:
         split_path = zips_root / f"OpenVid_part{part}_part{suffix}"
-        if not _try_download_file(OPENVID_SPLIT_URL.format(part, suffix), split_path):
+        if not _try_download_file(OPENVID_SPLIT_URL.format(part, suffix), split_path, skip_existing=False):
             for path in split_paths:
                 path.unlink(missing_ok=True)
             split_path.unlink(missing_ok=True)
