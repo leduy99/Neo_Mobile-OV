@@ -27,8 +27,10 @@ CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
 PYTHON_BIN="${PYTHON_BIN:-${CONDA_ENV}/bin/python}"
 DOWNLOAD_WORKERS="${DOWNLOAD_WORKERS:-1}"
 HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-5}"
-HEARTBEAT_SIZE="${HEARTBEAT_SIZE:-4096}"
+HEARTBEAT_SIZE="${HEARTBEAT_SIZE:-0}"
+HEARTBEAT_TENSOR_MB="${HEARTBEAT_TENSOR_MB:-4}"
 HEARTBEAT_WORK_SECONDS="${HEARTBEAT_WORK_SECONDS:-2}"
+HEARTBEAT_STOP_FILE="${TMPDIR%/}/mobileov_download_heartbeat_stop_${SLURM_JOB_ID:-local}.flag"
 
 mkdir -p logs "${HF_HOME}" "${TORCH_HOME}" "${PIP_CACHE_DIR}" "${TMPDIR}" "${TRITON_CACHE_DIR}"
 
@@ -49,21 +51,53 @@ echo "PARTS=${PARTS:-<infer-from-manifest>}"
 echo "MAX_PARTS=${MAX_PARTS:--1} START_OFFSET=${START_OFFSET:-0}"
 nvidia-smi || true
 
-"${PYTHON_BIN}" tools/utils/gpu_heartbeat.py \
+rm -f "${HEARTBEAT_STOP_FILE}"
+srun --overlap \
+  --nodes=1 \
+  --ntasks=1 \
+  --gpus-per-task=1 \
+  --gpu-bind=single:1 \
+  bash -lc '
+set -euo pipefail
+export PATH="'"${CONDA_ENV}"'/bin:$PATH"
+cd "'"${PWD}"'"
+export PYTHONNOUSERSITE=1
+export PYTHONPATH="./:${PYTHONPATH:-}"
+"'"${PYTHON_BIN}"'" tools/utils/gpu_heartbeat.py \
   --devices all \
-  --interval "${HEARTBEAT_INTERVAL}" \
-  --size "${HEARTBEAT_SIZE}" \
-  --work-seconds "${HEARTBEAT_WORK_SECONDS}" \
-  --label "openvid-download-${SLURM_JOB_ID:-local}" &
+  --interval "'"${HEARTBEAT_INTERVAL}"'" \
+  --size "'"${HEARTBEAT_SIZE}"'" \
+  --tensor-mb "'"${HEARTBEAT_TENSOR_MB}"'" \
+  --work-seconds "'"${HEARTBEAT_WORK_SECONDS}"'" \
+  --stop-file "'"${HEARTBEAT_STOP_FILE}"'" \
+  --label "openvid-download-'"${SLURM_JOB_ID:-local}"'-node-${SLURMD_NODENAME:-unknown}"
+' &
 HEARTBEAT_PID=$!
 
 cleanup() {
   if kill -0 "${HEARTBEAT_PID}" >/dev/null 2>&1; then
+    touch "${HEARTBEAT_STOP_FILE}" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      if ! kill -0 "${HEARTBEAT_PID}" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 1
+    done
+  fi
+  if kill -0 "${HEARTBEAT_PID}" >/dev/null 2>&1; then
     kill "${HEARTBEAT_PID}" >/dev/null 2>&1 || true
     wait "${HEARTBEAT_PID}" >/dev/null 2>&1 || true
   fi
+  rm -f "${HEARTBEAT_STOP_FILE}" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
+
+sleep 3
+if ! kill -0 "${HEARTBEAT_PID}" >/dev/null 2>&1; then
+  wait "${HEARTBEAT_PID}" >/dev/null 2>&1 || true
+  echo "GPU heartbeat failed to start; aborting to avoid idle-GPU job cancellation." >&2
+  exit 1
+fi
 
 DOWNLOAD_WORKERS="${DOWNLOAD_WORKERS}" bash scripts/download_openvid_raw_to_repo.sh
 
