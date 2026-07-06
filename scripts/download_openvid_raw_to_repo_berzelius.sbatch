@@ -25,9 +25,10 @@ export TRITON_CACHE_DIR=/proj/cvl/users/x_fahkh2/caches
 
 CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
 PYTHON_BIN="${PYTHON_BIN:-${CONDA_ENV}/bin/python}"
-DOWNLOAD_WORKERS="${DOWNLOAD_WORKERS:-4}"
-HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-15}"
-HEARTBEAT_SIZE="${HEARTBEAT_SIZE:-1024}"
+DOWNLOAD_WORKERS="${DOWNLOAD_WORKERS:-1}"
+HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-5}"
+HEARTBEAT_SIZE="${HEARTBEAT_SIZE:-4096}"
+HEARTBEAT_WORK_SECONDS="${HEARTBEAT_WORK_SECONDS:-2}"
 
 mkdir -p logs "${HF_HOME}" "${TORCH_HOME}" "${PIP_CACHE_DIR}" "${TMPDIR}" "${TRITON_CACHE_DIR}"
 
@@ -52,6 +53,7 @@ nvidia-smi || true
   --devices all \
   --interval "${HEARTBEAT_INTERVAL}" \
   --size "${HEARTBEAT_SIZE}" \
+  --work-seconds "${HEARTBEAT_WORK_SECONDS}" \
   --label "openvid-download-${SLURM_JOB_ID:-local}" &
 HEARTBEAT_PID=$!
 

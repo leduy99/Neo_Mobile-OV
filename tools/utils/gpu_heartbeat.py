@@ -25,6 +25,12 @@ def main() -> None:
     parser.add_argument("--devices", default="all", help="'all' visible GPUs, or a comma list such as 0,1.")
     parser.add_argument("--interval", type=float, default=15.0)
     parser.add_argument("--size", type=int, default=1024)
+    parser.add_argument(
+        "--work-seconds",
+        type=float,
+        default=0.5,
+        help="Seconds of visible matmul work per heartbeat interval. Increase if cluster monitors miss short pulses.",
+    )
     parser.add_argument("--label", default=os.environ.get("SLURM_JOB_NAME", "gpu-heartbeat"))
     args = parser.parse_args()
 
@@ -43,24 +49,31 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
-    tensors: list[tuple[int, torch.Tensor]] = []
+    tensors: list[tuple[int, torch.Tensor, torch.Tensor]] = []
     for device in devices:
         with torch.cuda.device(device):
-            tensor = torch.randn((args.size, args.size), device=f"cuda:{device}", dtype=torch.float16)
-            tensors.append((device, tensor))
+            left = torch.randn((args.size, args.size), device=f"cuda:{device}", dtype=torch.float16)
+            right = torch.randn((args.size, args.size), device=f"cuda:{device}", dtype=torch.float16)
+            tensors.append((device, left, right))
     print(
         f"[{args.label}] GPU heartbeat active on devices={devices}, "
-        f"tensor_shape={args.size}x{args.size}, interval={args.interval}s",
+        f"tensor_shape={args.size}x{args.size}, interval={args.interval}s, "
+        f"work_seconds={args.work_seconds}s",
         flush=True,
     )
 
     tick = 0
     while not stop:
-        for device, tensor in tensors:
+        for device, left, right in tensors:
             with torch.cuda.device(device):
-                tensor.mul_(1.0001).add_(0.0001)
-                if tick % 4 == 0:
-                    torch.cuda.synchronize(device)
+                start = time.monotonic()
+                sink = None
+                while not stop and time.monotonic() - start < max(0.0, args.work_seconds):
+                    sink = left @ right
+                if sink is not None:
+                    # Keep a tiny observable dependency and make utilization visible before sleeping.
+                    sink[0, 0].item()
+                torch.cuda.synchronize(device)
         tick += 1
         time.sleep(max(0.1, args.interval))
 
