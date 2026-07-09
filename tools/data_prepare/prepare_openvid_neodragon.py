@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 import zipfile
 from datetime import datetime, timezone
@@ -38,21 +39,39 @@ def _download_file(url: str, out_path: Path, *, skip_existing: bool = True) -> N
     if skip_existing and out_path.exists() and out_path.stat().st_size > 0:
         return
     if shutil.which("wget"):
-        _run(["wget", "-c", "--progress=dot:giga", url, "-O", str(out_path)])
+        # Use a single wget try so Python can retry the original HF URL and refresh
+        # the signed CDN redirect URL after long interrupted downloads.
+        _run(["wget", "-c", "--tries=1", "--progress=dot:giga", url, "-O", str(out_path)])
     else:
         _run(["curl", "-L", "-C", "-", url, "-o", str(out_path)])
 
 
-def _try_download_file(url: str, out_path: Path, *, skip_existing: bool = True) -> bool:
-    try:
-        _download_file(url, out_path, skip_existing=skip_existing)
-        return out_path.exists() and out_path.stat().st_size > 0
-    except subprocess.CalledProcessError:
+def _try_download_file(
+    url: str,
+    out_path: Path,
+    *,
+    skip_existing: bool = True,
+    attempts: int = 1,
+    delete_on_fail: bool = True,
+) -> bool:
+    attempts = max(1, int(attempts))
+    for attempt in range(1, attempts + 1):
+        before_size = out_path.stat().st_size if out_path.exists() else 0
         try:
-            out_path.unlink()
-        except FileNotFoundError:
-            pass
-        return False
+            _download_file(url, out_path, skip_existing=skip_existing)
+            return out_path.exists() and out_path.stat().st_size > 0
+        except subprocess.CalledProcessError as exc:
+            after_size = out_path.stat().st_size if out_path.exists() else 0
+            print(
+                f"Warning: download attempt {attempt}/{attempts} failed for {out_path.name} "
+                f"(exit={exc.returncode}, bytes={after_size}, delta={after_size - before_size}).",
+                flush=True,
+            )
+            if attempt < attempts:
+                time.sleep(min(60, 5 * attempt))
+    if delete_on_fail:
+        out_path.unlink(missing_ok=True)
+    return False
 
 
 def _is_valid_zip(path: Path) -> bool:
@@ -105,21 +124,36 @@ def _download_openvid_part(part: int, zips_root: Path, split_index: dict[int, li
         return zip_path
 
     # Keep partial zips from interrupted jobs; wget/curl can resume them.
-    if _try_download_file(OPENVID_ZIP_URL.format(part), zip_path, skip_existing=False) and _is_valid_zip(zip_path):
+    attempts = int(os.environ.get("OPENVID_DOWNLOAD_ATTEMPTS", "24"))
+    direct_ok = _try_download_file(
+        OPENVID_ZIP_URL.format(part),
+        zip_path,
+        skip_existing=False,
+        attempts=attempts,
+        delete_on_fail=False,
+    )
+    if direct_ok and _is_valid_zip(zip_path):
         return zip_path
-    try:
-        zip_path.unlink()
-    except FileNotFoundError:
-        pass
+    if zip_path.exists() and zip_path.stat().st_size > 0:
+        raise RuntimeError(
+            f"Could not finish direct OpenVid part {part}; kept partial file for resume: {zip_path}"
+        )
 
+    if split_index and part not in split_index:
+        raise RuntimeError(f"Could not download direct OpenVid part {part}, and no split files are listed for this part.")
     suffixes = split_index.get(part) or ["aa", "ab"]
     split_paths: list[Path] = []
     for suffix in suffixes:
         split_path = zips_root / f"OpenVid_part{part}_part{suffix}"
-        if not _try_download_file(OPENVID_SPLIT_URL.format(part, suffix), split_path, skip_existing=False):
+        if not _try_download_file(
+            OPENVID_SPLIT_URL.format(part, suffix),
+            split_path,
+            skip_existing=False,
+            attempts=attempts,
+            delete_on_fail=False,
+        ):
             for path in split_paths:
                 path.unlink(missing_ok=True)
-            split_path.unlink(missing_ok=True)
             raise RuntimeError(f"Could not download OpenVid split part={part} suffix={suffix}")
         split_paths.append(split_path)
 
