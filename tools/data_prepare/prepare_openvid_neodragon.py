@@ -261,7 +261,7 @@ def index_videos(parts_root: Path) -> dict[str, Path]:
 def build_source_rows(args: argparse.Namespace) -> pd.DataFrame:
     source_manifest = Path(args.source_manifest).expanduser() if args.source_manifest else None
     if source_manifest and source_manifest.exists():
-        return pd.read_csv(source_manifest)
+        return pd.read_csv(source_manifest, low_memory=False)
 
     download_root = Path(args.download_root).expanduser()
     csv_path = Path(args.openvid_csv).expanduser() if args.openvid_csv else None
@@ -354,6 +354,10 @@ def make_neodragon_manifest(args: argparse.Namespace) -> dict[str, Any]:
     text_columns = [x.strip() for x in args.text_columns.split(",") if x.strip()]
     rng = random.Random(args.seed)
     clip_seconds = float(args.clip_seconds or (args.num_frames / args.target_fps))
+    if args.probe_mode == "none" and args.clip_policy != "first":
+        raise ValueError("--probe-mode=none only supports --clip-policy=first.")
+    if args.probe_mode == "ffprobe" and shutil.which("ffprobe") is None:
+        raise RuntimeError("--probe-mode=ffprobe requires an ffprobe executable on PATH.")
     rows: list[dict[str, Any]] = []
     skipped: dict[str, int] = {"missing_path": 0, "missing_caption": 0, "ffprobe": 0, "too_short": 0}
     durations: list[float] = []
@@ -371,17 +375,21 @@ def make_neodragon_manifest(args: argparse.Namespace) -> dict[str, Any]:
         if not prompt:
             skipped["missing_caption"] += 1
             continue
-        meta = ffprobe_video(src)
-        if not meta:
-            skipped["ffprobe"] += 1
-            continue
-        duration = float(meta["source_duration_sec"])
-        if duration < args.min_duration_sec and not args.allow_short:
-            skipped["too_short"] += 1
-            continue
-        if duration < clip_seconds and not args.allow_short:
-            skipped["too_short"] += 1
-            continue
+        if args.probe_mode == "none":
+            meta: dict[str, Any] = {}
+            duration = float("nan")
+        else:
+            meta = ffprobe_video(src) or {}
+            if not meta:
+                skipped["ffprobe"] += 1
+                continue
+            duration = float(meta["source_duration_sec"])
+            if duration < args.min_duration_sec and not args.allow_short:
+                skipped["too_short"] += 1
+                continue
+            if duration < clip_seconds and not args.allow_short:
+                skipped["too_short"] += 1
+                continue
 
         dst = _copy_or_link(src, out_dir / "videos" / f"{len(rows):07d}_{src.name}", args.copy_mode)
         start = choose_clip_start(duration, clip_seconds, args.clip_policy, rng)
@@ -390,7 +398,7 @@ def make_neodragon_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "sample_id": len(rows),
             "video_path": str(dst.resolve() if args.copy_mode != "symlink" else dst),
             "prompt": prompt,
-            "caption": str(row.get("caption") or prompt),
+            "caption": _first_text(row, ["caption"]) or prompt,
             "clip_start_sec": round(start, 6),
             "clip_end_sec": round(end, 6),
             "clip_num_frames": int(args.num_frames),
@@ -402,9 +410,15 @@ def make_neodragon_manifest(args: argparse.Namespace) -> dict[str, Any]:
         }
         for col in ["caption_short", "caption_medium", "caption_long"]:
             if col in row:
-                item[col] = str(row.get(col) or "")
+                item[col] = _first_text(row, [col])
         rows.append(item)
-        durations.append(duration)
+        if math.isfinite(duration):
+            durations.append(duration)
+        if args.log_every > 0 and (row_idx + 1) % args.log_every == 0:
+            print(
+                f"Prepared rows={len(rows)} scanned={row_idx + 1}/{len(df)} skipped={skipped}",
+                flush=True,
+            )
         if args.max_samples > 0 and len(rows) >= args.max_samples:
             break
 
@@ -424,11 +438,12 @@ def make_neodragon_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "target_fps": float(args.target_fps),
         "clip_seconds": clip_seconds,
         "clip_policy": args.clip_policy,
+        "probe_mode": args.probe_mode,
         "copy_mode": args.copy_mode,
         "duration_sec": {
-            "min": min(durations),
-            "mean": sum(durations) / len(durations),
-            "max": max(durations),
+            "min": min(durations) if durations else None,
+            "mean": sum(durations) / len(durations) if durations else None,
+            "max": max(durations) if durations else None,
         },
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -453,6 +468,13 @@ def main() -> None:
     parser.add_argument("--target-fps", type=float, default=24.0)
     parser.add_argument("--clip-seconds", type=float, default=0.0)
     parser.add_argument("--clip-policy", choices=["first", "center", "random"], default="first")
+    parser.add_argument(
+        "--probe-mode",
+        choices=["ffprobe", "none"],
+        default="ffprobe",
+        help="Use 'none' for a fast first-clip manifest; video validity is checked during VAE encoding.",
+    )
+    parser.add_argument("--log-every", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--min-duration-sec", type=float, default=2.0)
     parser.add_argument("--allow-short", action="store_true")

@@ -30,6 +30,8 @@ MAX_SAMPLES="${MAX_SAMPLES:--1}"
 MAX_INPUT_ROWS="${MAX_INPUT_ROWS:--1}"
 CLIP_POLICY="${CLIP_POLICY:-first}"
 COPY_MODE="${COPY_MODE:-none}"
+PROBE_MODE="${PROBE_MODE:-none}"
+LOG_EVERY="${LOG_EVERY:-10000}"
 
 if [[ -n "${SOURCE_MANIFEST}" ]]; then
   python tools/data_prepare/prepare_openvid_neodragon.py \
@@ -40,6 +42,8 @@ if [[ -n "${SOURCE_MANIFEST}" ]]; then
     --num-frames 49 \
     --target-fps 24 \
     --clip-policy "${CLIP_POLICY}" \
+    --probe-mode "${PROBE_MODE}" \
+    --log-every "${LOG_EVERY}" \
     --copy-mode "${COPY_MODE}"
 else
   python tools/data_prepare/prepare_openvid_neodragon.py \
@@ -54,6 +58,8 @@ else
     --num-frames 49 \
     --target-fps 24 \
     --clip-policy "${CLIP_POLICY}" \
+    --probe-mode "${PROBE_MODE}" \
+    --log-every "${LOG_EVERY}" \
     --copy-mode "${COPY_MODE}"
 fi
 

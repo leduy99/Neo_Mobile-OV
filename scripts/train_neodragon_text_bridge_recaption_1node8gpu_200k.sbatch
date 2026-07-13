@@ -1,16 +1,25 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=neo-recap-8gpu
-#SBATCH --partition=gpu
+#SBATCH --job-name=mobile-ov
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
+#SBATCH --ntasks-per-node=8
+#SBATCH --time=72:00:00
+#SBATCH --output=logs/slurmm1.0-%j.out
+#SBATCH --error=logs/slurmm1.0-%j.out
+#SBATCH --account=berzelius-2026-196
 #SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=900G
-#SBATCH --time=3-00:00:00
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.out
+##SBATCH --gres=gpu:A100-SXM4-80GB:8
 
 set -euo pipefail
+
+module load buildenv-nvhpc/24.5-cuda12.4
+#module load buildenv-gcccuda/12.9.1-gcc11
+
+export PYTHONPATH="./:${PYTHONPATH:-}"
+export HF_HOME=/proj/cvl/users/x_fahkh2/caches
+export TORCH_HOME=/proj/cvl/users/x_fahkh2/caches
+export PIP_CACHE_DIR=/proj/cvl/users/x_fahkh2/caches
+export TMPDIR=/proj/cvl/users/x_fahkh2/caches
+export TRITON_CACHE_DIR=/proj/cvl/users/x_fahkh2/caches
 
 # Submit from the repo root:
 #   sbatch scripts/train_neodragon_text_bridge_recaption_1node8gpu_200k.sbatch
@@ -58,10 +67,6 @@ export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export TORCH_DIST_TIMEOUT_MINUTES="${TORCH_DIST_TIMEOUT_MINUTES:-60}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-export HF_HOME="${HF_HOME:-${PWD}/checkpoints/hf_home}"
-export TORCH_HOME="${TORCH_HOME:-${PWD}/checkpoints/torch_home}"
-export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${PWD}/output/cache/triton}"
-
 echo "PWD=${PWD}"
 echo "CONDA_ENV=${CONDA_ENV}"
 echo "RECAPTION_CSV=${RECAPTION_CSV}"

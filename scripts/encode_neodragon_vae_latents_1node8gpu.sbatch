@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=neo-vae-enc
-#SBATCH --partition=gpu
+#SBATCH --job-name=mobile-ov
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
+#SBATCH --ntasks-per-node=8
+#SBATCH --time=72:00:00
+#SBATCH --output=logs/slurmm1.0-%j.out
+#SBATCH --error=logs/slurmm1.0-%j.out
+#SBATCH --account=berzelius-2026-196
 #SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=900G
-#SBATCH --time=2-00:00:00
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.out
+##SBATCH --gres=gpu:A100-SXM4-80GB:8
 
 set -euo pipefail
 

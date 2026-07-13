@@ -30,6 +30,7 @@ export TRITON_CACHE_DIR=/proj/cvl/users/x_fahkh2/caches
 #     scripts/encode_neodragon_vae_latents.sbatch
 
 CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
+PYTHON_BIN="${PYTHON_BIN:-${CONDA_ENV}/bin/python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-${CONDA_ENV}/bin/torchrun}"
 
 CONFIG="${CONFIG:-configs/mobile_ov_neodragon.yaml}"
@@ -38,6 +39,11 @@ OUT="${OUT:-data/openvid_neodragon_2s_latents}"
 MAX_SAMPLES="${MAX_SAMPLES:--1}"
 LATENT_DTYPE="${LATENT_DTYPE:-bf16}"
 PREPARE_CLIPS="${PREPARE_CLIPS:-1}"
+PREPARE_PROBE_MODE="${PREPARE_PROBE_MODE:-none}"
+HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-5}"
+HEARTBEAT_TENSOR_MB="${HEARTBEAT_TENSOR_MB:-4}"
+HEARTBEAT_WORK_SECONDS="${HEARTBEAT_WORK_SECONDS:-2}"
+HEARTBEAT_STOP_FILE="${TMPDIR%/}/mobileov_vae_prepare_heartbeat_stop_${SLURM_JOB_ID:-local}.flag"
 
 if [[ -z "${NPROC_PER_NODE:-}" ]]; then
   if [[ -n "${SLURM_GPUS_ON_NODE:-}" ]]; then
@@ -56,23 +62,6 @@ fi
 
 mkdir -p logs "${OUT}" "${HF_HOME}" "${TORCH_HOME}" "${PIP_CACHE_DIR}" "${TMPDIR}" "${TRITON_CACHE_DIR}"
 
-if [[ ! -x "${TORCHRUN_BIN}" ]]; then
-  echo "Missing torchrun: ${TORCHRUN_BIN}" >&2
-  exit 1
-fi
-
-if [[ "${PREPARE_CLIPS}" == "1" && ! -f "${CLIP_MANIFEST}" ]]; then
-  echo "Preparing clip manifest because missing: ${CLIP_MANIFEST}"
-  OUT_DIR="$(dirname "${CLIP_MANIFEST}")" bash scripts/prepare_openvid_neodragon_2s.sh
-fi
-if [[ ! -f "${CLIP_MANIFEST}" ]]; then
-  echo "Missing CLIP_MANIFEST=${CLIP_MANIFEST}" >&2
-  echo "Run first:" >&2
-  echo "  bash scripts/copy_openvid_captions_to_repo.sh" >&2
-  echo "  bash scripts/download_openvid_raw_to_repo.sh" >&2
-  exit 1
-fi
-
 export PATH="${CONDA_ENV}/bin:${PATH}"
 export PYTHONPATH="${PWD}:${PYTHONPATH}"
 export PYTHONNOUSERSITE=1
@@ -82,11 +71,82 @@ export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export TORCH_DIST_TIMEOUT_MINUTES="${TORCH_DIST_TIMEOUT_MINUTES:-60}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
+if [[ ! -x "${TORCHRUN_BIN}" ]]; then
+  echo "Missing torchrun: ${TORCHRUN_BIN}" >&2
+  exit 1
+fi
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  echo "Missing python: ${PYTHON_BIN}" >&2
+  exit 1
+fi
+
+HEARTBEAT_PID=""
+stop_prepare_heartbeat() {
+  if [[ -z "${HEARTBEAT_PID}" ]]; then
+    return
+  fi
+  touch "${HEARTBEAT_STOP_FILE}" 2>/dev/null || true
+  for _ in $(seq 1 30); do
+    if ! kill -0 "${HEARTBEAT_PID}" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+  if kill -0 "${HEARTBEAT_PID}" >/dev/null 2>&1; then
+    kill "${HEARTBEAT_PID}" >/dev/null 2>&1 || true
+  fi
+  wait "${HEARTBEAT_PID}" >/dev/null 2>&1 || true
+  rm -f "${HEARTBEAT_STOP_FILE}" 2>/dev/null || true
+  HEARTBEAT_PID=""
+}
+
+start_prepare_heartbeat() {
+  rm -f "${HEARTBEAT_STOP_FILE}"
+  srun --overlap \
+    --nodes=1 \
+    --ntasks=1 \
+    --gpus-per-task=1 \
+    --gpu-bind=single:1 \
+    "${PYTHON_BIN}" tools/utils/gpu_heartbeat.py \
+      --devices all \
+      --interval "${HEARTBEAT_INTERVAL}" \
+      --tensor-mb "${HEARTBEAT_TENSOR_MB}" \
+      --work-seconds "${HEARTBEAT_WORK_SECONDS}" \
+      --stop-file "${HEARTBEAT_STOP_FILE}" \
+      --label "openvid-vae-prepare-${SLURM_JOB_ID:-local}" &
+  HEARTBEAT_PID=$!
+  sleep 3
+  if ! kill -0 "${HEARTBEAT_PID}" >/dev/null 2>&1; then
+    wait "${HEARTBEAT_PID}" >/dev/null 2>&1 || true
+    HEARTBEAT_PID=""
+    echo "GPU heartbeat failed to start; aborting manifest preparation." >&2
+    exit 1
+  fi
+}
+
+trap stop_prepare_heartbeat EXIT INT TERM
+
+if [[ "${PREPARE_CLIPS}" == "1" && ! -f "${CLIP_MANIFEST}" ]]; then
+  echo "Preparing clip manifest because missing: ${CLIP_MANIFEST}"
+  start_prepare_heartbeat
+  OUT_DIR="$(dirname "${CLIP_MANIFEST}")" \
+    PROBE_MODE="${PREPARE_PROBE_MODE}" \
+    bash scripts/prepare_openvid_neodragon_2s.sh
+  stop_prepare_heartbeat
+fi
+if [[ ! -f "${CLIP_MANIFEST}" ]]; then
+  echo "Missing CLIP_MANIFEST=${CLIP_MANIFEST}" >&2
+  echo "Run first:" >&2
+  echo "  bash scripts/copy_openvid_captions_to_repo.sh" >&2
+  echo "  bash scripts/download_openvid_raw_to_repo.sh" >&2
+  exit 1
+fi
+
 echo "PWD=${PWD}"
 echo "CONDA_ENV=${CONDA_ENV}"
 echo "CLIP_MANIFEST=${CLIP_MANIFEST}"
 echo "OUT=${OUT}"
-echo "NPROC_PER_NODE=${NPROC_PER_NODE} MAX_SAMPLES=${MAX_SAMPLES} LATENT_DTYPE=${LATENT_DTYPE}"
+echo "NPROC_PER_NODE=${NPROC_PER_NODE} MAX_SAMPLES=${MAX_SAMPLES} LATENT_DTYPE=${LATENT_DTYPE} PREPARE_PROBE_MODE=${PREPARE_PROBE_MODE}"
 nvidia-smi || true
 
 "${TORCHRUN_BIN}" \
