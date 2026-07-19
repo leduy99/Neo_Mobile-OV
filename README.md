@@ -148,6 +148,10 @@ SmolVLM2 + Bridge v2
 
 The bridge is trained by distilling frozen Neodragon `TextEncoderBundle + ContextAdapter` token conditions and CLIP pooled projections from the same prompts. This lets us keep the understanding branch unchanged while removing Neodragon's text-conditioning stack from the new model path.
 
+The four controlled bridge/DiT experiments, including the joint-from-scratch
+distillation run and its matched flow-only ablation, are documented in
+[`Docs/NEODRAGON_FOUR_EXPERIMENTS.md`](Docs/NEODRAGON_FOUR_EXPERIMENTS.md).
+
 Smoke inference:
 
 ```bash

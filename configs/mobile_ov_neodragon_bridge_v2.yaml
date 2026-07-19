@@ -1,0 +1,60 @@
+bridge:
+  smolvlm2_ckpt_path: checkpoints/smolvlm2_500m/smolvlm2_500m.pt
+  adapter_ckpt_dir:
+  tokenizer_model_id: HuggingFaceTB/SmolVLM-Instruct
+  max_length: 512
+  sana_model_max_length: 128
+  caption_channels: 1536
+  projector_type: mcp_lexical_gated
+  mcp_num_fuse_layers: 2
+  mcp_use_refine: true
+  mcp_refine_kernel_size: 3
+  mcp_lexical_gate_init: 0.2
+  strict_sana_parity_text_path: true
+  strict_sana_use_full_text_window: true
+  strict_sana_token_select_strategy: head_uniform_tail
+  strict_sana_head_tokens: 96
+  strict_sana_tail_tokens: 96
+  fail_fast_mask: true
+  neodragon_v2_conditioning: true
+  neodragon_resampler_heads: 12
+  neodragon_condition_bottleneck_dim: 768
+  neodragon_condition_scale_init: 0.78
+  neodragon_mask_length_delta_ratio: 0.25
+  neodragon_mask_temperature: 1.0
+
+backend:
+  name: mobile_ov_neodragon
+  dtype: bf16
+  extra:
+    repo_path: checkpoints/neodragon_repo
+    cache_dir: checkpoints/neodragon
+    repo_url: https://github.com/Qualcomm-AI-research/neodragon.git
+    mode: hybrid
+    model_id: karnewar/Neodragon
+
+motion:
+  latent_channels: 16
+  text_dim: 1536
+  hidden_dim: 512
+  temporal_len: 21
+  num_blocks: 10
+  mlp_ratio: 4
+  temporal_kernel: 3
+  temporal_dilation_cycle: [1, 2, 4]
+
+data:
+  output_dir: output/mobile_ov_neodragon_v2
+  frame_num: 49
+  height: 320
+  width: 512
+
+train:
+  batch_size: 1
+  lr: 0.0001
+  total_steps: 1000
+  motion_weight: 0.5
+  accel_weight: 0.0
+  log_every: 10
+  save_every: 500
+  dtype: bf16

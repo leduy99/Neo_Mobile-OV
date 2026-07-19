@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 import os
 import random
@@ -12,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from PIL import Image
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -25,6 +25,14 @@ sys.path.insert(0, str(ROOT))
 from new_mobile_ov.bridge import MobileOVNeodragonTextBridge
 from new_mobile_ov.checkpoints import ensure_neodragon_assets
 from new_mobile_ov.config import load_config
+from new_mobile_ov.training.neodragon_objectives import (
+    bridge_representation_losses,
+    flat_cosine_distance,
+    masked_mean_pool,
+    relational_cosine,
+    scheduled_weight,
+    weighted_loss_sum,
+)
 from new_mobile_ov.training.distributed import (
     barrier,
     build_deepspeed_config,
@@ -353,14 +361,69 @@ def load_neodragon_teacher_modules(cfg, device: torch.device, dtype: torch.dtype
     return text_bundle, context_adapter, teacher_dit
 
 
-def load_bridge(cfg, ckpt_path: str, device: torch.device, dtype: torch.dtype) -> MobileOVNeodragonTextBridge:
-    bridge = MobileOVNeodragonTextBridge(cfg.bridge, device=device, dtype=dtype).eval()
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state = ckpt.get("bridge", ckpt.get("student_state", ckpt))
-    bridge.load_state_dict(state, strict=False)
+def load_bridge(
+    cfg,
+    ckpt_path: str | None,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    trainable: bool = False,
+) -> MobileOVNeodragonTextBridge:
+    bridge = MobileOVNeodragonTextBridge(cfg.bridge, device=device, dtype=dtype)
+    if ckpt_path:
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        state = ckpt.get("bridge", ckpt.get("student_state", ckpt))
+        missing, unexpected = bridge.load_state_dict(state, strict=False)
+        if bool(cfg.bridge.neodragon_v2_conditioning) and (missing or unexpected):
+            raise RuntimeError(
+                "Bridge checkpoint does not match the configured NeoDragon v2 architecture: "
+                f"missing={missing[:8]} unexpected={unexpected[:8]}"
+            )
+    elif not trainable:
+        raise ValueError("A random bridge must be trainable; pass --train-bridge or provide --bridge-ckpt.")
     for param in bridge.parameters():
-        param.requires_grad_(False)
+        param.requires_grad_(trainable and param.requires_grad)
+    bridge.train(trainable)
     return bridge
+
+
+def _gather_with_gradient(tensor: torch.Tensor) -> torch.Tensor:
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+        return tensor
+    from torch.distributed.nn.functional import all_gather
+
+    return torch.cat(tuple(all_gather(tensor)), dim=0)
+
+
+def _shift_condition_across_global_batch(tensor: torch.Tensor) -> torch.Tensor | None:
+    """Return another sample's detached condition for text-sensitivity diagnostics."""
+    detached = tensor.detach()
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+        if detached.shape[0] < 2:
+            return None
+        return detached.roll(1, dims=0)
+    gathered = [torch.empty_like(detached) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, detached)
+    source_rank = (dist.get_rank() + 1) % dist.get_world_size()
+    return gathered[source_rank]
+
+
+def _gather_detached(tensor: torch.Tensor) -> torch.Tensor:
+    detached = tensor.detach()
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+        return detached
+    gathered = [torch.empty_like(detached) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, detached)
+    return torch.cat(gathered, dim=0)
+
+
+def _condition_offdiag_cosine(tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    pooled = F.normalize(masked_mean_pool(tokens.float(), mask), dim=-1)
+    if pooled.shape[0] < 2:
+        return pooled.new_zeros(())
+    similarity = pooled @ pooled.T
+    keep = ~torch.eye(pooled.shape[0], device=pooled.device, dtype=torch.bool)
+    return similarity[keep].mean()
 
 
 def scale_vae_latents(latents: torch.Tensor) -> torch.Tensor:
@@ -418,10 +481,39 @@ def wrap_dit(
             device_id=device,
             use_orig_params=True,
             sharding_strategy=strategy,
-            sync_module_states=False,
+            sync_module_states=True,
         )
     if parallel == "deepspeed":
         return dit
+    raise ValueError(f"Unknown --parallel={parallel}")
+
+
+def wrap_bridge(
+    bridge: torch.nn.Module,
+    *,
+    parallel: str,
+    device: torch.device,
+    local_rank: int,
+) -> torch.nn.Module:
+    parallel = parallel.lower()
+    if parallel == "none":
+        return bridge
+    if parallel == "ddp":
+        return DDP(bridge, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+    if parallel == "fsdp":
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import ShardingStrategy
+
+        strategy = ShardingStrategy.FULL_SHARD if torch.distributed.get_world_size() > 1 else ShardingStrategy.NO_SHARD
+        return FSDP(
+            bridge,
+            device_id=device,
+            use_orig_params=True,
+            sharding_strategy=strategy,
+            sync_module_states=True,
+        )
+    if parallel == "deepspeed":
+        raise ValueError("Joint bridge + DiT training currently supports FSDP or DDP, not separate DeepSpeed engines.")
     raise ValueError(f"Unknown --parallel={parallel}")
 
 
@@ -429,11 +521,22 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/mobile_ov_neodragon.yaml")
     parser.add_argument("--manifest", required=True, help="CSV with video_path/path/mp4 and prompt/caption/text columns.")
-    parser.add_argument("--bridge-ckpt", required=True)
+    parser.add_argument(
+        "--bridge-ckpt",
+        default="",
+        help="Optional aligned bridge checkpoint. Empty means random bridge initialization.",
+    )
     parser.add_argument("--output-dir", default="output/neodragon_dit_bridge_train")
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--bridge-lr", type=float, default=1e-5)
+    parser.add_argument(
+        "--train-bridge",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Jointly update the loaded bridge checkpoint with the student DiT.",
+    )
     parser.add_argument("--max-samples", type=int, default=-1)
     parser.add_argument("--train-last-n-blocks", type=int, default=1, help="0 trains the full DiT.")
     parser.add_argument("--target-fps", type=float, default=24.0)
@@ -447,8 +550,46 @@ def main() -> None:
     parser.add_argument("--caption-variant-columns", default="caption_short,caption_medium,caption_long")
     parser.add_argument("--caption-variant-weights", default="")
     parser.add_argument("--caption-fallback-column", default="caption")
+    parser.add_argument(
+        "--objective-mode",
+        choices=["joint-distill", "flow-only"],
+        default="joint-distill",
+        help="flow-only rejects every teacher objective and never loads teacher modules.",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--flow-start-weight", type=float, default=None)
+    parser.add_argument("--flow-weight", type=float, default=1.0)
+    parser.add_argument("--flow-final-weight", type=float, default=None)
+    parser.add_argument("--flow-ramp-steps", type=int, default=0)
+    parser.add_argument("--cooldown-steps", type=int, default=0)
+    parser.add_argument("--dit-warmup-steps", type=int, default=0)
     parser.add_argument("--distill-weight", type=float, default=0.0)
     parser.add_argument("--distill-cos-weight", type=float, default=0.0)
+    parser.add_argument("--preservation-weight", type=float, default=0.0)
+    parser.add_argument("--preservation-cos-weight", type=float, default=0.0)
+    parser.add_argument("--preservation-every", type=int, default=4)
+    parser.add_argument("--bridge-repr-weight", type=float, default=0.0)
+    parser.add_argument("--bridge-repr-final-weight", type=float, default=None)
+    parser.add_argument("--bridge-raw-token-weight", type=float, default=0.0)
+    parser.add_argument("--bridge-normalized-token-weight", type=float, default=1.0)
+    parser.add_argument("--bridge-cos-weight", type=float, default=0.5)
+    parser.add_argument("--bridge-token-norm-weight", type=float, default=0.1)
+    parser.add_argument("--bridge-pooled-weight", type=float, default=0.25)
+    parser.add_argument("--bridge-pooled-cos-weight", type=float, default=0.2)
+    parser.add_argument("--bridge-relational-weight", type=float, default=0.0)
+    parser.add_argument("--bridge-mask-weight", type=float, default=0.05)
+    parser.add_argument("--bridge-functional-weight", type=float, default=0.0)
+    parser.add_argument("--bridge-functional-cos-weight", type=float, default=0.0)
+    parser.add_argument("--bridge-functional-final-scale", type=float, default=1.0)
+    parser.add_argument("--bridge-functional-ramp-steps", type=int, default=0)
+    parser.add_argument("--bridge-functional-every", type=int, default=1)
+    parser.add_argument("--bridge-functional-batch-size", type=int, default=1)
+    parser.add_argument(
+        "--diagnostic-every",
+        type=int,
+        default=0,
+        help="Measure correct-vs-shuffled condition sensitivity without adding it to the loss.",
+    )
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument("--dtype", default=None)
@@ -463,12 +604,80 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    loss_weights = {
+        "flow start": args.flow_weight if args.flow_start_weight is None else args.flow_start_weight,
+        "flow": args.flow_weight,
+        "flow final": args.flow_weight if args.flow_final_weight is None else args.flow_final_weight,
+        "cross distill": args.distill_weight,
+        "cross distill cosine": args.distill_cos_weight,
+        "preservation": args.preservation_weight,
+        "preservation cosine": args.preservation_cos_weight,
+        "bridge representation": args.bridge_repr_weight,
+        "bridge representation final": (
+            args.bridge_repr_weight if args.bridge_repr_final_weight is None else args.bridge_repr_final_weight
+        ),
+        "bridge raw token": args.bridge_raw_token_weight,
+        "bridge normalized token": args.bridge_normalized_token_weight,
+        "bridge cosine": args.bridge_cos_weight,
+        "bridge token norm": args.bridge_token_norm_weight,
+        "bridge pooled": args.bridge_pooled_weight,
+        "bridge pooled cosine": args.bridge_pooled_cos_weight,
+        "bridge relational": args.bridge_relational_weight,
+        "bridge mask": args.bridge_mask_weight,
+        "bridge functional": args.bridge_functional_weight,
+        "bridge functional cosine": args.bridge_functional_cos_weight,
+        "bridge functional final scale": args.bridge_functional_final_scale,
+    }
+    invalid_weights = {name: value for name, value in loss_weights.items() if value < 0.0}
+    if invalid_weights:
+        raise ValueError(f"Loss weights must be non-negative, got {invalid_weights}")
+    if args.steps < 1 or args.log_every < 1 or args.save_every < 1:
+        raise ValueError("--steps, --log-every, and --save-every must be >= 1.")
+    if not 0 <= args.cooldown_steps <= args.steps:
+        raise ValueError("--cooldown-steps must be between 0 and --steps.")
+    if args.dit_warmup_steps < 0 or args.flow_ramp_steps < 0:
+        raise ValueError("--dit-warmup-steps and --flow-ramp-steps must be >= 0.")
+    if args.flow_ramp_steps + args.cooldown_steps > args.steps:
+        raise ValueError("--flow-ramp-steps + --cooldown-steps cannot exceed --steps.")
+    if args.preservation_every < 1 or args.bridge_functional_every < 1:
+        raise ValueError("Preservation and bridge functional frequencies must be >= 1.")
+    if args.bridge_functional_batch_size < 1 or args.bridge_functional_ramp_steps < 0:
+        raise ValueError("Bridge functional batch size must be >= 1 and ramp steps must be >= 0.")
+    if args.diagnostic_every < 0:
+        raise ValueError("--diagnostic-every must be >= 0.")
+    if args.train_bridge and args.parallel == "deepspeed":
+        raise ValueError("Joint bridge + DiT training requires --parallel fsdp or ddp, not deepspeed.")
+    if not args.bridge_ckpt and not args.train_bridge:
+        raise ValueError("Random bridge initialization requires --train-bridge.")
+    teacher_weights = {
+        "cross distill": args.distill_weight,
+        "cross distill cosine": args.distill_cos_weight,
+        "preservation": args.preservation_weight,
+        "preservation cosine": args.preservation_cos_weight,
+        "bridge representation": args.bridge_repr_weight,
+        "bridge representation final": (
+            args.bridge_repr_weight if args.bridge_repr_final_weight is None else args.bridge_repr_final_weight
+        ),
+        "bridge functional": args.bridge_functional_weight,
+        "bridge functional cosine": args.bridge_functional_cos_weight,
+    }
+    if args.objective_mode == "flow-only":
+        active_teacher_weights = {name: value for name, value in teacher_weights.items() if value > 0.0}
+        if active_teacher_weights:
+            raise ValueError(f"--objective-mode flow-only forbids teacher objectives: {active_teacher_weights}")
+
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("FSDP_USE_ORIG_PARAMS", "true")
     ctx = setup_distributed()
     if args.parallel in {"ddp", "fsdp"} and not ctx.is_distributed:
         rank0_print(ctx, f"Warning: --parallel={args.parallel} requested with WORLD_SIZE=1; falling back to --parallel=none.")
         args.parallel = "none"
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     cfg = load_config(args.config)
     if args.dtype:
@@ -529,7 +738,13 @@ def main() -> None:
         dtype,
         load_vae=not use_precomputed_latents,
     )
-    bridge = load_bridge(cfg, args.bridge_ckpt, ctx.device, dtype)
+    bridge = load_bridge(
+        cfg,
+        args.bridge_ckpt or None,
+        ctx.device,
+        dtype,
+        trainable=args.train_bridge,
+    )
     freeze_dit_for_last_n_blocks(dit, args.train_last_n_blocks)
     dit.train()
     trainable_count = sum(p.numel() for p in dit.parameters() if p.requires_grad)
@@ -538,6 +753,18 @@ def main() -> None:
     rank0_print(ctx, f"Trainable DiT parameters: {trainable_count:,}")
 
     dit_model = wrap_dit(dit, parallel=args.parallel, device=ctx.device, local_rank=ctx.local_rank)
+    bridge_model: torch.nn.Module = bridge
+    bridge_trainable_count = sum(p.numel() for p in bridge.parameters() if p.requires_grad)
+    if args.train_bridge:
+        if args.parallel == "deepspeed":
+            raise ValueError("--train-bridge is not supported with --parallel=deepspeed; use FSDP or DDP.")
+        bridge_model = wrap_bridge(
+            bridge,
+            parallel=args.parallel,
+            device=ctx.device,
+            local_rank=ctx.local_rank,
+        )
+    rank0_print(ctx, f"Trainable bridge parameters: {bridge_trainable_count:,}")
     deepspeed_engine = None
     opt = None
     if args.parallel == "deepspeed":
@@ -563,30 +790,108 @@ def main() -> None:
         )
         dit_model = deepspeed_engine
     else:
-        opt = torch.optim.AdamW((p for p in dit_model.parameters() if p.requires_grad), lr=args.lr, weight_decay=0.0)
+        parameter_groups = [
+            {
+                "params": [p for p in dit_model.parameters() if p.requires_grad],
+                "lr": args.lr,
+                "name": "dit",
+            }
+        ]
+        if args.train_bridge:
+            parameter_groups.append(
+                {
+                    "params": [p for p in bridge_model.parameters() if p.requires_grad],
+                    "lr": args.bridge_lr,
+                    "name": "bridge",
+                }
+            )
+        opt = torch.optim.AdamW(parameter_groups, weight_decay=0.0)
 
     teacher_text = None
     teacher_context_adapter = None
     teacher_dit = None
-    if args.distill_weight > 0.0 or args.distill_cos_weight > 0.0:
+    needs_teacher = bool(
+        args.objective_mode != "flow-only"
+        and any(value > 0.0 for value in teacher_weights.values())
+    )
+    if needs_teacher:
         rank0_print(
             ctx,
             f"Loading frozen Neodragon teacher for functional distill: "
-            f"mse_weight={args.distill_weight} cos_weight={args.distill_cos_weight}",
+            f"mse_weight={args.distill_weight} cos_weight={args.distill_cos_weight} "
+            f"preserve={args.preservation_weight}/{args.preservation_cos_weight} "
+            f"bridge_repr={args.bridge_repr_weight} "
+            f"bridge_functional={args.bridge_functional_weight}/{args.bridge_functional_cos_weight}",
         )
         teacher_text, teacher_context_adapter, teacher_dit = load_neodragon_teacher_modules(cfg, ctx.device, dtype)
+
+    # Keep model initialization identical across ranks, then decorrelate data,
+    # noise, stage, and timestep sampling for distributed training.
+    rank_seed = args.seed + ctx.rank
+    random.seed(rank_seed)
+    np.random.seed(rank_seed)
+    torch.manual_seed(rank_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(rank_seed)
+    sample_generator = torch.Generator(device=ctx.device)
+    sample_generator.manual_seed(rank_seed + 100_000)
 
     from neodragon.utils.generation_utils import _get_pyramid_latent, _prepare_past_condition_latents
 
     history: list[dict[str, float]] = []
+    bridge_initialization = "checkpoint" if args.bridge_ckpt else "random"
+    rank0_print(
+        ctx,
+        f"Objective mode={args.objective_mode} bridge_initialization={bridge_initialization} seed={args.seed}",
+    )
     pbar = tqdm(range(1, args.steps + 1), desc="Train Neodragon DiT with Mobile-OV bridge", disable=not ctx.is_main)
     for step in pbar:
+        warmup_scale = min(step / float(max(args.dit_warmup_steps, 1)), 1.0) if args.dit_warmup_steps > 0 else 1.0
+        cooldown_progress = 0.0
+        if args.cooldown_steps > 0 and step > args.steps - args.cooldown_steps:
+            cooldown_progress = (step - (args.steps - args.cooldown_steps)) / float(args.cooldown_steps)
+        flow_weight = scheduled_weight(
+            step,
+            total_steps=args.steps,
+            peak_weight=args.flow_weight,
+            start_weight=args.flow_start_weight,
+            warmup_steps=args.flow_ramp_steps,
+            final_weight=args.flow_final_weight,
+            cooldown_steps=args.cooldown_steps,
+        )
+        bridge_repr_weight = scheduled_weight(
+            step,
+            total_steps=args.steps,
+            peak_weight=args.bridge_repr_weight,
+            final_weight=args.bridge_repr_final_weight,
+            cooldown_steps=args.cooldown_steps,
+        )
+        bridge_functional_scale = scheduled_weight(
+            step,
+            total_steps=args.steps,
+            peak_weight=1.0,
+            start_weight=0.0 if args.bridge_functional_ramp_steps > 0 else 1.0,
+            warmup_steps=args.bridge_functional_ramp_steps,
+            final_weight=args.bridge_functional_final_scale,
+            cooldown_steps=args.cooldown_steps,
+        )
+        lr_cooldown_scale = 1.0 - 0.9 * cooldown_progress
+        if opt is not None and deepspeed_engine is None:
+            for group in opt.param_groups:
+                base_lr = args.bridge_lr if group.get("name") == "bridge" else args.lr
+                group["lr"] = base_lr * warmup_scale * lr_cooldown_scale
+
         batch = next(batches)
         prompts = [p + prompt_modifier for p in batch["prompt"]]
 
+        if args.train_bridge:
+            bridge_tokens, bridge_mask, pooled, bridge_aux = bridge_model(prompts, return_aux=True)
+        else:
+            with torch.no_grad():
+                bridge_tokens, bridge_mask, pooled, bridge_aux = bridge_model(prompts, return_aux=True)
+        encoder_hidden_states = bridge_tokens
+
         with torch.no_grad():
-            bridge_tokens, bridge_mask, pooled = bridge(prompts)
-            encoder_hidden_states = bridge_tokens
             if use_precomputed_latents:
                 latents = batch["latents"].to(device=ctx.device, dtype=dtype, non_blocking=True)
             else:
@@ -599,8 +904,18 @@ def main() -> None:
         latent_t = int(latents.shape[2])
         if latent_t < 2:
             raise RuntimeError(f"Need at least two latent frames for hybrid video training, got {latent_t}")
-        unit_index = int(torch.randint(1, latent_t, (1,), device=ctx.device).item())
-        stage = int(torch.randint(0, scheduler.config.stages, (1,), device=ctx.device).item())
+        unit_index = int(
+            torch.randint(1, latent_t, (1,), device=ctx.device, generator=sample_generator).item()
+        )
+        stage = int(
+            torch.randint(
+                0,
+                scheduler.config.stages,
+                (1,),
+                device=ctx.device,
+                generator=sample_generator,
+            ).item()
+        )
         past_units = [latents[:, :, i : i + 1] for i in range(unit_index)]
         past_conditions = _prepare_past_condition_latents(
             past_units,
@@ -609,8 +924,19 @@ def main() -> None:
         )
         clean_full = latents[:, :, unit_index : unit_index + 1]
         clean_stage = _get_pyramid_latent(clean_full, scheduler.config.stages)[stage].to(dtype=dtype)
-        noise = torch.randn_like(clean_stage)
-        t_idx = torch.randint(0, scheduler.config.num_train_timesteps, (clean_stage.shape[0],), device=ctx.device)
+        noise = torch.randn(
+            clean_stage.shape,
+            device=clean_stage.device,
+            dtype=clean_stage.dtype,
+            generator=sample_generator,
+        )
+        t_idx = torch.randint(
+            0,
+            scheduler.config.num_train_timesteps,
+            (clean_stage.shape[0],),
+            device=ctx.device,
+            generator=sample_generator,
+        )
         sigmas = scheduler.sigmas_per_stage[stage].to(device=ctx.device, dtype=dtype)[t_idx]
         timestep = scheduler.timesteps_per_stage[stage].to(device=ctx.device, dtype=dtype)[t_idx]
         while sigmas.dim() < clean_stage.dim():
@@ -629,6 +955,26 @@ def main() -> None:
         diff_loss = F.mse_loss(pred.float(), target_flow.float())
         distill_loss = pred.new_zeros(())
         distill_cos_loss = pred.new_zeros(())
+        preservation_loss = pred.new_zeros(())
+        preservation_cos_loss = pred.new_zeros(())
+        bridge_repr_loss = pred.new_zeros(())
+        bridge_repr_losses = {
+            "raw_token": pred.new_zeros(()),
+            "normalized_token": pred.new_zeros(()),
+            "token_cosine": pred.new_zeros(()),
+            "token_norm": pred.new_zeros(()),
+            "pooled_mse": pred.new_zeros(()),
+            "pooled_cosine": pred.new_zeros(()),
+            "relational": pred.new_zeros(()),
+            "mask": pred.new_zeros(()),
+        }
+        bridge_functional_loss = pred.new_zeros(())
+        bridge_functional_cos_loss = pred.new_zeros(())
+        bridge_functional_frequency_scale = 0.0
+        teacher_tokens = None
+        teacher_mask = None
+        teacher_pooled = None
+        teacher_pred = None
         if teacher_dit is not None and teacher_text is not None and teacher_context_adapter is not None:
             with torch.no_grad():
                 teacher_tokens, teacher_mask, teacher_pooled = teacher_text(prompts, ctx.device)
@@ -643,13 +989,103 @@ def main() -> None:
             if args.distill_weight > 0.0:
                 distill_loss = F.mse_loss(pred.float(), teacher_pred.float())
             if args.distill_cos_weight > 0.0:
-                distill_cos_loss = 1.0 - F.cosine_similarity(
-                    pred.float().reshape(pred.shape[0], -1),
-                    teacher_pred.float().reshape(teacher_pred.shape[0], -1),
-                    dim=-1,
-                ).mean()
-        loss = diff_loss + args.distill_weight * distill_loss + args.distill_cos_weight * distill_cos_loss
+                distill_cos_loss = flat_cosine_distance(pred, teacher_pred)
 
+            if bridge_repr_weight > 0.0:
+                bridge_repr_losses = bridge_representation_losses(
+                    bridge_tokens,
+                    teacher_tokens,
+                    teacher_mask,
+                    pooled,
+                    teacher_pooled,
+                    bridge_aux.get("mask_logits"),
+                )
+                if args.bridge_relational_weight > 0.0 and ctx.is_distributed:
+                    global_bridge_tokens = _gather_with_gradient(bridge_tokens)
+                    global_teacher_tokens = _gather_detached(teacher_tokens)
+                    global_teacher_mask = _gather_detached(teacher_mask)
+                    bridge_repr_losses["relational"] = relational_cosine(
+                        global_bridge_tokens,
+                        global_teacher_tokens,
+                        global_teacher_mask,
+                    )
+                bridge_repr_loss = weighted_loss_sum(
+                    bridge_repr_losses,
+                    {
+                        "raw_token": args.bridge_raw_token_weight,
+                        "normalized_token": args.bridge_normalized_token_weight,
+                        "token_cosine": args.bridge_cos_weight,
+                        "token_norm": args.bridge_token_norm_weight,
+                        "pooled_mse": args.bridge_pooled_weight,
+                        "pooled_cosine": args.bridge_pooled_cos_weight,
+                        "relational": args.bridge_relational_weight,
+                        "mask": args.bridge_mask_weight,
+                    },
+                )
+
+            run_bridge_functional = bool(
+                (args.bridge_functional_weight > 0.0 or args.bridge_functional_cos_weight > 0.0)
+                and (step - 1) % max(args.bridge_functional_every, 1) == 0
+            )
+            if run_bridge_functional:
+                effect_bs = min(max(args.bridge_functional_batch_size, 1), pred.shape[0])
+                effect_stage_input = [value[:effect_bs] for value in stage_input]
+                bridge_teacher_prediction = teacher_dit(
+                    sample=[effect_stage_input],
+                    encoder_hidden_states=bridge_tokens[:effect_bs],
+                    encoder_attention_mask=bridge_mask[:effect_bs],
+                    pooled_projections=pooled[:effect_bs],
+                    timestep_ratio=timestep[:effect_bs],
+                )[0]
+                bridge_functional_loss = F.mse_loss(
+                    bridge_teacher_prediction.float(),
+                    teacher_pred[:effect_bs].float(),
+                )
+                bridge_functional_cos_loss = flat_cosine_distance(
+                    bridge_teacher_prediction,
+                    teacher_pred[:effect_bs],
+                )
+                bridge_functional_frequency_scale = float(max(args.bridge_functional_every, 1))
+
+            run_preservation = bool(
+                (args.preservation_weight > 0.0 or args.preservation_cos_weight > 0.0)
+                and (step - 1) % max(args.preservation_every, 1) == 0
+            )
+            if run_preservation:
+                student_teacher_condition_pred = dit_model(
+                    sample=[stage_input],
+                    encoder_hidden_states=teacher_tokens,
+                    encoder_attention_mask=teacher_mask,
+                    pooled_projections=teacher_pooled,
+                    timestep_ratio=timestep,
+                )[0]
+                preservation_loss = F.mse_loss(
+                    student_teacher_condition_pred.float(),
+                    teacher_pred.float(),
+                )
+                preservation_cos_loss = flat_cosine_distance(student_teacher_condition_pred, teacher_pred)
+
+        preservation_frequency_scale = float(max(args.preservation_every, 1)) if preservation_loss.requires_grad else 0.0
+        loss = (
+            flow_weight * diff_loss
+            + args.distill_weight * distill_loss
+            + args.distill_cos_weight * distill_cos_loss
+            + preservation_frequency_scale
+            * (
+                args.preservation_weight * preservation_loss
+                + args.preservation_cos_weight * preservation_cos_loss
+            )
+            + bridge_repr_weight * bridge_repr_loss
+            + bridge_functional_frequency_scale
+            * bridge_functional_scale
+            * (
+                args.bridge_functional_weight * bridge_functional_loss
+                + args.bridge_functional_cos_weight * bridge_functional_cos_loss
+            )
+        )
+
+        dit_grad_norm = pred.new_zeros(())
+        bridge_grad_norm = pred.new_zeros(())
         if deepspeed_engine is not None:
             deepspeed_engine.backward(loss)
             deepspeed_engine.step()
@@ -659,23 +1095,108 @@ def main() -> None:
             loss.backward()
             if args.clip_grad_norm > 0:
                 if args.parallel == "fsdp" and hasattr(dit_model, "clip_grad_norm_"):
-                    dit_model.clip_grad_norm_(args.clip_grad_norm)
+                    dit_grad_norm = dit_model.clip_grad_norm_(args.clip_grad_norm)
+                    if args.train_bridge and hasattr(bridge_model, "clip_grad_norm_"):
+                        bridge_grad_norm = bridge_model.clip_grad_norm_(args.clip_grad_norm)
                 else:
-                    torch.nn.utils.clip_grad_norm_(dit_model.parameters(), args.clip_grad_norm)
+                    dit_parameters = [p for p in dit_model.parameters() if p.requires_grad]
+                    dit_grad_norm = torch.nn.utils.clip_grad_norm_(dit_parameters, args.clip_grad_norm)
+                    if args.train_bridge:
+                        bridge_parameters = [p for p in bridge_model.parameters() if p.requires_grad]
+                        bridge_grad_norm = torch.nn.utils.clip_grad_norm_(bridge_parameters, args.clip_grad_norm)
             opt.step()
+
+        diagnostic_active = 0.0
+        diagnostic_correct_flow_loss = pred.new_zeros(())
+        diagnostic_shuffled_flow_loss = pred.new_zeros(())
+        diagnostic_text_sensitivity = pred.new_zeros(())
+        diagnostic_condition_offdiag_cos = pred.new_zeros(())
+        run_diagnostic = bool(args.diagnostic_every > 0 and step % args.diagnostic_every == 0)
+        if run_diagnostic:
+            shuffled_tokens = _shift_condition_across_global_batch(bridge_tokens)
+            shuffled_mask = _shift_condition_across_global_batch(bridge_mask)
+            shuffled_pooled = _shift_condition_across_global_batch(pooled)
+            if shuffled_tokens is not None and shuffled_mask is not None and shuffled_pooled is not None:
+                with torch.no_grad():
+                    diagnostic_correct_prediction = dit_model(
+                        sample=[stage_input],
+                        encoder_hidden_states=bridge_tokens.detach(),
+                        encoder_attention_mask=bridge_mask.detach(),
+                        pooled_projections=pooled.detach(),
+                        timestep_ratio=timestep,
+                    )[0]
+                    diagnostic_shuffled_prediction = dit_model(
+                        sample=[stage_input],
+                        encoder_hidden_states=shuffled_tokens,
+                        encoder_attention_mask=shuffled_mask,
+                        pooled_projections=shuffled_pooled,
+                        timestep_ratio=timestep,
+                    )[0]
+                    diagnostic_correct_flow_loss = F.mse_loss(
+                        diagnostic_correct_prediction.float(),
+                        target_flow.float(),
+                    )
+                    diagnostic_shuffled_flow_loss = F.mse_loss(
+                        diagnostic_shuffled_prediction.float(),
+                        target_flow.float(),
+                    )
+                    diagnostic_text_sensitivity = F.mse_loss(
+                        diagnostic_correct_prediction.float(),
+                        diagnostic_shuffled_prediction.float(),
+                    )
+                    global_tokens = _gather_detached(bridge_tokens)
+                    global_mask = _gather_detached(bridge_mask)
+                    diagnostic_condition_offdiag_cos = _condition_offdiag_cosine(global_tokens, global_mask)
+                    diagnostic_active = 1.0
 
         if step % args.log_every == 0 or step == 1:
             item = {
                     "step": float(step),
                     "loss": scalar_mean(loss.detach(), ctx),
                     "diff_loss": scalar_mean(diff_loss.detach(), ctx),
+                    "flow_weight": float(flow_weight),
                     "distill_loss": scalar_mean(distill_loss.detach(), ctx),
                     "distill_cos_loss": scalar_mean(distill_cos_loss.detach(), ctx),
+                    "preservation_loss": scalar_mean(preservation_loss.detach(), ctx),
+                    "preservation_cos_loss": scalar_mean(preservation_cos_loss.detach(), ctx),
+                    "bridge_repr_loss": scalar_mean(bridge_repr_loss.detach(), ctx),
+                    "bridge_raw_token_loss": scalar_mean(bridge_repr_losses["raw_token"].detach(), ctx),
+                    "bridge_normalized_token_loss": scalar_mean(
+                        bridge_repr_losses["normalized_token"].detach(), ctx
+                    ),
+                    "bridge_token_cos_loss": scalar_mean(bridge_repr_losses["token_cosine"].detach(), ctx),
+                    "bridge_token_norm_loss": scalar_mean(bridge_repr_losses["token_norm"].detach(), ctx),
+                    "bridge_pooled_loss": scalar_mean(bridge_repr_losses["pooled_mse"].detach(), ctx),
+                    "bridge_pooled_cos_loss": scalar_mean(
+                        bridge_repr_losses["pooled_cosine"].detach(), ctx
+                    ),
+                    "bridge_relational_loss": scalar_mean(bridge_repr_losses["relational"].detach(), ctx),
+                    "bridge_mask_loss": scalar_mean(bridge_repr_losses["mask"].detach(), ctx),
+                    "bridge_repr_weight": float(bridge_repr_weight),
+                    "bridge_functional_loss": scalar_mean(bridge_functional_loss.detach(), ctx),
+                    "bridge_functional_cos_loss": scalar_mean(bridge_functional_cos_loss.detach(), ctx),
+                    "bridge_functional_scale": float(bridge_functional_scale),
+                    "diagnostic_active": float(diagnostic_active),
+                    "diagnostic_correct_flow_loss": scalar_mean(diagnostic_correct_flow_loss.detach(), ctx),
+                    "diagnostic_shuffled_flow_loss": scalar_mean(diagnostic_shuffled_flow_loss.detach(), ctx),
+                    "diagnostic_text_sensitivity": scalar_mean(diagnostic_text_sensitivity.detach(), ctx),
+                    "diagnostic_condition_offdiag_cos": scalar_mean(
+                        diagnostic_condition_offdiag_cos.detach(), ctx
+                    ),
+                    "dit_lr_scale": float(warmup_scale * lr_cooldown_scale),
                     "unit_index": float(unit_index),
                     "stage": float(stage),
                     "latent_t": float(latent_t),
                     "trainable_params": float(trainable_count),
+                    "trainable_bridge_params": float(bridge_trainable_count),
+                    "dit_grad_norm": scalar_mean(dit_grad_norm.detach(), ctx),
+                    "bridge_grad_norm": scalar_mean(bridge_grad_norm.detach(), ctx),
                     "world_size": float(ctx.world_size),
+                    "gpu_peak_allocated_gib": (
+                        float(torch.cuda.max_memory_allocated(ctx.device) / (1024**3))
+                        if ctx.device.type == "cuda"
+                        else 0.0
+                    ),
             }
             if ctx.is_main:
                 history.append(item)
@@ -683,20 +1204,43 @@ def main() -> None:
                     loss=f"{item['loss']:.4f}",
                     diff=f"{item['diff_loss']:.4f}",
                     dist=f"{item['distill_loss']:.4f}",
+                    preserve=f"{item['preservation_loss']:.4f}",
+                    bfunc=f"{item['bridge_functional_loss']:.4f}",
                     unit=unit_index,
                     stage=stage,
                 )
 
         if step % args.save_every == 0 or step == args.steps:
             state = full_state_dict(dit_model, args.parallel)
+            bridge_state = (
+                full_state_dict(bridge_model, args.parallel)
+                if args.train_bridge
+                else bridge.state_dict()
+            )
             if ctx.is_main:
                 payload = {
                     "step": step,
                     "dit": state,
-                    "bridge_ckpt": args.bridge_ckpt,
+                    "bridge": bridge_state,
+                    "bridge_ckpt": args.bridge_ckpt or None,
+                    "bridge_initialization": bridge_initialization,
                     "config": cfg,
                     "args": vars(args),
                     "history": history,
+                    "objective": {
+                        "mode": args.objective_mode,
+                        "flow_matching": True,
+                        "teacher_cross_distillation": bool(args.distill_weight or args.distill_cos_weight),
+                        "teacher_condition_preservation": bool(
+                            args.preservation_weight or args.preservation_cos_weight
+                        ),
+                        "joint_bridge_training": bool(args.train_bridge),
+                        "bridge_representation_distillation": bool(args.bridge_repr_weight),
+                        "frozen_teacher_bridge_functional_distillation": bool(
+                            args.bridge_functional_weight or args.bridge_functional_cos_weight
+                        ),
+                        "teacher_modules_loaded": bool(needs_teacher),
+                    },
                     "parallel": {
                         "backend": args.parallel,
                         "world_size": ctx.world_size,

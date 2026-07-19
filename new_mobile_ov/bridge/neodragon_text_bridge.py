@@ -10,6 +10,69 @@ from new_mobile_ov.bridge.text_bridge import pool_prompt_tokens
 from new_mobile_ov.config import BridgeConfig
 
 
+class NeoDragonSequenceTranslator(nn.Module):
+    """Translate Smol token positions into NeoDragon's 128-token condition sequence."""
+
+    def __init__(self, dim: int, sequence_length: int, num_heads: int):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
+        self.query_pos = nn.Parameter(torch.zeros(1, sequence_length, dim))
+        self.query_norm = nn.LayerNorm(dim)
+        self.context_norm = nn.LayerNorm(dim)
+        self.cross_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.ff_norm = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.SiLU(),
+            nn.Linear(dim * 2, dim),
+        )
+        nn.init.normal_(self.query_pos, std=0.02)
+        nn.init.zeros_(self.ff[-1].weight)
+        nn.init.zeros_(self.ff[-1].bias)
+
+    def forward(self, tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if tokens.shape[1] != self.query_pos.shape[1]:
+            raise ValueError(
+                f"Expected {self.query_pos.shape[1]} source tokens, got {tokens.shape[1]}. "
+                "The NeoDragon bridge requires a fixed token sequence."
+            )
+        if mask.shape != tokens.shape[:2]:
+            raise ValueError(f"Mask shape {tuple(mask.shape)} does not match tokens {tuple(tokens.shape[:2])}.")
+        queries = tokens + self.query_pos[:, : tokens.shape[1]].to(dtype=tokens.dtype)
+        translated, _ = self.cross_attn(
+            self.query_norm(queries),
+            self.context_norm(tokens),
+            self.context_norm(tokens),
+            key_padding_mask=~mask.bool(),
+            need_weights=False,
+        )
+        translated = queries + translated
+        return translated + self.ff(self.ff_norm(translated))
+
+
+class NeoDragonConditionHead(nn.Module):
+    """Map normalized MCP features to the raw distribution expected by NeoDragon."""
+
+    def __init__(self, dim: int, bottleneck_dim: int, scale_init: float):
+        super().__init__()
+        self.input_norm = nn.LayerNorm(dim)
+        self.residual = nn.Sequential(
+            nn.Linear(dim, bottleneck_dim),
+            nn.SiLU(),
+            nn.Linear(bottleneck_dim, dim),
+        )
+        self.output_scale = nn.Parameter(torch.full((dim,), float(scale_init)))
+        self.output_bias = nn.Parameter(torch.zeros(dim))
+        nn.init.zeros_(self.residual[-1].weight)
+        nn.init.zeros_(self.residual[-1].bias)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        normalized = self.input_norm(tokens)
+        residual = self.residual(normalized)
+        return normalized * self.output_scale + self.output_bias + residual
+
+
 class MobileOVNeodragonTextBridge(nn.Module):
     """SmolVLM2 + Bridge v2 with Neodragon DiT-condition-shaped outputs.
 
@@ -42,6 +105,7 @@ class MobileOVNeodragonTextBridge(nn.Module):
         self.token_dim = int(token_dim)
         self.pooled_dim = int(pooled_dim)
         self.sequence_length = int(sequence_length)
+        self.use_v2_conditioning = bool(cfg.neodragon_v2_conditioning)
 
         self.token_bridge = SanaPromptBridge(
             smolvlm2_ckpt_path=cfg.smolvlm2_ckpt_path,
@@ -74,15 +138,83 @@ class MobileOVNeodragonTextBridge(nn.Module):
             nn.LayerNorm(self.token_dim),
             nn.Linear(self.token_dim, self.pooled_dim),
         )
+        if self.use_v2_conditioning:
+            self.sequence_translator = NeoDragonSequenceTranslator(
+                self.token_dim,
+                self.sequence_length,
+                int(cfg.neodragon_resampler_heads),
+            )
+            self.condition_head = NeoDragonConditionHead(
+                self.token_dim,
+                int(cfg.neodragon_condition_bottleneck_dim),
+                float(cfg.neodragon_condition_scale_init),
+            )
+            self.mask_length_head = nn.Linear(self.token_dim, 1)
+            nn.init.zeros_(self.mask_length_head.weight)
+            nn.init.zeros_(self.mask_length_head.bias)
+        else:
+            self.sequence_translator = nn.Identity()
+            self.condition_head = nn.Identity()
+            self.mask_length_head = None
         self.to(device=self.device, dtype=dtype)
 
-    def forward(self, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.encode(prompts)
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # The backbone is frozen; keeping it in eval mode prevents stochastic
+        # hidden states while the bridge heads remain trainable.
+        self.token_bridge.smolvlm2_model.eval()
+        return self
 
-    def encode(self, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        prompt_embeds, prompt_mask = self.token_bridge(prompts, return_mask=True)
-        prompt_embeds = prompt_embeds.to(device=self.device, dtype=self.dtype)
-        prompt_mask = prompt_mask.to(device=self.device)
-        pooled_source = pool_prompt_tokens(prompt_embeds, prompt_mask)
+    def forward(
+        self,
+        prompts: List[str],
+        *,
+        return_aux: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]
+    ]:
+        return self.encode(prompts, return_aux=return_aux)
+
+    def encode(
+        self,
+        prompts: List[str],
+        *,
+        return_aux: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]
+    ]:
+        base_tokens, base_mask = self.token_bridge(prompts, return_mask=True)
+        base_tokens = base_tokens.to(device=self.device, dtype=self.dtype)
+        base_mask = base_mask.to(device=self.device)
+        pooled_source = pool_prompt_tokens(base_tokens, base_mask)
         pooled = self.pooled_head(pooled_source)
-        return prompt_embeds, prompt_mask, pooled
+
+        aux: dict[str, torch.Tensor] = {"base_mask": base_mask}
+        if self.use_v2_conditioning:
+            translated = self.sequence_translator(base_tokens, base_mask)
+            prompt_embeds = self.condition_head(translated)
+
+            assert self.mask_length_head is not None
+            base_lengths = base_mask.float().sum(dim=1)
+            max_delta = self.sequence_length * float(self.cfg.neodragon_mask_length_delta_ratio)
+            length_delta = torch.tanh(self.mask_length_head(pooled_source).squeeze(-1).float()) * max_delta
+            predicted_lengths = (base_lengths + length_delta).clamp(1.0, float(self.sequence_length))
+            positions = torch.arange(self.sequence_length, device=base_mask.device, dtype=torch.float32)
+            temperature = max(float(self.cfg.neodragon_mask_temperature), 1e-3)
+            mask_logits = (predicted_lengths[:, None] - positions[None, :] - 0.5) / temperature
+            prompt_mask = (mask_logits >= 0).to(dtype=base_mask.dtype)
+            aux.update(
+                {
+                    "mask_logits": mask_logits,
+                    "predicted_lengths": predicted_lengths,
+                    "translated_tokens": translated,
+                }
+            )
+        else:
+            prompt_embeds = base_tokens
+            prompt_mask = base_mask
+
+        result = (prompt_embeds, prompt_mask, pooled)
+        if return_aux:
+            return (*result, aux)
+        return result

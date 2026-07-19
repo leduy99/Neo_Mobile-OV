@@ -29,6 +29,12 @@ class BridgeConfig:
     strict_sana_head_tokens: int = 96
     strict_sana_tail_tokens: int = 96
     fail_fast_mask: bool = True
+    neodragon_v2_conditioning: bool = False
+    neodragon_resampler_heads: int = 12
+    neodragon_condition_bottleneck_dim: int = 768
+    neodragon_condition_scale_init: float = 0.78
+    neodragon_mask_length_delta_ratio: float = 0.25
+    neodragon_mask_temperature: float = 1.0
 
 
 @dataclass
