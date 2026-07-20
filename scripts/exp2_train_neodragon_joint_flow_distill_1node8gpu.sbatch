@@ -22,9 +22,9 @@ export TRITON_CACHE_DIR=/proj/cvl/users/x_fahkh2/caches
 
 CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-${CONDA_ENV}/bin/torchrun}"
-CONFIG="${CONFIG:-configs/mobile_ov_neodragon_bridge_v2.yaml}"
+CONFIG="${CONFIG:-configs/mobile_ov_neodragon.yaml}"
 MANIFEST="${MANIFEST:-data/openvid_neodragon_2s_latents/latent_manifest.csv}"
-BRIDGE_CKPT="${BRIDGE_CKPT:-}"
+BRIDGE_CKPT="${BRIDGE_CKPT:-output/neo_bridge_8gpu_200k/17002251/neodragon_text_bridge_latest.pt}"
 OUT="${OUT:-output/neo_exp2_joint_flow_distill/${SLURM_JOB_ID:-local}}"
 STEPS="${STEPS:-28000}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
@@ -41,7 +41,7 @@ export TORCH_DIST_TIMEOUT_MINUTES="${TORCH_DIST_TIMEOUT_MINUTES:-60}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 if [[ -z "${BRIDGE_CKPT}" || ! -f "${BRIDGE_CKPT}" ]]; then
-  echo "Set BRIDGE_CKPT to Experiment 1 neodragon_text_bridge_latest.pt" >&2
+  echo "Missing aligned bridge checkpoint: BRIDGE_CKPT=${BRIDGE_CKPT}" >&2
   exit 1
 fi
 if [[ ! -f "${MANIFEST}" ]]; then

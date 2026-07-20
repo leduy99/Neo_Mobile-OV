@@ -25,7 +25,6 @@ from new_mobile_ov.config import load_config
 from new_mobile_ov.training.neodragon_objectives import (
     flat_cosine_distance,
     linear_ramp,
-    mask_binary_cross_entropy,
     masked_mean_norm,
     masked_token_cosine,
     masked_token_mse,
@@ -309,7 +308,6 @@ def main() -> None:
     parser.add_argument("--pooled-weight", type=float, default=0.25)
     parser.add_argument("--pooled-cos-weight", type=float, default=0.0)
     parser.add_argument("--relational-weight", type=float, default=0.0)
-    parser.add_argument("--mask-weight", type=float, default=0.0)
     parser.add_argument("--functional-weight", type=float, default=0.0)
     parser.add_argument("--functional-cos-weight", type=float, default=0.0)
     parser.add_argument("--functional-start-step", type=int, default=1)
@@ -340,7 +338,6 @@ def main() -> None:
         "pooled": args.pooled_weight,
         "pooled cosine": args.pooled_cos_weight,
         "relational": args.relational_weight,
-        "mask": args.mask_weight,
         "functional": args.functional_weight,
         "functional cosine": args.functional_cos_weight,
     }
@@ -463,7 +460,7 @@ def main() -> None:
             target_tokens, target_mask, target_pooled = teacher(prompts, ctx.device)
             target_tokens = context_adapter(target_tokens)
 
-        pred_tokens, pred_mask, pred_pooled, bridge_aux = bridge_model(prompts, return_aux=True)
+        pred_tokens, pred_mask, pred_pooled = bridge_model(prompts)
         target_tokens = target_tokens.float()
         target_pooled = target_pooled.float()
         target_mask = target_mask.to(device=ctx.device)
@@ -480,7 +477,6 @@ def main() -> None:
         norm_loss = token_norm_alignment(pred_tokens, target_tokens, target_mask)
         pooled_cos_loss = pooled_cosine(pred_pooled, target_pooled)
         relational_loss = relational_cosine(pred_tokens, target_tokens, target_mask)
-        mask_loss = mask_binary_cross_entropy(bridge_aux.get("mask_logits"), target_mask)
 
         functional_loss = pred_tokens.new_zeros(())
         functional_cos_loss = pred_tokens.new_zeros(())
@@ -534,7 +530,6 @@ def main() -> None:
             + args.pooled_weight * pooled_loss
             + args.pooled_cos_weight * pooled_cos_loss
             + args.relational_weight * relational_loss
-            + args.mask_weight * mask_loss
             + functional_scale
             * (
                 args.functional_weight * functional_loss
@@ -573,7 +568,6 @@ def main() -> None:
                 "norm_loss": scalar_mean(norm_loss.detach(), ctx),
                 "pooled_cos_loss": scalar_mean(pooled_cos_loss.detach(), ctx),
                 "relational_loss": scalar_mean(relational_loss.detach(), ctx),
-                "mask_loss": scalar_mean(mask_loss.detach(), ctx),
                 "mask_accuracy": scalar_mean(mask_accuracy.detach(), ctx),
                 "functional_loss": scalar_mean(functional_loss.detach(), ctx),
                 "functional_cos_loss": scalar_mean(functional_cos_loss.detach(), ctx),
@@ -607,7 +601,7 @@ def main() -> None:
                     "history": history,
                     "target": "neodragon_dit_condition_direct",
                     "architecture": {
-                        "neodragon_v2_conditioning": bool(cfg.bridge.neodragon_v2_conditioning),
+                        "bridge_contract": "original_neodragon_direct_condition",
                         "functional_distillation": functional_enabled,
                     },
                     "parallel": {

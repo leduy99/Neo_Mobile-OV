@@ -374,9 +374,9 @@ def load_bridge(
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         state = ckpt.get("bridge", ckpt.get("student_state", ckpt))
         missing, unexpected = bridge.load_state_dict(state, strict=False)
-        if bool(cfg.bridge.neodragon_v2_conditioning) and (missing or unexpected):
+        if missing or unexpected:
             raise RuntimeError(
-                "Bridge checkpoint does not match the configured NeoDragon v2 architecture: "
+                "Bridge checkpoint does not match the original NeoDragon bridge architecture: "
                 f"missing={missing[:8]} unexpected={unexpected[:8]}"
             )
     elif not trainable:
@@ -577,7 +577,6 @@ def main() -> None:
     parser.add_argument("--bridge-pooled-weight", type=float, default=0.25)
     parser.add_argument("--bridge-pooled-cos-weight", type=float, default=0.2)
     parser.add_argument("--bridge-relational-weight", type=float, default=0.0)
-    parser.add_argument("--bridge-mask-weight", type=float, default=0.05)
     parser.add_argument("--bridge-functional-weight", type=float, default=0.0)
     parser.add_argument("--bridge-functional-cos-weight", type=float, default=0.0)
     parser.add_argument("--bridge-functional-final-scale", type=float, default=1.0)
@@ -623,7 +622,6 @@ def main() -> None:
         "bridge pooled": args.bridge_pooled_weight,
         "bridge pooled cosine": args.bridge_pooled_cos_weight,
         "bridge relational": args.bridge_relational_weight,
-        "bridge mask": args.bridge_mask_weight,
         "bridge functional": args.bridge_functional_weight,
         "bridge functional cosine": args.bridge_functional_cos_weight,
         "bridge functional final scale": args.bridge_functional_final_scale,
@@ -885,10 +883,10 @@ def main() -> None:
         prompts = [p + prompt_modifier for p in batch["prompt"]]
 
         if args.train_bridge:
-            bridge_tokens, bridge_mask, pooled, bridge_aux = bridge_model(prompts, return_aux=True)
+            bridge_tokens, bridge_mask, pooled = bridge_model(prompts)
         else:
             with torch.no_grad():
-                bridge_tokens, bridge_mask, pooled, bridge_aux = bridge_model(prompts, return_aux=True)
+                bridge_tokens, bridge_mask, pooled = bridge_model(prompts)
         encoder_hidden_states = bridge_tokens
 
         with torch.no_grad():
@@ -966,7 +964,6 @@ def main() -> None:
             "pooled_mse": pred.new_zeros(()),
             "pooled_cosine": pred.new_zeros(()),
             "relational": pred.new_zeros(()),
-            "mask": pred.new_zeros(()),
         }
         bridge_functional_loss = pred.new_zeros(())
         bridge_functional_cos_loss = pred.new_zeros(())
@@ -998,7 +995,6 @@ def main() -> None:
                     teacher_mask,
                     pooled,
                     teacher_pooled,
-                    bridge_aux.get("mask_logits"),
                 )
                 if args.bridge_relational_weight > 0.0 and ctx.is_distributed:
                     global_bridge_tokens = _gather_with_gradient(bridge_tokens)
@@ -1019,7 +1015,6 @@ def main() -> None:
                         "pooled_mse": args.bridge_pooled_weight,
                         "pooled_cosine": args.bridge_pooled_cos_weight,
                         "relational": args.bridge_relational_weight,
-                        "mask": args.bridge_mask_weight,
                     },
                 )
 
@@ -1171,7 +1166,6 @@ def main() -> None:
                         bridge_repr_losses["pooled_cosine"].detach(), ctx
                     ),
                     "bridge_relational_loss": scalar_mean(bridge_repr_losses["relational"].detach(), ctx),
-                    "bridge_mask_loss": scalar_mean(bridge_repr_losses["mask"].detach(), ctx),
                     "bridge_repr_weight": float(bridge_repr_weight),
                     "bridge_functional_loss": scalar_mean(bridge_functional_loss.detach(), ctx),
                     "bridge_functional_cos_loss": scalar_mean(bridge_functional_cos_loss.detach(), ctx),

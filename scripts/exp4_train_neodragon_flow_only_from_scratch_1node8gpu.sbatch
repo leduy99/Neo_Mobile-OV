@@ -22,7 +22,7 @@ export TRITON_CACHE_DIR=/proj/cvl/users/x_fahkh2/caches
 
 CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-${CONDA_ENV}/bin/torchrun}"
-CONFIG="${CONFIG:-configs/mobile_ov_neodragon_bridge_v2.yaml}"
+CONFIG="${CONFIG:-configs/mobile_ov_neodragon.yaml}"
 MANIFEST="${MANIFEST:-data/openvid_neodragon_2s_latents/latent_manifest.csv}"
 OUT="${OUT:-output/neo_exp4_flow_only/${SLURM_JOB_ID:-local}}"
 STEPS="${STEPS:-200000}"

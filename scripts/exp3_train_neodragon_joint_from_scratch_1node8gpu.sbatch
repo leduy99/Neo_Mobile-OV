@@ -22,7 +22,7 @@ export TRITON_CACHE_DIR=/proj/cvl/users/x_fahkh2/caches
 
 CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-${CONDA_ENV}/bin/torchrun}"
-CONFIG="${CONFIG:-configs/mobile_ov_neodragon_bridge_v2.yaml}"
+CONFIG="${CONFIG:-configs/mobile_ov_neodragon.yaml}"
 MANIFEST="${MANIFEST:-data/openvid_neodragon_2s_latents/latent_manifest.csv}"
 OUT="${OUT:-output/neo_exp3_joint_from_scratch/${SLURM_JOB_ID:-local}}"
 STEPS="${STEPS:-200000}"
@@ -89,7 +89,6 @@ nvidia-smi || true
   --bridge-pooled-weight 0.25 \
   --bridge-pooled-cos-weight 0.2 \
   --bridge-relational-weight 0.1 \
-  --bridge-mask-weight 0.05 \
   --bridge-functional-weight 1.0 \
   --bridge-functional-cos-weight 0.1 \
   --bridge-functional-final-scale 0.1 \

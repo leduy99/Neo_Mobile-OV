@@ -73,12 +73,6 @@ def relational_cosine(
     return F.mse_loss(pred_pool @ pred_pool.T, target_pool @ target_pool.T)
 
 
-def mask_binary_cross_entropy(mask_logits: torch.Tensor | None, target_mask: torch.Tensor) -> torch.Tensor:
-    if mask_logits is None:
-        return target_mask.new_zeros((), dtype=torch.float32)
-    return F.binary_cross_entropy_with_logits(mask_logits.float(), target_mask.float())
-
-
 def flat_cosine_distance(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return 1.0 - F.cosine_similarity(
         prediction.float().reshape(prediction.shape[0], -1),
@@ -131,7 +125,6 @@ def bridge_representation_losses(
     target_mask: torch.Tensor,
     prediction_pooled: torch.Tensor,
     target_pooled: torch.Tensor,
-    mask_logits: torch.Tensor | None,
 ) -> dict[str, torch.Tensor]:
     """Return the complete post-ContextAdapter bridge alignment objective."""
     return {
@@ -147,7 +140,6 @@ def bridge_representation_losses(
         "pooled_mse": F.mse_loss(prediction_pooled.float(), target_pooled.float()),
         "pooled_cosine": pooled_cosine(prediction_pooled, target_pooled),
         "relational": relational_cosine(prediction_tokens, target_tokens, target_mask),
-        "mask": mask_binary_cross_entropy(mask_logits, target_mask),
     }
 
 
