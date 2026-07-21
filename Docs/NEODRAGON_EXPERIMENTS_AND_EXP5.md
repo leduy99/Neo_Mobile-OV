@@ -337,6 +337,74 @@ Exp1 differed in several high-impact dimensions:
 Step count alone therefore understated Exp1's data exposure and supervision
 quality.
 
+#### 5.3.1 Durable lesson: why the 64k bridge succeeded
+
+This result should be preserved as a design rule for future Mobile-OV text
+bridges. The successful checkpoint was not produced by a new architecture. It
+used the same original MCP lexical-gated bridge and pooled head as the failed
+runs. Its advantage came from the training contract.
+
+Direct checkpoint metadata gives the following controlled comparison:
+
+| Checkpoint | Steps | Global batch | Prompt exposures | LR | Frozen-DiT functional exposures |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| old bridge | 200k | 8 | 1.60M | `1e-4` | 0 |
+| Exp1 early | 24k | 32 | 0.768M | `5e-5` | about 192k |
+| Exp1 successful | 64k | 32 | 2.048M | `5e-5` | about 512k |
+
+The old bridge optimized mostly raw token MSE, token cosine, and pooled MSE. It
+actually reached superficially competitive embedding metrics: its final raw
+token MSE was approximately `0.439`, compared with approximately `0.484` for
+Exp1-64k. Nevertheless, the old checkpoint failed at inference. This is direct
+evidence that average embedding distance is not a sufficient model-selection
+criterion for replacing a nonlinear text-conditioning stack.
+
+Exp1 succeeded because it combined four properties:
+
+1. **Task-aware functional supervision.** The bridge was optimized so the same
+   frozen released DiT produced the same vector field under bridge and native
+   conditions. This constrains the behavior that generation actually consumes,
+   rather than only the numerical distance between two embeddings.
+2. **A stationary teacher coordinate system.** SmolVLM2, the native text bundle,
+   and the released DiT were frozen. The bridge could not lower its loss through
+   bridge-DiT co-adaptation or through a private condition representation.
+3. **Better-conditioned optimization.** Global batch 32 reduced gradient noise,
+   the learning rate was halved to `5e-5`, and the functional objective ramped
+   over 2,000 steps instead of applying its full gradient to a random bridge at
+   initialization.
+4. **Enough downstream-state coverage.** The 64k run evaluated approximately
+   512k randomly sampled DiT functional states. From 24k to 64k, functional MSE
+   improved from about `0.00729` to `0.00516`, while functional cosine distance
+   improved from about `0.02558` to `0.00802`. The much larger cosine improvement
+   tracks the observed inference recovery better than the small change in total
+   representation loss.
+
+The three caption granularities were sampled equally in both the old merged-
+caption 200k run and Exp1-64k. Multi-granularity captions remain useful for
+prompt robustness, but they do not by themselves explain this controlled
+quality difference. Likewise, the architecture, prompt modifier, teacher target
+shape, and FSDP backend were not the differentiating factors.
+
+The component-swap ablation makes the conclusion stronger: Exp2-4 DiTs recover
+when paired with the Exp1 bridge, while Exp2-4 bridges still fail with the
+released DiT. The dominant failure mode is therefore semantic and functional
+bridge drift, not simply insufficient DiT capacity or a high scalar flow loss.
+
+For future checkpoint selection, use the following priority order:
+
+```text
+held-out autoregressive inference
+> frozen-DiT functional MSE/cosine
+> correct-vs-shuffled text sensitivity
+> complete representation metrics
+> total scalar training loss
+```
+
+The operational lesson is: **preserve a fixed downstream functional contract,
+measure sample and functional-state exposure rather than optimizer steps alone,
+and never accept a low embedding or flow loss as proof that text conditioning is
+valid.**
+
 ### 5.4 Exp2: initialized bridge, joint bridge and DiT training
 
 Exp2 initialized from the old 200k bridge, not the later successful Exp1 64k
