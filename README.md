@@ -152,6 +152,16 @@ The four controlled bridge/DiT experiments, including the joint-from-scratch
 distillation run and its matched flow-only ablation, are documented in
 [`Docs/NEODRAGON_FOUR_EXPERIMENTS.md`](Docs/NEODRAGON_FOUR_EXPERIMENTS.md).
 
+The checkpoint evidence, component-swap ablations, and protected three-phase
+Exp5 design are documented in
+[`Docs/NEODRAGON_EXPERIMENTS_AND_EXP5.md`](Docs/NEODRAGON_EXPERIMENTS_AND_EXP5.md).
+
+Exp5 production training on Berzelius:
+
+```bash
+sbatch scripts/exp5_train_neodragon_staged_1node8gpu.sbatch
+```
+
 Smoke inference:
 
 ```bash

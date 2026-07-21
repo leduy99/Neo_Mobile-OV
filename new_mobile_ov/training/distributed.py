@@ -145,3 +145,44 @@ def full_state_dict(model: torch.nn.Module, parallel: str) -> dict[str, torch.Te
             return model.state_dict()
     module = getattr(model, "module", model)
     return module.state_dict()
+
+
+def full_optimizer_state_dict(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    parallel: str,
+) -> dict[str, Any]:
+    """Collect a portable optimizer state on rank 0.
+
+    FSDP optimizer states are sharded at runtime. The returned full state can
+    therefore be empty on non-zero ranks, matching ``full_state_dict``.
+    """
+    if str(parallel).lower() == "fsdp":
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        return FSDP.full_optim_state_dict(model, optimizer, rank0_only=True)
+    return optimizer.state_dict()
+
+
+def load_full_optimizer_state_dict(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    state: dict[str, Any] | None,
+    parallel: str,
+    *,
+    is_main: bool,
+) -> None:
+    """Restore a full optimizer checkpoint into the current parallel layout."""
+    if str(parallel).lower() == "fsdp":
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        sharded = FSDP.scatter_full_optim_state_dict(
+            state if is_main else None,
+            model,
+            optim=optimizer,
+        )
+        optimizer.load_state_dict(sharded)
+        return
+    if state is None:
+        raise ValueError("Optimizer state is required on every rank outside FSDP.")
+    optimizer.load_state_dict(state)

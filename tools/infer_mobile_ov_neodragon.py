@@ -59,11 +59,19 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--num-frames", type=int, default=None)
     parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dtype", default=None)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--skip-bridge", action="store_true")
     parser.add_argument("--condition-source", choices=["native", "bridge"], default="native")
     parser.add_argument("--bridge-ckpt", default=None, help="Optional Neodragon-shaped bridge checkpoint.")
+    parser.add_argument("--dit-ckpt", default=None, help="Optional checkpoint supplying a separate `dit` state.")
+    parser.add_argument(
+        "--load-checkpoint-dit",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically load `dit` from --bridge-ckpt when present.",
+    )
     parser.add_argument(
         "--bridge-append-prompt-modifier",
         action=argparse.BooleanOptionalAction,
@@ -92,9 +100,11 @@ def main() -> None:
         "device": str(device),
         "dtype": str(dtype),
         "backend": cfg.backend.name,
+        "seed": args.seed,
     }
 
     bridge_outputs = None
+    dit_state = None
     if not args.skip_bridge:
         t0 = time.time()
         bridge_prompt = args.prompt
@@ -113,9 +123,20 @@ def main() -> None:
             ckpt = torch.load(args.bridge_ckpt, map_location="cpu", weights_only=False)
             state = ckpt.get("bridge", ckpt.get("student_state", ckpt))
             missing, unexpected = bridge.load_state_dict(state, strict=False)
+            checkpoint_dit = ckpt.get("dit")
+            if args.load_checkpoint_dit and not args.dit_ckpt:
+                dit_state = checkpoint_dit
             metrics["bridge_ckpt"] = args.bridge_ckpt
+            metrics["checkpoint_step"] = ckpt.get("step")
+            metrics["checkpoint_has_dit"] = checkpoint_dit is not None
             metrics["bridge_ckpt_missing"] = len(missing)
             metrics["bridge_ckpt_unexpected"] = len(unexpected)
+            if missing or unexpected:
+                raise RuntimeError(
+                    "Bridge checkpoint does not exactly match the inference architecture: "
+                    f"missing={missing[:10]} unexpected={unexpected[:10]}"
+                )
+            del checkpoint_dit, state, ckpt
         with torch.no_grad():
             prompt_embeds, prompt_mask, pooled = bridge.encode([bridge_prompt])
         bridge_outputs = (prompt_embeds, prompt_mask, pooled)
@@ -134,13 +155,41 @@ def main() -> None:
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
+    if args.dit_ckpt:
+        dit_ckpt = torch.load(args.dit_ckpt, map_location="cpu", weights_only=False)
+        dit_state = dit_ckpt.get("dit", dit_ckpt)
+        metrics["dit_ckpt"] = args.dit_ckpt
+        metrics["dit_checkpoint_step"] = dit_ckpt.get("step") if isinstance(dit_ckpt, dict) else None
+        del dit_ckpt
+
     t0 = time.time()
     backend = build_generation_backend(cfg.backend, device=device)
     metrics["backend_load_seconds"] = time.time() - t0
+    if dit_state is not None:
+        dit = getattr(getattr(backend, "pipeline", None), "dit", None)
+        if dit is None:
+            raise RuntimeError("Checkpoint contains DiT weights, but the backend has no pipeline.dit module.")
+        missing, unexpected = dit.load_state_dict(dit_state, strict=False)
+        metrics["dit_ckpt_loaded"] = True
+        metrics["dit_ckpt_missing"] = len(missing)
+        metrics["dit_ckpt_unexpected"] = len(unexpected)
+        if missing or unexpected:
+            raise RuntimeError(
+                "DiT checkpoint does not exactly match the inference architecture: "
+                f"missing={missing[:10]} unexpected={unexpected[:10]}"
+            )
+        del dit_state
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    else:
+        metrics["dit_ckpt_loaded"] = False
 
     height = int(args.height or cfg.data.height)
     width = int(args.width or cfg.data.width)
     num_frames = int(args.num_frames or cfg.data.frame_num)
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
     t0 = time.time()
     if args.condition_source == "bridge":
         if bridge_outputs is None:
