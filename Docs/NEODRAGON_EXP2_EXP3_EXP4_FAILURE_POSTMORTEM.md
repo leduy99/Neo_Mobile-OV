@@ -514,7 +514,7 @@ incompatible with the released model or semantically collapsed.
 
 ## 7. Experiment-Specific Root Causes
 
-### 7.1 Exp2: wrong bridge initialization and incomplete protection
+### 7.1 Legacy Exp2: unvalidated bridge initialization and incomplete protection
 
 Exp2 had the least difficult optimization problem because it did not begin with
 a random bridge. It still failed for four interacting reasons.
@@ -568,7 +568,12 @@ entirely below zero. More joint training did not solve the semantic problem.
 
 ![Exp3 released reference, old checkpoint, and final checkpoint](assets/neodragon_failures/exp3_native_old_latest.jpg)
 
-### 7.3 Why Exp2 is worse than Exp3 despite bridge pretraining
+### 7.3 Why legacy Exp2 is worse than Exp3, and why this does not isolate initialization
+
+> **Correction, 2026-07-23:** The legacy Exp2 and Exp3 runs are not a
+> controlled pretrained-versus-random bridge ablation. The observations below
+> remain valid, but negative transfer is a hypothesis consistent with them, not
+> a causal conclusion established by this pair.
 
 At first glance, Exp2 should have been easier and better:
 
@@ -583,7 +588,7 @@ not a contradiction once the bridge objectives are compared precisely.
 
 #### Exp2 and Exp3 are not the same experiment
 
-Their DiT-side objectives and optimization scales are the same:
+Several headline DiT settings are shared:
 
 | Shared item | Exp2 | Exp3 |
 | --- | ---: | ---: |
@@ -606,6 +611,18 @@ Their bridge-side training is substantially different:
 | Relational term | disabled | `0.1` |
 | Frozen-DiT bridge functional MSE/cosine | disabled | `1.0 / 0.1` |
 | Functional schedule | none | ramped, every 4 steps, final scale `0.1` |
+
+Their flow curricula and random seeds also differ:
+
+| Additional confound | Exp2 | Exp3 |
+| --- | ---: | ---: |
+| Initial flow weight | `0.3` | `0.05` |
+| Flow ramp | none | 2k steps |
+| Cooldown | 4k steps | 10k steps |
+| Seed | `0` | `2026` |
+
+Therefore, the final metric difference cannot be attributed to bridge
+initialization alone.
 
 `L_distill` does not make these configurations equivalent. In both experiments,
 it compares the trainable DiT under bridge conditions with the frozen hybrid
@@ -656,7 +673,7 @@ This does not mean the Exp3 bridge is good. The component-swap experiment shows
 that the Exp3 bridge still fails with the released DiT. Exp3 is only a less bad
 full system because its DiT learned to interpret its private condition space.
 
-#### The old 200k bridge was a negative-transfer initialization
+#### The old 200k bridge is a plausible negative-transfer source
 
 Exp2 did not initialize from Exp1-64k. It initialized from:
 
@@ -736,10 +753,12 @@ The optimization exposure also favors Exp1 despite its smaller step count:
 | Exp1 | 64k | 32 | 2.048M | `5e-5` | about 512k |
 
 The old bridge therefore was not a mature version of the same solution. It was
-an over-optimized solution to a weaker proxy objective. Its 200k step count made
-it a strong prior in the wrong basin.
+an over-optimized solution to a weaker proxy objective and may provide a strong
+prior in the wrong basin. Independent inference establishes that it is weaker
+than Exp1-64k; legacy Exp2 does not isolate how much of its final failure was
+caused by that initialization.
 
-#### Why the bad initialization can be worse than random
+#### A mechanism by which bad initialization can be worse than random
 
 A random bridge has high error but no commitment. Exp3's strong early
 representation loss and frozen-DiT functional loss provide gradients toward a
@@ -754,14 +773,15 @@ no fixed-DiT bridge correction
 joint bridge and DiT gradients
 ```
 
-The easiest optimization path is to preserve much of that mapping and let the
-trainable DiT compensate locally. This is negative transfer: prior training
-reduces optimization freedom without providing the downstream function required
-by the new task.
+One easy optimization path is to preserve much of that mapping and let the
+trainable DiT compensate locally. If this mechanism dominates, it constitutes
+negative transfer: prior training reduces optimization freedom without
+providing the downstream function required by the new task.
 
-The observed stability from Exp2-90k to Exp2-240k supports this explanation.
-Condition and trajectory metrics barely move over another 150k steps. The run
-is not slowly repairing the bridge; it is stable inside the wrong basin.
+The observed stability from Exp2-90k to Exp2-240k is consistent with this
+explanation. Condition and trajectory metrics barely move over another 150k
+steps. The run is not slowly repairing the bridge; it is stable inside the
+wrong basin.
 
 ```mermaid
 flowchart TB
@@ -780,13 +800,34 @@ flowchart TB
     G1 --> Q1[Best released-DiT inference]
 ```
 
-#### Important lesson
+#### Important lesson and required controlled rerun
 
 The correct conclusion is not "random initialization is better than bridge
 pretraining." The correct conclusion is:
 
-> An unvalidated distillation checkpoint can be worse than random
-> initialization when its proxy loss is misaligned with the downstream model.
+> An unvalidated distillation checkpoint can plausibly be worse than random
+> initialization when its proxy loss is misaligned with the downstream model,
+> but this must be tested with identical objectives and schedules.
+
+The corrected comparison is now defined as:
+
+```text
+Exp2-corrected = Exp3 command + validated Exp1 BRIDGE_CKPT
+Exp3           = identical command + random bridge initialization
+```
+
+The repository enforces this contract with:
+
+```text
+tests/test_exp2_corrected_parity.py
+```
+
+After removing `--bridge-ckpt` and the output directory, every training argument
+must match. The corrected script is:
+
+```text
+scripts/exp2_corrected_train_neodragon_joint_distill_1node8gpu.sbatch
+```
 
 Future bridge checkpoints must earn the label "aligned" by passing:
 
@@ -797,8 +838,9 @@ Future bridge checkpoints must earn the label "aligned" by passing:
 
 Optimizer steps and raw embedding MSE are not qualification criteria. A future
 joint experiment should initialize only from Exp1-64k or a bridge that improves
-on these functional gates. The old 200k bridge must remain archived as a
-negative-transfer example.
+on these functional gates. The old 200k bridge and legacy Exp2 must remain
+archived as a confounded negative result, not as a controlled initialization
+ablation.
 
 ### 7.4 Exp4: an unidentifiable conditioning solution
 
@@ -1053,9 +1095,11 @@ weak, because 200k steps are too few, or because the distributed trainer did not
 run. They failed because the training objective did not preserve the specialized
 function represented by the released hybrid model.
 
-Exp2 began from the wrong bridge and protected it weakly. Exp3 attempted an
-unstable from-scratch joint curriculum with two moving modules and only local
-teacher constraints. Exp4 removed the semantic anchor entirely. All three used
+Legacy Exp2 began from an independently weak bridge, protected it lightly, and
+used a different curriculum from Exp3, so its exact causal failure cannot be
+isolated. Exp3 attempted an unstable from-scratch joint curriculum with two
+moving modules and only local teacher constraints. Exp4 removed the semantic
+anchor entirely. All three used
 ordinary random-timestep flow matching on a DiT whose useful fast behavior came
 from a dedicated one-step distillation process. All three trained with clean
 teacher-forced history while inference consumed accumulated student history.

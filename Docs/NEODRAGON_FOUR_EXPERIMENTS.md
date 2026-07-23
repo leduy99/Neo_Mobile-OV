@@ -183,7 +183,14 @@ Submit:
 sbatch scripts/exp1_train_neodragon_bridge_functional_distill_1node8gpu.sbatch
 ```
 
-## 5. Experiment 2: Continue the Existing Bridge and Train Full DiT
+## 5. Legacy Experiment 2: Lightly Anchor an Existing Bridge and Train Full DiT
+
+> **Correction, 2026-07-23:** This legacy experiment is not a controlled
+> initialization comparison with Exp 3. It weakens bridge representation
+> distillation, disables frozen-DiT bridge-functional distillation, and uses a
+> different flow schedule and seed. Its results remain useful as evidence about
+> a light-anchor training recipe, but they cannot establish whether pretrained
+> bridge initialization is better or worse than random initialization.
 
 Script:
 
@@ -240,6 +247,56 @@ Override the checkpoint when needed:
 sbatch --export=ALL,BRIDGE_CKPT=/absolute/path/to/neodragon_text_bridge_latest.pt \
   scripts/exp2_train_neodragon_joint_flow_distill_1node8gpu.sbatch
 ```
+
+### 5.1 Corrected Experiment 2: controlled pretrained-versus-random initialization
+
+Corrected script:
+
+```text
+scripts/exp2_corrected_train_neodragon_joint_distill_1node8gpu.sbatch
+```
+
+Exp2-corrected copies the complete Exp3 training command. The only
+training-variable difference is:
+
+```text
+Exp2-corrected: load BRIDGE_CKPT
+Exp3:           leave the same bridge randomly initialized
+```
+
+The two jobs therefore share:
+
+```text
+seed
+200k optimizer-step budget
+OpenVid latent manifest and caption ratio
+bridge and DiT learning rates
+flow warmup, peak, cooldown, and final weights
+complete bridge representation objective
+frozen-DiT bridge-functional objective
+cross-response distillation
+native-condition preservation
+diagnostic and checkpoint schedules
+```
+
+The corrected script intentionally has no fallback checkpoint. This prevents
+the old 200k checkpoint from being selected silently. Submit it only with the
+validated Exp1 checkpoint being tested:
+
+```bash
+sbatch --export=ALL,BRIDGE_CKPT=/absolute/path/to/exp1/neodragon_text_bridge_latest.pt \
+  scripts/exp2_corrected_train_neodragon_joint_distill_1node8gpu.sbatch
+```
+
+An automated parity test compares the two sbatch training commands token by
+token:
+
+```bash
+python -m unittest tests.test_exp2_corrected_parity -v
+```
+
+After removing `--bridge-ckpt` and the experiment-specific output directory,
+the test requires every Exp2-corrected argument to equal its Exp3 counterpart.
 
 ## 6. Experiment 3: Joint Training From a Random Original Bridge
 
