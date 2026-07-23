@@ -156,6 +156,11 @@ The checkpoint evidence, component-swap ablations, and protected three-phase
 Exp5 design are documented in
 [`Docs/NEODRAGON_EXPERIMENTS_AND_EXP5.md`](Docs/NEODRAGON_EXPERIMENTS_AND_EXP5.md).
 
+Exp2, Exp3, and Exp4 are archived failed experiments. Their final
+200k-240k checkpoint evidence, exact loss audit, NeoDragon
+monolithic-versus-hybrid analysis, and do-not-repeat rules are documented in
+[`Docs/NEODRAGON_EXP2_EXP3_EXP4_FAILURE_POSTMORTEM.md`](Docs/NEODRAGON_EXP2_EXP3_EXP4_FAILURE_POSTMORTEM.md).
+
 Exp5 production training on Berzelius:
 
 ```bash

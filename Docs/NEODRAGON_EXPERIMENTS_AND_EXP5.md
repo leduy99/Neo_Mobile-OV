@@ -1,6 +1,6 @@
 # Neo Mobile-OV with NeoDragon: Experiment Review and Exp5 Design
 
-Last updated: 2026-07-22
+Last updated: 2026-07-23
 
 ## 1. Executive Summary
 
@@ -31,19 +31,26 @@ passes over the 1,019,957-sample OpenVid latent manifest at global batch 8. The
 resumable latest checkpoint is updated every 5,000 steps and model-only archives
 are retained every 20,000 steps.
 
-Post-training evaluation on 2026-07-22 adds an important qualification. At its
-current 30k Phase-B checkpoint, Exp5 preserves a strong bridge and avoids the
-catastrophic semantic collapse seen in Exp2-4, but its adapted DiT is still
-softer and less dynamic than the released NeoDragon DiT. Exp1-64k plus the
-released DiT therefore remains the best current inference configuration. The
-evidence supports Exp1 as the correct initialization for staged Exp5 training;
-it does not yet prove that the unfinished Exp5 run will surpass Exp1.
+Post-training evaluation on 2026-07-22 adds an important qualification. At 30k
+Phase-B steps, Exp5 preserved a strong bridge and avoided the catastrophic
+semantic collapse seen in Exp2-4, but its adapted DiT was softer and less
+dynamic than the released NeoDragon DiT. A controlled follow-up at step 70k
+reaches the same conclusion: the videos remain coherent, but the aggregate
+motion and sharpness diagnostics are effectively unchanged from step 30k.
+Component swaps continue to localize the remaining quality gap to the adapted
+DiT rather than the bridge. Exp1-64k plus the released DiT therefore remains the
+best current inference configuration. The evidence supports Exp1 as the correct
+initialization for staged Exp5 training; it does not yet prove that the
+unfinished Exp5 run will surpass Exp1.
 
-The later Exp2, Exp3, and Exp4 checkpoints also do not show a meaningful
-recovery over their earlier checkpoints. Increasing Exp2 from 40k to 90k, Exp3
-from 80k to 120k, and Exp4 from 100k to 150k preserves essentially the same
-failure patterns. More optimization steps alone are not repairing an invalid
-conditioning contract or an already degraded autoregressive trajectory.
+The final Exp2, Exp3, and Exp4 checkpoints confirm that these runs are failed
+experiments, not merely early checkpoints. Increasing Exp2 from 90k to 240k,
+Exp3 from 120k to 200k, and Exp4 from 150k to 200k leaves their generated
+trajectories and decoded failure patterns effectively unchanged. More
+optimization steps do not repair the objective mismatch. The detailed
+postmortem, including the exact loss audit and the NeoDragon
+monolithic-versus-hybrid analysis, is in
+[`NEODRAGON_EXP2_EXP3_EXP4_FAILURE_POSTMORTEM.md`](NEODRAGON_EXP2_EXP3_EXP4_FAILURE_POSTMORTEM.md).
 
 ## 2. Fixed Model Architecture
 
@@ -1063,7 +1070,7 @@ softer with the Exp5 DiT. Exp5 has successfully protected the bridge; its curren
 bottleneck is learning how to adapt the DiT without sacrificing the released
 model's visual quality.
 
-### 14.6 Do later Exp2-4 checkpoints improve?
+### 14.6 Intermediate Exp2-4 checkpoint evidence
 
 The old and new checkpoints were evaluated with the same fox prompt and seed
 1234. In the combined figure, each experiment occupies two rows: old checkpoint
@@ -1096,6 +1103,23 @@ but it is not a replacement for a multi-prompt benchmark. The evidence currently
 supports early stopping these strategies rather than spending more compute on
 the assumption that additional steps alone will repair them.
 
+#### Final Exp2-4 decision on 2026-07-23
+
+A later paired benchmark replaced this one-prompt intermediate check with six
+prompts, shared SSD first frames, identical noise, and traces for every
+autoregressive unit and pyramid stage. It evaluated Exp2 at 240k, Exp3 at 200k,
+and Exp4 at 200k.
+
+| Experiment | Additional training | Generated latent cosine old -> final | Unit6/stage2 cosine old -> final | Decision |
+| --- | ---: | ---: | ---: | --- |
+| Exp2 | 90k -> 240k | `0.62682 -> 0.62666` | `0.56759 -> 0.56712` | Failed; no recovery |
+| Exp3 | 120k -> 200k | `0.75303 -> 0.75176` | `0.65609 -> 0.65693` | Failed; semantic score regressed |
+| Exp4 | 150k -> 200k | `0.66905 -> 0.66870` | `0.58822 -> 0.58978` | Failed; sharpness regressed |
+
+This final evaluation confirms that Exp2-4 converged to poor solutions rather
+than stopping too early. The full technical postmortem is
+[`NEODRAGON_EXP2_EXP3_EXP4_FAILURE_POSTMORTEM.md`](NEODRAGON_EXP2_EXP3_EXP4_FAILURE_POSTMORTEM.md).
+
 ### 14.7 Why the Exp5 latest checkpoint is approximately 10 GB
 
 The 30k Exp5 `latest` file is an exact-resume checkpoint, not a model-only
@@ -1127,15 +1151,17 @@ training resume.
    output remains coherent, whereas Exp2 and Exp4 collapse severely.
 4. **The remaining Exp5-30k gap follows the adapted DiT.** Component swaps show
    that the Exp5 bridge remains compatible with the released DiT.
-5. **More steps do not automatically rescue a poor training contract.** The
-   later Exp2-4 checkpoints preserve essentially the same failure modes.
+5. **Exp2, Exp3, and Exp4 are confirmed failed strategies.** Their final
+   200k-240k checkpoints preserve essentially the same failure modes after an
+   additional 50k-150k optimizer steps.
 
 ### 15.2 What is not yet confirmed
 
 1. The unfinished Exp5 run has not yet surpassed Exp1 plus the released DiT.
 2. Six prompts are not enough to claim benchmark-level generalization.
-3. The old-to-new Exp2-4 comparison currently uses one controlled prompt and
-   should not be reported as a population estimate.
+3. The final Exp2-4 decision uses six controlled prompts and trajectory traces,
+   but it is still a diagnostic suite rather than a full VBench population
+   estimate.
 4. Lower optical flow does not prove worse motion quality, and higher sharpness
    does not prove better semantics; broad evaluation still requires VBench and
    human inspection.
@@ -1175,3 +1201,215 @@ LR, strengthen response/native preservation, lengthen the frozen-bridge warmup,
 or early-stop at the best model-only archive. Reintroducing unrestricted flow
 gradients into the bridge would contradict the strongest evidence collected so
 far.
+
+## 16. Exp5 Step-70k Phase-B Follow-Up on 2026-07-22
+
+This follow-up answers whether the additional 40,000 optimizer steps between
+the evaluated Exp5-30k and Exp5-70k checkpoints produced a visible recovery.
+The experiment repeats the exact six-prompt protocol from Section 14 and adds a
+new component-swap ablation. The purpose is attribution, not benchmark ranking:
+
+1. Check whether prompt semantics remain intact at step 70k.
+2. Measure whether temporal motion and late-frame detail improve from 30k.
+3. Separate bridge quality from DiT quality by exchanging one component at a
+   time.
+4. Compare visual results against internal text-conditioning diagnostics.
+
+### 16.1 Checkpoint identity and integrity
+
+The evaluated checkpoint is:
+
+```text
+Hugging Face path:
+neo_exp5_staged/17112635/neodragon_exp5_latest.pt
+
+SHA256:
+a855100c18a74092026783f7dd7f2fa6265c0c7c274c63d8b65ed75977d06351
+
+optimizer step: 70,000
+phase: B_joint_refinement
+```
+
+The checkpoint loaded with zero missing and zero unexpected keys for both the
+bridge and DiT. It contains 10,000 Phase-A warmup steps followed by 60,000
+Phase-B joint-refinement steps. It is still an intermediate checkpoint: Phase B
+ends at step 130,000 and the complete Exp5 schedule ends at step 255,000.
+
+The latest history record stored in the checkpoint reports:
+
+| Diagnostic | Step-70k value | Interpretation |
+| --- | ---: | --- |
+| Bridge functional MSE | 0.00404 | Low frozen-DiT response mismatch |
+| Bridge functional cosine distance | 0.00715 | Teacher and bridge responses remain directionally close |
+| DiT response-distillation MSE | 0.00650 | Student response remains numerically close to teacher response |
+| Native-condition preservation MSE | 0.00454 | Released-condition behavior is still constrained |
+| Correct-condition flow loss | 0.76131 | Diagnostic flow objective on the sampled state |
+| Shuffled-condition flow loss | 0.77291 | Only slightly worse than the correct condition |
+| Text sensitivity | 0.00308 | DiT response changes very little when condition is shuffled |
+| Off-diagonal condition cosine | 0.96836 | Conditions for different prompts remain highly similar |
+
+The first four numbers show that the explicit teacher constraints are active.
+The last four reveal the remaining problem: low alignment losses do not by
+themselves prove that the adapted DiT uses prompt differences strongly. The
+small correct-versus-shuffled gap and high off-diagonal cosine are warning
+signals for text under-utilization or weak semantic separation.
+
+### 16.2 Controlled prompt suite
+
+The same prompts, seeds, first-frame generator, 49-frame output, 320 x 512
+resolution, bf16 precision, and inference configuration are used for all three
+models:
+
+```text
+Exp1-64k bridge + released DiT
+Exp5-30k bridge + Exp5-30k DiT
+Exp5-70k bridge + Exp5-70k DiT
+```
+
+The six prompts contain two short, two medium, and two long captions. Because
+each prompt uses an identical seed across checkpoints, differences are caused
+by checkpoint state rather than a different initial noise realization.
+
+Each figure below samples frames 0, 8, 16, 24, 32, 40, and 48. The row order is:
+
+```text
+top:    Exp1-64k + released DiT
+middle: Exp5-30k full model
+bottom: Exp5-70k full model
+```
+
+#### Short prompt: red panda
+
+All three configurations generate the requested red panda and bamboo. Exp5-70k
+remains coherent but is visually almost indistinguishable from Exp5-30k.
+
+![Exp1, Exp5-30k, and Exp5-70k on the red-panda prompt](assets/neodragon_exp5/exp1_exp5_30k_70k_red_panda.jpg)
+
+#### Medium prompt: golden retriever
+
+All configurations preserve the dog, field, wildflowers, and warm lighting.
+The two Exp5 trajectories remain softer toward the end than Exp1, with no clear
+70k recovery.
+
+![Exp1, Exp5-30k, and Exp5-70k on the retriever prompt](assets/neodragon_exp5/exp1_exp5_30k_70k_golden_retriever.jpg)
+
+#### Long prompt: chef in a kitchen
+
+The subject and setting remain correct for all three checkpoints. Exp5-70k does
+not show a clear gain in executing the detailed action, and it remains visually
+close to Exp5-30k.
+
+![Exp1, Exp5-30k, and Exp5-70k on the chef prompt](assets/neodragon_exp5/exp1_exp5_30k_70k_chef.jpg)
+
+### 16.3 Six-prompt temporal diagnostics
+
+The metrics use the definitions and limitations in Section 14.3. Optical flow
+is a motion-magnitude proxy, and Laplacian variance is a detail proxy. Neither
+metric should be interpreted as a standalone semantic or perceptual score.
+
+| Mean over six prompts | Exp1-64k | Exp5-30k | Exp5-70k |
+| --- | ---: | ---: | ---: |
+| Adjacent-frame MAE | 2.8731 | 2.1845 | 2.1779 |
+| First-to-last MAE | 25.0655 | 23.5061 | 23.3662 |
+| Optical flow | 0.2671 | 0.2302 | 0.2295 |
+| Mean sharpness | 205.7357 | 195.7009 | 195.5415 |
+| Last-frame sharpness | 167.9947 | 135.3782 | 135.0315 |
+
+The 30k-to-70k changes are all below one percent. Exp5-70k has 18.9 percent
+lower adjacent-frame change, 14.1 percent lower optical flow, and 19.6 percent
+lower last-frame sharpness than Exp1-64k. More Phase-B steps have therefore not
+yet closed the visual-quality gap.
+
+A direct frame-paired comparison between Exp5-30k and Exp5-70k gives:
+
+```text
+mean pixel MAE = 2.1562
+mean PSNR      = 37.166 dB
+```
+
+These videos are not bit-identical, but the high PSNR and small metric changes
+confirm that step 70k remains very close to the step-30k trajectory under the
+controlled seeds.
+
+### 16.4 Step-70k component-swap ablation
+
+The fox prompt uses seed 1234 for every row. The figure row order is:
+
+```text
+1. Exp1-64k bridge + released DiT
+2. Exp5-30k bridge + Exp5-30k DiT
+3. Exp5-70k bridge + Exp5-70k DiT
+4. Exp5-70k bridge + released DiT
+5. Exp1-64k bridge + Exp5-70k DiT
+```
+
+![Exp5-70k fox component-swap ablation](assets/neodragon_exp5/exp5_70k_fox_component_ablation.jpg)
+
+| Bridge | DiT | Optical flow | Mean sharpness | Last-frame sharpness |
+| --- | --- | ---: | ---: | ---: |
+| Exp1-64k | released | 0.3111 | 176.50 | 185.96 |
+| Exp5-30k | Exp5-30k | 0.3451 | 144.59 | 104.75 |
+| Exp5-70k | Exp5-70k | 0.3353 | 146.14 | 108.19 |
+| Exp5-70k | released | 0.3110 | 178.03 | 194.30 |
+| Exp1-64k | Exp5-70k | 0.3354 | 146.01 | 110.74 |
+
+The two decisive rows are the last two:
+
+- Exp5-70k bridge plus released DiT restores strong late-frame detail and
+  reaches a last-frame sharpness of 194.30.
+- Exp1-64k bridge plus Exp5-70k DiT remains soft and reaches only 110.74.
+
+The quality gap follows the Exp5 DiT when the bridge is exchanged. Conversely,
+the Exp5 bridge remains compatible with the released DiT. This is strong
+component-level evidence that the current Phase-B bottleneck is DiT adaptation,
+not catastrophic bridge drift.
+
+### 16.5 Findings and limitations
+
+The step-70k evaluation supports the following findings:
+
+1. **Prompt-level scene semantics remain coherent.** All six short, medium, and
+   long prompts produce distinct requested subjects and settings.
+2. **Step 70k is not a clear visual improvement over step 30k.** Aggregate
+   motion and sharpness diagnostics are effectively flat.
+3. **The Exp5 bridge remains the stronger component.** It performs well when
+   paired with the released DiT and keeps low teacher-response mismatch.
+4. **The adapted DiT is the current quality bottleneck.** Softness follows the
+   Exp5 DiT under both Exp1 and Exp5 bridge conditions.
+5. **Low distillation loss is not sufficient evidence of strong conditioning.**
+   The very small text-sensitivity value and high off-diagonal condition cosine
+   indicate that prompt distinctions may have weak influence on the DiT output.
+
+There are also important limitations:
+
+- This is a six-prompt pilot rather than a VBench-scale evaluation.
+- Pixel motion can increase because of desired motion, blur, or flicker.
+- Laplacian variance measures local detail, not semantic correctness.
+- NeoDragon's separate first-frame generator can establish the correct subject
+  before temporal continuation. Correct first-frame semantics therefore do not
+  prove that the adapted DiT uses bridge conditions strongly.
+- The component swap localizes the visual-quality gap, but does not by itself
+  measure editing or image-to-video capability.
+
+### 16.6 Model-selection decision
+
+Exp5 remains the appropriate development path because the final project requires
+a trainable DiT for video/image editing and image-to-video extension. Exp1 alone
+cannot provide those new capabilities. However, the current Exp5-70k checkpoint
+must not replace Exp1-64k plus the released DiT as the quality reference.
+
+The supported policy is:
+
+```text
+continue Exp5 as the joint-adaptation experiment
+keep Exp1-64k + released DiT as the permanent quality anchor
+evaluate each Exp5 archive with the same six-prompt and component-swap suite
+require a meaningful correct-vs-shuffled conditioning gap
+select or early-stop by decoded video quality, not training loss alone
+```
+
+If the DiT gap remains flat through the end of Phase B, the next intervention
+should target DiT optimization: lower the DiT learning rate, increase response
+and native-condition preservation, or stop at the best decoded checkpoint. The
+evidence does not support weakening bridge protection or sending unrestricted
+flow gradients into the bridge.
