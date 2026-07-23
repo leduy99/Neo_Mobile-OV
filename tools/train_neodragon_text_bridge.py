@@ -179,14 +179,24 @@ def load_neodragon_text_modules(cfg, device: torch.device, dtype: torch.dtype):
     return text_bundle, context_adapter, DEFAULT_PROMPT_MODIFIER
 
 
-def cycle_loader(loader: DataLoader, sampler: DistributedSampler | None):
-    epoch = 0
+def cycle_loader(
+    loader: DataLoader,
+    sampler: DistributedSampler | None,
+    *,
+    start_epoch: int = 0,
+    start_batch: int = 0,
+):
+    epoch = start_epoch
+    skip_batches = start_batch
     while True:
         if sampler is not None:
             sampler.set_epoch(epoch)
-        for batch in loader:
+        for batch_index, batch in enumerate(loader):
+            if batch_index < skip_batches:
+                continue
             yield batch
         epoch += 1
+        skip_batches = 0
 
 
 def load_neodragon_functional_modules(cfg, device: torch.device, dtype: torch.dtype):
@@ -279,6 +289,17 @@ def main() -> None:
     parser.add_argument("--prompts", required=True, help="Text file or CSV/TSV with prompt/caption/text column.")
     parser.add_argument("--output-dir", default="output/neodragon_text_bridge_train")
     parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument(
+        "--init-checkpoint",
+        default="",
+        help="Optional bridge checkpoint used as a model-only warm start.",
+    )
+    parser.add_argument(
+        "--step-offset",
+        type=int,
+        default=-1,
+        help="Global-step offset. With --init-checkpoint, -1 reads its saved step.",
+    )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--max-prompts", type=int, default=-1)
@@ -350,6 +371,10 @@ def main() -> None:
         raise ValueError("--functional-every and --functional-batch-size must be >= 1.")
     if args.steps < 1 or args.log_every < 1 or args.save_every < 1:
         raise ValueError("--steps, --log-every, and --save-every must be >= 1.")
+    if args.step_offset < -1:
+        raise ValueError("--step-offset must be -1 or a non-negative integer.")
+    if args.step_offset == -1 and not args.init_checkpoint:
+        args.step_offset = 0
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("FSDP_USE_ORIG_PARAMS", "true")
@@ -394,8 +419,6 @@ def main() -> None:
         num_workers=0,
         drop_last=False,
     )
-    batches = cycle_loader(loader, sampler)
-
     rank0_print(
         ctx,
         f"Text bridge distill: parallel={args.parallel} world_size={ctx.world_size} "
@@ -420,6 +443,36 @@ def main() -> None:
             f"every={args.functional_every} batch={args.functional_batch_size}",
         )
     bridge = MobileOVNeodragonTextBridge(cfg.bridge, device=ctx.device, dtype=frozen_dtype).train()
+    init_checkpoint_step = 0
+    if args.init_checkpoint:
+        init_path = Path(args.init_checkpoint)
+        if not init_path.is_file():
+            raise FileNotFoundError(f"Bridge init checkpoint does not exist: {init_path}")
+        checkpoint = torch.load(init_path, map_location="cpu", weights_only=False)
+        bridge_state = checkpoint.get("bridge", checkpoint.get("student_state", checkpoint))
+        if not isinstance(bridge_state, dict):
+            raise TypeError(f"Bridge state in {init_path} must be a mapping, got {type(bridge_state).__name__}")
+        bridge.load_state_dict(bridge_state, strict=True)
+        init_checkpoint_step = int(checkpoint.get("step", 0))
+        if args.step_offset == -1:
+            args.step_offset = init_checkpoint_step
+        rank0_print(
+            ctx,
+            "Warm-started bridge: "
+            f"checkpoint={init_path} checkpoint_step={init_checkpoint_step} "
+            f"global_step_offset={args.step_offset}",
+        )
+    start_epoch, start_batch = divmod(args.step_offset, len(loader))
+    batches = cycle_loader(
+        loader,
+        sampler,
+        start_epoch=start_epoch,
+        start_batch=start_batch,
+    )
+    rank0_print(
+        ctx,
+        f"Data position: loader_batches={len(loader)} start_epoch={start_epoch} start_batch={start_batch}",
+    )
     bridge_model = wrap_bridge(bridge, parallel=args.parallel, device=ctx.device, local_rank=ctx.local_rank)
 
     deepspeed_engine = None
@@ -452,7 +505,8 @@ def main() -> None:
     history: list[dict[str, float]] = []
     iterator = range(1, args.steps + 1)
     pbar = tqdm(iterator, desc="Train Mobile-OV Neodragon text bridge", disable=not ctx.is_main)
-    for step in pbar:
+    for additional_step in pbar:
+        step = args.step_offset + additional_step
         prompts_raw = [str(x) for x in next(batches)]
         prompts = [p + prompt_modifier for p in prompts_raw] if args.append_prompt_modifier else prompts_raw
 
@@ -560,6 +614,7 @@ def main() -> None:
         if step % args.log_every == 0 or step == 1:
             item = {
                 "step": float(step),
+                "additional_step": float(additional_step),
                 "loss": scalar_mean(loss.detach(), ctx),
                 "raw_token_loss": scalar_mean(raw_token_loss.detach(), ctx),
                 "normalized_token_loss": scalar_mean(normalized_token_loss.detach(), ctx),
@@ -590,11 +645,15 @@ def main() -> None:
                     norm=f"{item['pred_norm']:.1f}/{item['target_norm']:.1f}",
                 )
 
-        if step % args.save_every == 0 or step == args.steps:
+        if additional_step % args.save_every == 0 or additional_step == args.steps:
             state = full_state_dict(bridge_model, args.parallel)
             if ctx.is_main:
                 payload = {
                     "step": step,
+                    "additional_step": additional_step,
+                    "step_offset": args.step_offset,
+                    "init_checkpoint": args.init_checkpoint or None,
+                    "init_checkpoint_step": init_checkpoint_step,
                     "bridge": state,
                     "config": cfg,
                     "args": vars(args),
