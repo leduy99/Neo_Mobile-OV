@@ -478,6 +478,33 @@ but becomes blurred:
 
 ![Exp3 full checkpoint](assets/neodragon_exp5/exp3_full_fox.png)
 
+#### 5.5.1 Why Exp3 is less bad than initialized Exp2
+
+Exp2 and Exp3 share the same DiT-side flow, response-distillation, preservation,
+learning-rate, and caption settings, but they are not equivalent bridge
+experiments. Exp2 starts from the old 200k bridge, keeps only a `0.1` light
+representation objective, and disables frozen-DiT bridge-functional
+distillation. Exp3 starts randomly but uses the full representation objective
+and frozen-DiT functional supervision.
+
+The final six-prompt benchmark exposes the resulting negative transfer. Exp2 is
+closer to native condition embeddings than Exp3 (`0.518` versus `0.100`
+cosine), but its generated latent trajectory is farther from the released model
+(`0.627` versus `0.752`), and its CLIP text-video score is lower (`0.256` versus
+`0.306`). Exp3 learned a less poor private bridge-DiT interface; its bridge still
+fails when paired with the released DiT.
+
+The old 200k bridge had a lower raw token MSE than Exp1-64k (`0.435` versus
+`0.486`) but had no frozen-DiT functional objective. Exp1 additionally used a
+larger global batch, lower LR, more prompt exposures, normalized/norm/relational
+terms, and about 512k frozen-DiT functional states. Therefore, old-200k was not a
+more mature version of Exp1. It was an over-optimized solution to a weaker proxy
+objective and became a harmful initialization for Exp2.
+
+The detailed comparison, exact losses, and negative-transfer mechanism are
+documented in
+[`NEODRAGON_EXP2_EXP3_EXP4_FAILURE_POSTMORTEM.md`](NEODRAGON_EXP2_EXP3_EXP4_FAILURE_POSTMORTEM.md#73-why-exp2-is-worse-than-exp3-despite-bridge-pretraining).
+
 ### 5.6 Exp4: flow-only from a random bridge
 
 Exp4 is the clean flow-only baseline:

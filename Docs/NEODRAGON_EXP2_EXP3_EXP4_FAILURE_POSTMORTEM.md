@@ -568,7 +568,239 @@ entirely below zero. More joint training did not solve the semantic problem.
 
 ![Exp3 released reference, old checkpoint, and final checkpoint](assets/neodragon_failures/exp3_native_old_latest.jpg)
 
-### 7.3 Exp4: an unidentifiable conditioning solution
+### 7.3 Why Exp2 is worse than Exp3 despite bridge pretraining
+
+At first glance, Exp2 should have been easier and better:
+
+```text
+Exp2: initialize from a 200k distilled bridge
+Exp3: initialize the bridge randomly
+```
+
+The final checkpoint shows the opposite. Exp3 is still a failed experiment, but
+its complete bridge-plus-DiT trajectory is materially better than Exp2. This is
+not a contradiction once the bridge objectives are compared precisely.
+
+#### Exp2 and Exp3 are not the same experiment
+
+Their DiT-side objectives and optimization scales are the same:
+
+| Shared item | Exp2 | Exp3 |
+| --- | ---: | ---: |
+| Released hybrid DiT initialization | yes | yes |
+| Full DiT trainable | yes | yes |
+| DiT LR | `3e-6` | `3e-6` |
+| Bridge LR | `1e-5` | `1e-5` |
+| Peak flow weight | `0.3` | `0.3` |
+| Response MSE/cosine | `1.0 / 0.1` | `1.0 / 0.1` |
+| Native preservation MSE/cosine | `0.5 / 0.05` | `0.5 / 0.05` |
+| Caption ratio | `5:4:1` | `5:4:1` |
+
+Their bridge-side training is substantially different:
+
+| Bridge item | Exp2 | Exp3 |
+| --- | --- | --- |
+| Initialization | old bridge-only 200k | random |
+| Representation scale | constant `0.1` | `1.0`, decayed to `0.1` |
+| Raw-token term | disabled | `0.25` |
+| Relational term | disabled | `0.1` |
+| Frozen-DiT bridge functional MSE/cosine | disabled | `1.0 / 0.1` |
+| Functional schedule | none | ramped, every 4 steps, final scale `0.1` |
+
+`L_distill` does not make these configurations equivalent. In both experiments,
+it compares the trainable DiT under bridge conditions with the frozen hybrid
+teacher under native conditions:
+
+```text
+L_distill = distance(D_s(x, B), D_h(x, T))
+```
+
+The gradient can move both `D_s` and `B`. A trainable DiT can compensate for a
+bad bridge. By contrast, Exp3's `L_bfunc` evaluates bridge and native conditions
+through the same frozen DiT:
+
+```text
+L_bfunc = distance(D_h(x, B), D_h(x, T))
+```
+
+This gives the bridge a stationary downstream target that cannot move to absorb
+its error. Exp2 has no such constraint.
+
+#### The final metrics contain an important inversion
+
+The Exp2 condition is numerically much closer to the native condition than the
+Exp3 condition, yet Exp2 generation is worse:
+
+| Six-prompt mean at final checkpoint | Exp2-240k | Exp3-200k | Better |
+| --- | ---: | ---: | --- |
+| Condition cosine to native | `0.5179` | `0.0998` | Exp2 |
+| Pooled-condition cosine to native | `0.5084` | `0.0761` | Exp2 |
+| Generated latent cosine to native | `0.6267` | `0.7518` | Exp3 |
+| Local flow cosine to native | `0.7801` | `0.8694` | Exp3 |
+| Scheduler endpoint cosine to native | `0.7368` | `0.8465` | Exp3 |
+| Unit6/stage2 cosine to native | `0.5671` | `0.6569` | Exp3 |
+| CLIP text-video similarity | `0.2556` | `0.3059` | Exp3 |
+| Sharpness proxy | `56.41` | `92.70` | Exp3 |
+
+This inversion is one of the strongest findings from Exp2 and Exp3:
+
+> Closeness in the condition tensor is not monotonic with functional generation
+> quality.
+
+Exp2 stays closer in average embedding geometry but lies in directions that the
+nonlinear DiT uses poorly. Exp3 learns a private bridge-DiT interface that is
+farther from the native tensor space but produces a less damaged trajectory
+when its own co-adapted components are used together.
+
+This does not mean the Exp3 bridge is good. The component-swap experiment shows
+that the Exp3 bridge still fails with the released DiT. Exp3 is only a less bad
+full system because its DiT learned to interpret its private condition space.
+
+#### The old 200k bridge was a negative-transfer initialization
+
+Exp2 did not initialize from Exp1-64k. It initialized from:
+
+```text
+output/neo_bridge_8gpu_200k/17002251/neodragon_text_bridge_latest.pt
+```
+
+The old bridge-only objective was:
+
+```text
+L_old =
+    1.00 * raw_token_MSE
+  + 0.05 * token_cosine_distance
+  + 0.25 * pooled_MSE
+```
+
+It did not optimize:
+
+```text
+normalized token MSE
+token norm alignment
+pooled cosine distance
+relational prompt geometry
+frozen-DiT functional response
+```
+
+The old checkpoint's last-100-log means were:
+
+```text
+raw token MSE:        0.4350
+pooled MSE:           0.4245
+token cosine distance: 0.2394
+total loss:           0.5531
+```
+
+Exp1-64k used the same bridge architecture but a different training contract:
+
+```text
+L_exp1 =
+    0.25 * raw_token_MSE
+  + 1.00 * normalized_token_MSE
+  + 0.50 * token_cosine_distance
+  + 0.10 * token_norm_error
+  + 0.25 * pooled_MSE
+  + 0.20 * pooled_cosine_distance
+  + 0.10 * relational_loss
+  + 1.00 * frozen_DiT_functional_MSE
+  + 0.10 * frozen_DiT_functional_cosine
+```
+
+Its last-100-log means were:
+
+```text
+raw token MSE:             0.4865
+normalized token MSE:      0.5179
+pooled MSE:                0.5411
+token cosine distance:     0.2591
+functional MSE:            0.00346
+functional cosine distance: 0.00703
+total loss:                0.9824
+```
+
+The old bridge appears better if only raw token MSE, pooled MSE, or total scalar
+loss is inspected. That conclusion is false:
+
+- The total losses are not comparable because Exp1 contains many more terms.
+- Exp1 deliberately accepts a slightly larger average embedding error to match
+  directions, norms, prompt geometry, and downstream DiT behavior.
+- Only Exp1 measures whether the frozen DiT responds correctly.
+- Held-out inference confirms Exp1 is the better bridge.
+
+The optimization exposure also favors Exp1 despite its smaller step count:
+
+| Bridge run | Steps | Global batch | Prompt exposures | LR | Functional-state exposures |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| old bridge | 200k | 8 | 1.60M | `1e-4` | 0 |
+| Exp1 | 64k | 32 | 2.048M | `5e-5` | about 512k |
+
+The old bridge therefore was not a mature version of the same solution. It was
+an over-optimized solution to a weaker proxy objective. Its 200k step count made
+it a strong prior in the wrong basin.
+
+#### Why the bad initialization can be worse than random
+
+A random bridge has high error but no commitment. Exp3's strong early
+representation loss and frozen-DiT functional loss provide gradients toward a
+task-aware condition space.
+
+The old bridge has lower proxy error but a confident, functionally invalid
+mapping. Exp2 then applies:
+
+```text
+weak representation correction
+no fixed-DiT bridge correction
+joint bridge and DiT gradients
+```
+
+The easiest optimization path is to preserve much of that mapping and let the
+trainable DiT compensate locally. This is negative transfer: prior training
+reduces optimization freedom without providing the downstream function required
+by the new task.
+
+The observed stability from Exp2-90k to Exp2-240k supports this explanation.
+Condition and trajectory metrics barely move over another 150k steps. The run
+is not slowly repairing the bridge; it is stable inside the wrong basin.
+
+```mermaid
+flowchart TB
+    O[Old 200k bridge] --> O1[Low raw embedding MSE]
+    O1 --> O2[No frozen-DiT functional guarantee]
+    O2 --> E2[Exp2 weak bridge supervision]
+    E2 --> C2[DiT compensates for bad bridge locally]
+    C2 --> F2[Poor autoregressive trajectory]
+
+    R[Random bridge] --> E3[Exp3 strong representation plus L_bfunc]
+    E3 --> C3[Bridge and DiT co-adapt]
+    C3 --> F3[Less poor private interface]
+
+    R --> E1[Exp1 fixed DiT plus full bridge objective]
+    E1 --> G1[Functionally valid bridge]
+    G1 --> Q1[Best released-DiT inference]
+```
+
+#### Important lesson
+
+The correct conclusion is not "random initialization is better than bridge
+pretraining." The correct conclusion is:
+
+> An unvalidated distillation checkpoint can be worse than random
+> initialization when its proxy loss is misaligned with the downstream model.
+
+Future bridge checkpoints must earn the label "aligned" by passing:
+
+1. Frozen-DiT functional MSE and cosine checks.
+2. Correct-versus-shuffled text-sensitivity checks.
+3. Component-swap inference with the released DiT.
+4. Held-out autoregressive generation across caption granularities.
+
+Optimizer steps and raw embedding MSE are not qualification criteria. A future
+joint experiment should initialize only from Exp1-64k or a bridge that improves
+on these functional gates. The old 200k bridge must remain archived as a
+negative-transfer example.
+
+### 7.4 Exp4: an unidentifiable conditioning solution
 
 Exp4 asks a random bridge and full DiT to solve only ground-truth flow matching.
 There is no teacher condition, representation loss, functional loss, response
