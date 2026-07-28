@@ -161,6 +161,15 @@ Exp2, Exp3, and Exp4 are archived failed experiments. Their final
 monolithic-versus-hybrid analysis, and do-not-repeat rules are documented in
 [`Docs/NEODRAGON_EXP2_EXP3_EXP4_FAILURE_POSTMORTEM.md`](Docs/NEODRAGON_EXP2_EXP3_EXP4_FAILURE_POSTMORTEM.md).
 
+The Exp1-64k versus 200k findings, 18-call BPTT memory measurements, and the
+new frozen-DiT full-rollout bridge continuation are documented in
+[`Docs/NEODRAGON_FULL_ROLLOUT_DISTILLATION.md`](Docs/NEODRAGON_FULL_ROLLOUT_DISTILLATION.md).
+Run the 8-GPU Berzelius experiment with:
+
+```bash
+sbatch scripts/exp1_rollout_distill_64k_to100k_1node8gpu.sbatch
+```
+
 Exp5 production training on Berzelius:
 
 ```bash
