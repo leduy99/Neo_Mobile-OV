@@ -170,6 +170,17 @@ Run the 8-GPU Berzelius experiment with:
 sbatch scripts/exp1_rollout_distill_64k_to100k_1node8gpu.sbatch
 ```
 
+The new Exp6 full-DiT pilot treats the released Hybrid model as 18 specialized
+one-step transition maps instead of a generic flow field. Its monolithic
+teacher, released-Hybrid trust region, on-policy replay, losses, deferred DMD
+scope, and two-GPU validation are documented in
+[`Docs/NEODRAGON_HYBRID_RECOVERY_EXP6.md`](Docs/NEODRAGON_HYBRID_RECOVERY_EXP6.md).
+Submit it on Berzelius with:
+
+```bash
+sbatch scripts/exp6_train_neodragon_hybrid_recovery_1node8gpu.sbatch
+```
+
 ### SSD1B Image Bridge
 
 The new Image Bridge distills SSD1B's native CLIP-L, CLIP-bigG, and pooled
