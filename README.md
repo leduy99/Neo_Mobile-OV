@@ -170,6 +170,34 @@ Run the 8-GPU Berzelius experiment with:
 sbatch scripts/exp1_rollout_distill_64k_to100k_1node8gpu.sbatch
 ```
 
+### SSD1B Image Bridge
+
+The new Image Bridge distills SSD1B's native CLIP-L, CLIP-bigG, and pooled
+conditions from one frozen SmolVLM2 forward:
+
+```text
+SmolVLM2
+  -> Image Bridge
+     -> [B, 77, 768] CLIP-L-compatible tokens
+     -> [B, 77, 1280] CLIP-bigG-compatible tokens
+     -> [B, 1280] pooled condition
+  -> frozen SSD1B UNet
+```
+
+It uses representation, frozen-UNet functional, and full four-step LCM rollout
+distillation. This makes it possible to remove both native CLIP encoders from
+the final inference package after generation parity is validated.
+
+The complete architecture, losses, schedule, checkpoint behavior, and tests
+are documented in
+[`Docs/SSD1B_IMAGE_BRIDGE_DISTILLATION.md`](Docs/SSD1B_IMAGE_BRIDGE_DISTILLATION.md).
+
+Run the 8-GPU Berzelius job with:
+
+```bash
+sbatch scripts/train_ssd1b_image_bridge_distill_1node8gpu.sbatch
+```
+
 Exp5 production training on Berzelius:
 
 ```bash

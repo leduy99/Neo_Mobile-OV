@@ -32,6 +32,21 @@ class BridgeConfig:
 
 
 @dataclass
+class ImageBridgeConfig:
+    sequence_length: int = 77
+    clip_l_dim: int = 768
+    clip_big_g_dim: int = 1280
+    pooled_dim: int = 1280
+    attention_dim: int = 512
+    num_heads: int = 8
+    num_layers: int = 2
+    num_fuse_layers: int = 4
+    lexical_gate_init: float = 0.2
+    ff_mult: int = 4
+    dropout: float = 0.0
+
+
+@dataclass
 class BackendConfig:
     name: GenerationBackendName = "mobile_ov_current"
     checkpoint_path: Optional[str] = None
@@ -77,6 +92,7 @@ class TrainConfig:
 @dataclass
 class NewMobileOVConfig:
     bridge: BridgeConfig = field(default_factory=BridgeConfig)
+    image_bridge: ImageBridgeConfig = field(default_factory=ImageBridgeConfig)
     backend: BackendConfig = field(default_factory=BackendConfig)
     motion: MotionConfig = field(default_factory=MotionConfig)
     data: DataConfig = field(default_factory=DataConfig)
