@@ -192,11 +192,18 @@ The complete architecture, losses, schedule, checkpoint behavior, and tests
 are documented in
 [`Docs/SSD1B_IMAGE_BRIDGE_DISTILLATION.md`](Docs/SSD1B_IMAGE_BRIDGE_DISTILLATION.md).
 
-Run the 8-GPU Berzelius job with:
+The 100K checkpoint evaluation, measured failure analysis, combined
+Image-Bridge-to-Exp1 video test, and objective-only V2 design are documented in
+[`Docs/SSD1B_IMAGE_BRIDGE_100K_EVALUATION_AND_V2.md`](Docs/SSD1B_IMAGE_BRIDGE_100K_EVALUATION_AND_V2.md).
+
+Run the measured objective-only V2 from scratch on eight Berzelius GPUs with:
 
 ```bash
-sbatch scripts/train_ssd1b_image_bridge_distill_1node8gpu.sbatch
+sbatch scripts/train_ssd1b_image_bridge_v2_1node8gpu.sbatch
 ```
+
+The original V1 reproduction script remains available as
+`scripts/train_ssd1b_image_bridge_distill_1node8gpu.sbatch`.
 
 Exp5 production training on Berzelius:
 

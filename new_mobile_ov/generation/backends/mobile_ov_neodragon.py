@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from PIL import Image
 
 from new_mobile_ov.checkpoints import ensure_neodragon_assets
 from new_mobile_ov.generation.backends.base import AnchorGenerationBackend
@@ -117,6 +118,7 @@ class MobileOVNeodragonBackend(AnchorGenerationBackend):
         prompt_embeds: torch.Tensor,
         prompt_mask: torch.Tensor,
         pooled_prompt_embeds: torch.Tensor,
+        first_frame: Image.Image | None = None,
         height: int = 320,
         width: int = 512,
         num_frames: int = 49,
@@ -127,9 +129,10 @@ class MobileOVNeodragonBackend(AnchorGenerationBackend):
     ):
         """Generate video with Mobile-OV bridge outputs replacing Neodragon text conditioning.
 
-        In hybrid mode, Neodragon still uses its SSD first-frame generator from raw text.
         The autoregressive video DiT receives bridge-conditioned tensors directly,
-        without Neodragon's TextEncoderBundle or ContextAdapter.
+        without Neodragon's TextEncoderBundle or ContextAdapter. By default,
+        Neodragon still uses its native SSD first-frame generator. Supplying
+        ``first_frame`` lets another Mobile-OV generation head provide the anchor.
         """
         if self.mode != "hybrid":
             raise NotImplementedError("Bridge-conditioned smoke path currently supports Neodragon hybrid mode.")
@@ -142,10 +145,13 @@ class MobileOVNeodragonBackend(AnchorGenerationBackend):
             pooled_prompt_embeds.to(device=self.device, dtype=self.dtype),
         )
         with torch.cuda.amp.autocast(enabled=self.device.type == "cuda", dtype=self.dtype):
-            first_frame = self.pipeline.first_frame_gen_pipeline(
-                prompt=str(prompt) + prompt_modifier,
-                num_images_per_prompt=1,
-            ).images[0]
+            if first_frame is None:
+                first_frame = self.pipeline.first_frame_gen_pipeline(
+                    prompt=str(prompt) + prompt_modifier,
+                    num_images_per_prompt=1,
+                ).images[0]
+            else:
+                first_frame = first_frame.convert("RGB")
             return generate(
                 text_encoder_bundle=text_encoder,
                 dit=self.pipeline.dit,

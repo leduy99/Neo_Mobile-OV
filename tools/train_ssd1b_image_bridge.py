@@ -33,6 +33,7 @@ from new_mobile_ov.training.distributed import (
 )
 from new_mobile_ov.training.neodragon_objectives import linear_ramp
 from new_mobile_ov.training.ssd1b_distillation import (
+    SSD1BClosedLoopResult,
     SSD1BFunctionalResult,
     SSD1BFrozenTeacher,
     SSD1BFrozenUNetController,
@@ -153,6 +154,65 @@ def representation_loss(
     losses: dict[str, torch.Tensor],
     args: argparse.Namespace,
 ) -> torch.Tensor:
+    if args.objective_version == "v2":
+        clip_l = (
+            losses["clip_l_content_normalized_mse"]
+            + losses["clip_l_content_cosine"]
+            + args.eos_weight
+            * (
+                losses["clip_l_eos_normalized_mse"]
+                + losses["clip_l_eos_cosine"]
+            )
+            + args.padding_weight
+            * (
+                losses["clip_l_padding_normalized_mse"]
+                + losses["clip_l_padding_cosine"]
+            )
+        )
+        clip_big_g = (
+            losses["clip_big_g_content_normalized_mse"]
+            + losses["clip_big_g_content_cosine"]
+            + args.eos_weight
+            * (
+                losses["clip_big_g_eos_normalized_mse"]
+                + losses["clip_big_g_eos_cosine"]
+            )
+            + args.padding_weight
+            * (
+                losses["clip_big_g_padding_normalized_mse"]
+                + losses["clip_big_g_padding_cosine"]
+            )
+        )
+        pooled = losses["pooled_mse"] + losses["pooled_cosine"]
+        norm = 0.5 * (
+            losses["clip_l_content_norm"]
+            + losses["clip_big_g_content_norm"]
+        )
+        geometry = (
+            losses["clip_l_geometry"]
+            + losses["clip_big_g_geometry"]
+            + losses["pooled_geometry"]
+        ) / 3.0
+        retrieval = (
+            losses["clip_l_retrieval"]
+            + losses["clip_big_g_retrieval"]
+            + losses["pooled_retrieval"]
+        ) / 3.0
+        variance = (
+            losses["clip_l_variance"]
+            + losses["clip_big_g_variance"]
+            + losses["pooled_variance"]
+        ) / 3.0
+        return (
+            args.clip_l_weight * clip_l
+            + args.clip_big_g_weight * clip_big_g
+            + args.pooled_weight * pooled
+            + args.norm_weight * norm
+            + args.geometry_weight * geometry
+            + args.retrieval_weight * retrieval
+            + args.variance_weight * variance
+        )
+
     clip_l = losses["clip_l_normalized_mse"] + losses["clip_l_cosine"]
     clip_big_g = losses["clip_big_g_normalized_mse"] + losses["clip_big_g_cosine"]
     pooled = losses["pooled_mse"] + losses["pooled_cosine"]
@@ -169,6 +229,35 @@ def representation_loss(
         + args.norm_weight * norm
         + args.geometry_weight * geometry
     )
+
+
+def representation_scale(step: int, args: argparse.Namespace) -> float:
+    if args.objective_version != "v2" or step < args.closed_loop_start_step:
+        return 1.0
+    if args.representation_decay_steps <= 0:
+        return float(args.representation_final_scale)
+    progress = min(
+        max(
+            (step - args.closed_loop_start_step + 1)
+            / float(args.representation_decay_steps),
+            0.0,
+        ),
+        1.0,
+    )
+    return 1.0 + (float(args.representation_final_scale) - 1.0) * progress
+
+
+def load_hard_prompts(path: str | None) -> list[str]:
+    if not path:
+        return []
+    prompt_path = Path(path)
+    if not prompt_path.is_file():
+        raise FileNotFoundError(f"Hard-prompt file does not exist: {prompt_path}")
+    return [
+        clean_text(line)
+        for line in prompt_path.read_text(encoding="utf-8").splitlines()
+        if clean_text(line)
+    ]
 
 
 def parse_args() -> argparse.Namespace:
@@ -188,6 +277,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--clip-grad-norm", type=float, default=1.0)
+    parser.add_argument("--objective-version", choices=["v1", "v2"], default="v1")
     parser.add_argument("--caption-variant-columns", default="caption_short,caption_medium,caption_long")
     parser.add_argument("--caption-variant-weights", default="1,1,1")
     parser.add_argument("--caption-fallback-column", default="caption")
@@ -196,12 +286,26 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--prompt-modifier-prob",
+        type=float,
+        default=None,
+        help="Per-prompt modifier probability. Overrides --append-prompt-modifier.",
+    )
+    parser.add_argument("--hard-prompts", default=None)
+    parser.add_argument("--hard-prompt-prob", type=float, default=0.0)
 
     parser.add_argument("--clip-l-weight", type=float, default=0.25)
     parser.add_argument("--clip-big-g-weight", type=float, default=0.25)
     parser.add_argument("--pooled-weight", type=float, default=1.0)
     parser.add_argument("--geometry-weight", type=float, default=0.5)
     parser.add_argument("--norm-weight", type=float, default=0.1)
+    parser.add_argument("--eos-weight", type=float, default=0.5)
+    parser.add_argument("--padding-weight", type=float, default=0.15)
+    parser.add_argument("--retrieval-weight", type=float, default=0.1)
+    parser.add_argument("--variance-weight", type=float, default=0.05)
+    parser.add_argument("--representation-final-scale", type=float, default=0.35)
+    parser.add_argument("--representation-decay-steps", type=int, default=15000)
     parser.add_argument("--functional-weight", type=float, default=1.0)
     parser.add_argument("--functional-cos-weight", type=float, default=0.1)
     parser.add_argument("--functional-start-step", type=int, default=5001)
@@ -214,6 +318,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout-ramp-steps", type=int, default=5000)
     parser.add_argument("--rollout-every", type=int, default=8)
     parser.add_argument("--rollout-batch-size", type=int, default=1)
+    parser.add_argument("--closed-loop-weight", type=float, default=1.0)
+    parser.add_argument("--closed-loop-prediction-weight", type=float, default=0.5)
+    parser.add_argument("--closed-loop-cos-weight", type=float, default=0.1)
+    parser.add_argument("--closed-loop-transition-weight", type=float, default=1.0)
+    parser.add_argument("--closed-loop-terminal-weight", type=float, default=1.0)
+    parser.add_argument("--closed-loop-start-step", type=int, default=25001)
+    parser.add_argument("--closed-loop-ramp-steps", type=int, default=5000)
+    parser.add_argument("--closed-loop-every", type=int, default=4)
+    parser.add_argument("--closed-loop-batch-size", type=int, default=1)
 
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--save-latest-every", type=int, default=5000)
@@ -228,6 +341,8 @@ def validate_args(args: argparse.Namespace) -> None:
         "functional_batch_size": args.functional_batch_size,
         "rollout_batch_size": args.rollout_batch_size,
         "rollout_every": args.rollout_every,
+        "closed_loop_every": args.closed_loop_every,
+        "closed_loop_batch_size": args.closed_loop_batch_size,
         "log_every": args.log_every,
         "save_latest_every": args.save_latest_every,
         "save_archive_every": args.save_archive_every,
@@ -243,6 +358,18 @@ def validate_args(args: argparse.Namespace) -> None:
     invalid_weights = {name: value for name, value in weights.items() if value < 0}
     if invalid_weights:
         raise ValueError(f"Loss weights must be non-negative: {invalid_weights}")
+    probabilities = {
+        "hard_prompt_prob": args.hard_prompt_prob,
+    }
+    if args.prompt_modifier_prob is not None:
+        probabilities["prompt_modifier_prob"] = args.prompt_modifier_prob
+    invalid_probabilities = {
+        name: value
+        for name, value in probabilities.items()
+        if not 0.0 <= value <= 1.0
+    }
+    if invalid_probabilities:
+        raise ValueError(f"Probabilities must be within [0, 1]: {invalid_probabilities}")
 
 
 def main() -> None:
@@ -281,6 +408,9 @@ def main() -> None:
         fallback_column=args.caption_fallback_column,
         max_samples=args.max_samples,
     )
+    hard_prompts = load_hard_prompts(args.hard_prompts)
+    if args.hard_prompt_prob > 0 and not hard_prompts:
+        raise ValueError("--hard-prompt-prob requires a non-empty --hard-prompts file.")
     sampler = (
         DistributedSampler(
             dataset,
@@ -394,8 +524,22 @@ def main() -> None:
                 continue
             current_step += 1
             prompts = [str(value) for value in prompt_batch]
-            if args.append_prompt_modifier:
-                prompts = [prompt + DEFAULT_PROMPT_MODIFIER for prompt in prompts]
+            if hard_prompts:
+                prompts = [
+                    random.choice(hard_prompts)
+                    if random.random() < args.hard_prompt_prob
+                    else prompt
+                    for prompt in prompts
+                ]
+            modifier_probability = args.prompt_modifier_prob
+            if modifier_probability is None:
+                modifier_probability = 1.0 if args.append_prompt_modifier else 0.0
+            prompts = [
+                prompt + DEFAULT_PROMPT_MODIFIER
+                if random.random() < modifier_probability
+                else prompt
+                for prompt in prompts
+            ]
 
             with torch.no_grad():
                 teacher_condition = teacher.encode(prompts)
@@ -423,6 +567,7 @@ def main() -> None:
                     teacher_condition,
                 )
                 repr_loss = representation_loss(component_losses, args)
+                repr_scale = representation_scale(current_step, args)
 
                 functional = SSD1BFunctionalResult(
                     mse=repr_loss.new_zeros(()),
@@ -436,14 +581,46 @@ def main() -> None:
                     per_step_mse=(),
                     calls=0,
                 )
+                closed_loop = SSD1BClosedLoopResult(
+                    prediction_relative_mse=repr_loss.new_zeros(()),
+                    prediction_cosine=repr_loss.new_zeros(()),
+                    transition_relative_mse=repr_loss.new_zeros(()),
+                    transition_cosine=repr_loss.new_zeros(()),
+                    terminal_relative_mse=repr_loss.new_zeros(()),
+                    per_step_transition_relative_mse=(),
+                    calls=0,
+                )
                 mode = "representation"
                 functional_scale = 0.0
                 rollout_scale = 0.0
+                closed_loop_scale = 0.0
+                run_closed_loop = (
+                    args.objective_version == "v2"
+                    and current_step >= args.closed_loop_start_step
+                    and (current_step - args.closed_loop_start_step)
+                    % args.closed_loop_every
+                    == 0
+                )
                 run_rollout = (
+                    args.objective_version == "v1"
+                    and
                     current_step >= args.rollout_start_step
                     and (current_step - args.rollout_start_step) % args.rollout_every == 0
                 )
-                if run_rollout:
+                if run_closed_loop:
+                    mode = "closed_loop"
+                    closed_loop_scale = linear_ramp(
+                        current_step,
+                        start_step=args.closed_loop_start_step,
+                        ramp_steps=args.closed_loop_ramp_steps,
+                    )
+                    closed_loop = controller.closed_loop_loss(
+                        student_condition,
+                        teacher_condition,
+                        batch_size=args.closed_loop_batch_size,
+                        generator=generator,
+                    )
+                elif run_rollout:
                     mode = "rollout"
                     rollout_scale = linear_ramp(
                         current_step,
@@ -468,9 +645,14 @@ def main() -> None:
                         teacher_condition,
                         batch_size=args.functional_batch_size,
                         generator=generator,
+                        timestep_index=(
+                            (current_step + context.rank) % 4
+                            if args.objective_version == "v2"
+                            else None
+                        ),
                     )
 
-                loss = repr_loss
+                loss = repr_scale * repr_loss
                 loss = loss + functional_scale * (
                     args.functional_weight * functional.mse
                     + args.functional_cos_weight * functional.cosine
@@ -479,6 +661,19 @@ def main() -> None:
                     args.rollout_weight * rollout.prediction_mse
                     + args.rollout_cos_weight * rollout.prediction_cosine
                     + args.rollout_transition_weight * rollout.transition_mse
+                )
+                loss = loss + closed_loop_scale * args.closed_loop_weight * (
+                    args.closed_loop_prediction_weight
+                    * closed_loop.prediction_relative_mse
+                    + args.closed_loop_cos_weight
+                    * (
+                        closed_loop.prediction_cosine
+                        + closed_loop.transition_cosine
+                    )
+                    + args.closed_loop_transition_weight
+                    * closed_loop.transition_relative_mse
+                    + args.closed_loop_terminal_weight
+                    * closed_loop.terminal_relative_mse
                 )
 
             optimizer.zero_grad(set_to_none=True)
@@ -495,11 +690,17 @@ def main() -> None:
             for group in optimizer.param_groups:
                 group["lr"] = args.lr * lr_scale
 
-            if current_step % args.log_every == 0 or current_step == 1:
+            if (
+                current_step % args.log_every == 0
+                or current_step == 1
+                or run_rollout
+                or run_closed_loop
+            ):
                 item = {
                     "step": current_step,
                     "loss": scalar_mean(loss.detach(), context),
                     "representation": scalar_mean(repr_loss.detach(), context),
+                    "representation_scale": repr_scale,
                     "clip_l_normalized_mse": scalar_mean(
                         component_losses["clip_l_normalized_mse"].detach(),
                         context,
@@ -527,6 +728,40 @@ def main() -> None:
                         / 3.0,
                         context,
                     ),
+                    "retrieval": scalar_mean(
+                        (
+                            component_losses["clip_l_retrieval"]
+                            + component_losses["clip_big_g_retrieval"]
+                            + component_losses["pooled_retrieval"]
+                        ).detach()
+                        / 3.0,
+                        context,
+                    ),
+                    "variance": scalar_mean(
+                        (
+                            component_losses["clip_l_variance"]
+                            + component_losses["clip_big_g_variance"]
+                            + component_losses["pooled_variance"]
+                        ).detach()
+                        / 3.0,
+                        context,
+                    ),
+                    "content_cosine": scalar_mean(
+                        (
+                            component_losses["clip_l_content_cosine"]
+                            + component_losses["clip_big_g_content_cosine"]
+                        ).detach()
+                        / 2.0,
+                        context,
+                    ),
+                    "padding_cosine": scalar_mean(
+                        (
+                            component_losses["clip_l_padding_cosine"]
+                            + component_losses["clip_big_g_padding_cosine"]
+                        ).detach()
+                        / 2.0,
+                        context,
+                    ),
                     "functional_mse": scalar_mean(functional.mse.detach(), context),
                     "functional_cosine": scalar_mean(functional.cosine.detach(), context),
                     "functional_scale": functional_scale,
@@ -536,6 +771,28 @@ def main() -> None:
                     "rollout_transition": scalar_mean(rollout.transition_mse.detach(), context),
                     "rollout_scale": rollout_scale,
                     "rollout_calls": rollout.calls,
+                    "closed_loop_prediction_relative_mse": scalar_mean(
+                        closed_loop.prediction_relative_mse.detach(),
+                        context,
+                    ),
+                    "closed_loop_transition_relative_mse": scalar_mean(
+                        closed_loop.transition_relative_mse.detach(),
+                        context,
+                    ),
+                    "closed_loop_terminal_relative_mse": scalar_mean(
+                        closed_loop.terminal_relative_mse.detach(),
+                        context,
+                    ),
+                    "closed_loop_transition_cosine": scalar_mean(
+                        closed_loop.transition_cosine.detach(),
+                        context,
+                    ),
+                    "closed_loop_per_step_transition_relative_mse": [
+                        scalar_mean(value.detach(), context)
+                        for value in closed_loop.per_step_transition_relative_mse
+                    ],
+                    "closed_loop_scale": closed_loop_scale,
+                    "closed_loop_calls": closed_loop.calls,
                     "lr": optimizer.param_groups[0]["lr"],
                     "mode": mode,
                 }
@@ -546,7 +803,7 @@ def main() -> None:
                         loss=f"{item['loss']:.4f}",
                         repr=f"{item['representation']:.4f}",
                         func=f"{item['functional_mse']:.4f}",
-                        roll=f"{item['rollout_mse']:.4f}",
+                        traj=f"{item['closed_loop_terminal_relative_mse']:.4f}",
                     )
 
             save_latest = current_step % args.save_latest_every == 0
@@ -575,8 +832,17 @@ def main() -> None:
                         "distillation": {
                             "representation": True,
                             "frozen_unet_functional": True,
+                            "objective_version": args.objective_version,
+                            "mask_aware_tokens": args.objective_version == "v2",
+                            "global_retrieval": args.objective_version == "v2",
+                            "variance_alignment": args.objective_version == "v2",
+                            "balanced_functional_timesteps": args.objective_version == "v2",
                             "full_lcm_rollout_calls": 4,
-                            "teacher_state_policy": "detached_student_on_policy",
+                            "teacher_state_policy": (
+                                "independent_native_closed_loop"
+                                if args.objective_version == "v2"
+                                else "detached_student_on_policy"
+                            ),
                         },
                     }
                     atomic_torch_save(payload, latest_path)

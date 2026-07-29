@@ -1,0 +1,57 @@
+bridge:
+  smolvlm2_ckpt_path: checkpoints/smolvlm2_500m/smolvlm2_500m.pt
+  adapter_ckpt_dir:
+  tokenizer_model_id: HuggingFaceTB/SmolVLM-Instruct
+  max_length: 128
+  sana_model_max_length: 128
+  caption_channels: 1536
+  projector_type: mcp_lexical_gated
+  mcp_num_fuse_layers: 2
+  mcp_use_refine: true
+  mcp_refine_kernel_size: 3
+  mcp_lexical_gate_init: 0.2
+  strict_sana_parity_text_path: true
+  strict_sana_use_full_text_window: true
+  strict_sana_token_select_strategy: head_uniform_tail
+  strict_sana_head_tokens: 96
+  strict_sana_tail_tokens: 96
+  fail_fast_mask: true
+
+image_bridge:
+  sequence_length: 77
+  clip_l_dim: 768
+  clip_big_g_dim: 1280
+  pooled_dim: 1280
+  attention_dim: 512
+  num_heads: 8
+  num_layers: 2
+  num_fuse_layers: 4
+  lexical_gate_init: 0.2
+  ff_mult: 4
+  dropout: 0.0
+
+backend:
+  name: mobile_ov_neodragon
+  dtype: bf16
+  extra:
+    repo_path: checkpoints/neodragon_repo
+    cache_dir: checkpoints/neodragon
+    repo_url: https://github.com/Qualcomm-AI-research/neodragon.git
+    mode: hybrid
+    model_id: karnewar/Neodragon
+
+data:
+  output_dir: output/ssd1b_image_bridge_v2
+  frame_num: 49
+  height: 320
+  width: 512
+
+train:
+  batch_size: 4
+  lr: 0.00004
+  total_steps: 100000
+  motion_weight: 0.5
+  accel_weight: 0.0
+  log_every: 20
+  save_every: 5000
+  dtype: bf16

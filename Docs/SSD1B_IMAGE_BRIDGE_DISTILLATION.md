@@ -172,3 +172,11 @@ The implementation was smoke-tested through SLURM with two GPUs:
 
 The production eight-GPU Berzelius run uses the same `torchrun` path with
 `--nproc_per_node=8`.
+
+## 100K Evaluation and V2
+
+This document describes the original V1 implementation. The measured 100K
+evaluation found padding-dominated token supervision, compressed condition
+rank, weak prompt retrieval, and compounding four-step trajectory drift. The
+controlled objective-only V2 and its exact metrics are documented in
+[`SSD1B_IMAGE_BRIDGE_100K_EVALUATION_AND_V2.md`](SSD1B_IMAGE_BRIDGE_100K_EVALUATION_AND_V2.md).
