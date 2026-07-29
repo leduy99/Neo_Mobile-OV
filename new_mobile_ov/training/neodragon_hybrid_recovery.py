@@ -189,13 +189,17 @@ def normalized_charbonnier(
     return torch.sqrt(residual.square() + float(epsilon) ** 2).mean()
 
 
-def endpoint_cosine_distance(
+def transition_cosine_distance(
     prediction: torch.Tensor,
     target: torch.Tensor,
+    *,
+    start: torch.Tensor,
 ) -> torch.Tensor:
+    prediction_delta = prediction.float() - start.float()
+    target_delta = target.float() - start.float()
     return 1.0 - F.cosine_similarity(
-        prediction.float().flatten(1),
-        target.float().flatten(1),
+        prediction_delta.flatten(1),
+        target_delta.flatten(1),
         dim=-1,
     ).mean()
 

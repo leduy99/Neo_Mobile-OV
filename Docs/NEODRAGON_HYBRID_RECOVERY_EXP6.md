@@ -17,9 +17,11 @@ second frozen copy of the released Hybrid model defines a behavior trust
 region. The certified Exp1 Mobile-OV bridge is frozen and supplies the
 Student/Hybrid text condition.
 
-This is a 20K-step feasibility run. It tests whether the Hybrid DiT can improve
+The default job is a 2K-step pilot. It tests whether the Hybrid DiT can improve
 late-unit and high-resolution transitions without destroying its released
-1-1-1 behavior. It is not yet a reproduction of NeoDragon's full DMD training.
+1-1-1 behavior. A 20K continuation is justified only if the pilot passes the
+go/no-go checks below. This is not a reproduction of NeoDragon's full DMD
+training.
 
 ## Why this experiment exists
 
@@ -142,6 +144,10 @@ The 18 positions are visited in a balanced cycle:
 (0,0), (0,1), (0,2), (1,0), ... (5,2), repeat
 ```
 
+For the default 2K pilot, the two curriculum boundaries are 100 and 1,000
+steps. The 500/5K boundaries below describe the optional 20K continuation and
+scale proportionally in the pilot.
+
 ### Steps 1-500: Hybrid parity
 
 ```text
@@ -215,9 +221,12 @@ The primary loss is normalized Charbonnier:
 L_map = mean(sqrt(((z_S - z_target) / q[u,s])^2 + epsilon^2))
 ```
 
-`q[u,s]` is a clamped EMA of the target transition RMS for each of the 18
+`q[u,s]` is a clamped EMA of Teacher-M target transition RMS for each of the 18
 positions. Per-position normalization is required because transition
-magnitudes differ strongly across units and pyramid resolutions.
+magnitudes differ strongly across units and pyramid resolutions. Hybrid parity
+and real-endpoint auxiliary samples use their current globally reduced
+transition RMS but do not update this primary EMA, so auxiliary target families
+cannot distort the Teacher-M map scale.
 
 For normal map modes:
 
@@ -237,14 +246,19 @@ For the real endpoint anchor:
 z_target = clean OpenVid pyramid endpoint
 ```
 
-### 2. Endpoint cosine
+### 2. Transition cosine
 
 ```text
-L_cos = 1 - cosine(flatten(z_S), flatten(z_target))
+delta_S      = z_S - x_start
+delta_target = z_target - x_start
+L_cos        = 1 - cosine(flatten(delta_S), flatten(delta_target))
 ```
 
-This preserves update direction when endpoint scale differs. Its default
-weight is `0.05`; it supplements rather than replaces the endpoint loss.
+This preserves the denoising-update direction when transition scale differs.
+Comparing absolute endpoints would be misleading because the shared
+`x_start` can dominate both tensors even when their updates point in different
+directions. Its default weight is `0.05`; it supplements rather than replaces
+the endpoint loss.
 
 ### 3. Adaptive Hybrid trust region
 
@@ -369,8 +383,11 @@ The default global batch on Berzelius is:
 8 GPUs x batch 1/GPU = 8
 ```
 
-The main checkpoint optionally includes Adam state for exact resume. Because
-the Student has 1.512B FP32 trainable parameters:
+The main checkpoint optionally includes Adam state for resume. The output
+directory is stable across SLURM submissions, and resume restores the model,
+optimizer, map-scale EMA, absolute step, deterministic per-step random seeds,
+and data epoch/batch position. GPU kernels are not claimed to be bitwise
+deterministic. Because the Student has 1.512B FP32 trainable parameters:
 
 ```text
 model-only archive: approximately 6 GB
@@ -387,7 +404,7 @@ The implementation was validated on two H200 GPUs.
 ### Static tests
 
 ```text
-7 unit tests passed
+23 repository tests passed, including 8 Exp6-specific tests
 Python compilation passed
 Bash syntax checks passed
 git diff whitespace checks passed
@@ -399,13 +416,13 @@ The unit tests cover:
 - curriculum probability normalization;
 - exact scheduler endpoint integration;
 - rollout stopping before the selected call;
-- endpoint normalization and adaptive trust margin;
+- transition cosine, endpoint normalization, and adaptive trust margin;
 - real-history teacher forcing;
 - stage-unit EMA state restoration.
 
 ### Two-GPU branch smoke
 
-Job `2897` completed successfully and exercised:
+Job `2904` completed successfully and exercised:
 
 ```text
 hybrid_parity
@@ -428,8 +445,7 @@ The near-zero Student/Hybrid gap confirms correct released-Hybrid
 initialization. The nonzero M/H gap confirms that the monolithic target is not
 trivially identical to the Hybrid target.
 
-The first smoke run observed approximately `35.3 GiB/GPU` peak allocated
-memory.
+The complete five-step training section took 7.5 seconds after model loading.
 
 Job `2898` forced `noisy_history` at `(unit=5, stage=2)`. The Student replayed
 all 17 preceding calls under `no_grad`, then recomputed call 18 with gradients.
@@ -447,13 +463,56 @@ peak allocated memory: 31.5 GiB/GPU
 This covers the maximum causal-history position and confirms that replayed
 backpropagation stays well below an 80 GB Berzelius GPU.
 
+Job `2905` forced the worst-case `teacher_map` position `(unit=5, stage=2)`.
+This includes all preceding Monolithic actor transitions and the selected
+ten-step Teacher-M target. It completed in 7.83 seconds. This rules out the
+feared graph-memory failure and provides a conservative upper bound for online
+teacher-map cost.
+
+Job `2906` profiled one complete balanced cycle of all 18 Teacher-M positions:
+
+```text
+mean:                 4.11 seconds/step
+median:               4.09 seconds/step
+minimum at (0,1):     1.64 seconds
+maximum at (5,2):     7.17 seconds
+peak GPU allocation: 34.51 GiB
+```
+
+On the local H200 node, an artificial 2K run containing only the more expensive
+`teacher_map` mode would therefore require about 2.3 hours of training compute,
+excluding model load and checkpoint I/O. The actual mixed curriculum also uses
+cheaper modes. Berzelius A100 throughput must still be read from the first
+pilot log rather than assumed identical.
+
+The trainer records `step_seconds` in `history.json`, including diagnostic runs
+that intentionally skip model checkpoint saves.
+
+## Deliberately unchanged after review
+
+Teacher M continues to use its native multistep conditioner and CFG, while the
+Student and Teacher H use the Exp1 bridge. This difference is bounded by the
+Hybrid trust region and is intentional in v1.1. The Exp1 bridge was aligned to
+the released Hybrid context adapter, not the Monolithic multistep adapter.
+Feeding that bridge directly to Teacher M would therefore be an
+out-of-distribution diagnostic rather than a clean isolation of dynamics. A
+separate Monolithic-condition bridge can be evaluated later if the pilot shows
+that condition mismatch dominates the M-H gap.
+
+Generated SSD1B anchors, a fake-model DMD objective, midpoint consistency, and
+an EMA Student remain deferred. None is required to answer the pilot's narrow
+question, and adding them now would make failures harder to attribute.
+
 ## Berzelius usage
 
 Submit from the repository root:
 
 ```bash
-sbatch scripts/exp6_train_neodragon_hybrid_recovery_1node8gpu.sbatch
+RUN_NAME=exp6_v1_pilot sbatch scripts/exp6_train_neodragon_hybrid_recovery_1node8gpu.sbatch
 ```
+
+The safe default is 2,000 total steps, 100 parity steps, and a 1,000-step
+map-initialization boundary.
 
 Inspect status and the last 20 log lines:
 
@@ -465,16 +524,21 @@ tail -n 20 logs/neo-exp6-map-<JOBID>.out
 Override a setting without editing the script:
 
 ```bash
-STEPS=20000 BATCH_SIZE=1 sbatch scripts/exp6_train_neodragon_hybrid_recovery_1node8gpu.sbatch
+RUN_NAME=exp6_v1_full STEPS=20000 PARITY_STEPS=500 MAP_END_STEP=5000 \
+sbatch scripts/exp6_train_neodragon_hybrid_recovery_1node8gpu.sbatch
 ```
 
 The script resumes automatically from:
 
 ```text
-output/neo_exp6_hybrid_recovery/<JOBID>/neodragon_exp6_latest.pt
+output/neo_exp6_hybrid_recovery/<RUN_NAME>/neodragon_exp6_latest.pt
 ```
 
-To resume into a new job/output directory, provide the checkpoint explicitly:
+Submit the same command with the same `RUN_NAME` to resume automatically.
+Exp6 also pins the bridge to step 80K, computes its SHA256 at launch, stores
+the hash in every checkpoint, and rejects resume with a different bridge.
+
+To resume from an explicit checkpoint instead:
 
 ```bash
 RESUME=/absolute/path/neodragon_exp6_latest.pt \

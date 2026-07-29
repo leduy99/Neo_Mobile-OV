@@ -8,6 +8,7 @@ import math
 import os
 import random
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -37,7 +38,6 @@ from new_mobile_ov.training.neodragon_hybrid_recovery import (
     balanced_position,
     clean_endpoint_for_position,
     corrupt_history,
-    endpoint_cosine_distance,
     hybrid_trust_region_loss,
     normalized_charbonnier,
     relative_endpoint_l2,
@@ -45,16 +45,19 @@ from new_mobile_ov.training.neodragon_hybrid_recovery import (
     run_stage_endpoint,
     sample_curriculum_mode,
     teacher_forced_state_to_position,
+    transition_cosine_distance,
     transition_rms,
 )
 from tools.train_neodragon_dit_bridge import (
     VideoPromptDataset,
     collate_video_batch,
-    cycle_loader,
     load_bridge,
     load_neodragon_train_modules,
 )
-from tools.train_neodragon_text_bridge import load_neodragon_functional_modules
+from tools.train_neodragon_text_bridge import (
+    cycle_loader,
+    load_neodragon_functional_modules,
+)
 
 
 def dtype_from_name(name: str) -> torch.dtype:
@@ -237,7 +240,7 @@ def save_checkpoint(
     output_dir: Path,
     step: int,
     bridge_checkpoint: str,
-    scale_ema: StageUnitScaleEMA,
+    map_scale_ema: StageUnitScaleEMA,
     history: list[dict[str, object]],
     cfg,
     args: argparse.Namespace,
@@ -254,7 +257,8 @@ def save_checkpoint(
             "step": int(step),
             "dit": student_state,
             "bridge_ckpt": bridge_checkpoint,
-            "scale_ema": scale_ema.state_dict(),
+            "bridge_sha256": args.bridge_sha256,
+            "map_scale_ema": map_scale_ema.state_dict(),
             "history": history,
             "config": cfg,
             "args": vars(args),
@@ -305,6 +309,7 @@ def parse_args() -> argparse.Namespace:
         default="data/openvid_neodragon_2s_latents/latent_manifest.csv",
     )
     parser.add_argument("--bridge-ckpt", required=True)
+    parser.add_argument("--bridge-sha256", default="")
     parser.add_argument("--output-dir", default="output/neo_exp6_hybrid_recovery")
     parser.add_argument("--resume", default="auto")
     parser.add_argument("--steps", type=int, default=20000)
@@ -361,6 +366,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Keep Adam state in latest; archives are model-only.",
+    )
+    parser.add_argument(
+        "--save-final",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save at the final step even when it is not a checkpoint interval.",
     )
     parser.add_argument("--caption-variant-columns", default="caption_short,caption_medium,caption_long")
     parser.add_argument("--caption-variant-weights", default="1,1,1")
@@ -466,8 +477,6 @@ def main() -> None:
             use_latents=True,
         ),
     )
-    batches = cycle_loader(loader, sampler)
-
     rank0_print(ctx, "Loading released Hybrid Student.")
     student, _, scheduler, _ = load_neodragon_train_modules(
         cfg,
@@ -475,9 +484,13 @@ def main() -> None:
         inference_dtype,
         load_vae=False,
     )
-    student.requires_grad_(True)
+    student.train().requires_grad_(True)
     student.gradient_checkpointing = bool(args.gradient_checkpointing)
     student.gradient_checkpointing_ratio = 0.0
+    if not student.training:
+        raise RuntimeError("Trainable Hybrid Student must remain in training mode.")
+    if args.gradient_checkpointing and not student.gradient_checkpointing:
+        raise RuntimeError("Gradient checkpointing was requested but is not enabled.")
     promote_trainable_to_fp32(student)
 
     resume_path: Path | None = None
@@ -498,6 +511,16 @@ def main() -> None:
         student.load_state_dict(resume_payload["dit"], strict=True)
         start_step = int(resume_payload["step"])
         history = list(resume_payload.get("history", []))
+        saved_bridge_sha256 = str(resume_payload.get("bridge_sha256", ""))
+        if (
+            saved_bridge_sha256
+            and args.bridge_sha256
+            and saved_bridge_sha256 != args.bridge_sha256
+        ):
+            raise ValueError(
+                "Refusing to resume with a different bridge checkpoint: "
+                f"saved={saved_bridge_sha256} current={args.bridge_sha256}."
+            )
         rank0_print(ctx, f"Resuming Exp6 from {resume_path} at step={start_step}.")
 
     optimizer_groups, parameter_counts = build_optimizer_groups(
@@ -517,13 +540,18 @@ def main() -> None:
     if resume_payload is not None and "optimizer" in resume_payload:
         optimizer.load_state_dict(resume_payload["optimizer"])
 
-    scale_ema = StageUnitScaleEMA(
+    map_scale_ema = StageUnitScaleEMA(
         num_units=args.num_units,
         num_stages=args.num_stages,
         decay=args.normalizer_decay,
     )
-    if resume_payload is not None and "scale_ema" in resume_payload:
-        scale_ema.load_state_dict(resume_payload["scale_ema"])
+    if resume_payload is not None:
+        saved_scale = resume_payload.get(
+            "map_scale_ema",
+            resume_payload.get("scale_ema"),
+        )
+        if saved_scale is not None:
+            map_scale_ema.load_state_dict(saved_scale)
 
     student_model: torch.nn.Module = student
     if ctx.is_distributed:
@@ -560,6 +588,16 @@ def main() -> None:
         inference_dtype,
         trainable=False,
     ).eval()
+    hybrid_teacher.eval()
+    monolithic_teacher.eval()
+
+    start_epoch, start_batch = divmod(start_step, len(loader))
+    batches = cycle_loader(
+        loader,
+        sampler,
+        start_epoch=start_epoch,
+        start_batch=start_batch,
+    )
 
     rank0_print(
         ctx,
@@ -568,7 +606,8 @@ def main() -> None:
         f"global_batch={ctx.world_size * args.batch_size} rows={len(dataset)} "
         f"student_params={sum(p.numel() for p in student.parameters()):,} "
         f"optimizer_groups={parameter_counts} "
-        f"bridge={args.bridge_ckpt}",
+        f"bridge={args.bridge_ckpt} "
+        f"data_epoch={start_epoch} data_batch={start_batch}",
     )
     if start_step >= args.steps:
         rank0_print(ctx, f"Nothing to train: step={start_step} target={args.steps}.")
@@ -581,6 +620,15 @@ def main() -> None:
         disable=not ctx.is_main,
     )
     for step in progress:
+        step_started = time.perf_counter()
+        step_seed = args.seed + ctx.rank * 10_000_019 + step * 1_000_003
+        random.seed(step_seed)
+        np.random.seed(step_seed % (2**32))
+        torch.manual_seed(step_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(step_seed)
+        generator.manual_seed(step_seed + 100_000)
+
         unit, stage = balanced_position(
             step,
             num_units=args.num_units,
@@ -722,11 +770,17 @@ def main() -> None:
 
             local_scale = transition_rms(state.start, target_endpoint)
             global_scale = all_reduce_mean(local_scale)
-            normalizer = scale_ema.update(
-                unit,
-                stage,
-                float(global_scale.cpu()),
-            )
+            if mode in {"hybrid_parity", "real_endpoint"}:
+                normalizer = min(
+                    max(float(global_scale.cpu()), map_scale_ema.minimum),
+                    map_scale_ema.maximum,
+                )
+            else:
+                normalizer = map_scale_ema.update(
+                    unit,
+                    stage,
+                    float(global_scale.cpu()),
+                )
 
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(
@@ -748,9 +802,10 @@ def main() -> None:
                 target_endpoint.detach(),
                 scale=normalizer,
             )
-            map_cosine = endpoint_cosine_distance(
+            map_cosine = transition_cosine_distance(
                 student_endpoint,
                 target_endpoint.detach(),
+                start=state.start.detach(),
             )
 
             trust_loss = student_endpoint.new_zeros(())
@@ -787,7 +842,11 @@ def main() -> None:
         )
         optimizer.step()
 
-        if step % args.log_every == 0 or step == start_step + 1:
+        should_log = step % args.log_every == 0 or step == start_step + 1
+        if should_log:
+            if ctx.device.type == "cuda":
+                torch.cuda.synchronize(ctx.device)
+            step_seconds = time.perf_counter() - step_started
             with torch.no_grad():
                 target_relative_l2 = relative_endpoint_l2(
                     student_endpoint,
@@ -814,6 +873,7 @@ def main() -> None:
                 "hybrid_target_relative_l2": scalar_mean(hybrid_target_l2.detach(), ctx),
                 "transition_normalizer": float(normalizer),
                 "history_corruption": float(corruption_strength),
+                "step_seconds": float(step_seconds),
                 "lr_scale": float(lr_scale),
                 "middle_lr": float(args.middle_lr * lr_scale),
                 "grad_norm": scalar_mean(grad_norm.detach(), ctx),
@@ -831,10 +891,18 @@ def main() -> None:
                     loss=f"{item['loss']:.4f}",
                     rel=f"{item['student_target_relative_l2']:.3f}",
                     trust=f"{item['trust_loss']:.3f}",
+                    dt=f"{item['step_seconds']:.2f}s",
                 )
 
-        save_latest = step % args.save_latest_every == 0 or step == args.steps
-        save_archive = step % args.save_archive_every == 0 or step == args.steps
+        is_final = step == args.steps
+        save_latest = (
+            step % args.save_latest_every == 0
+            or (is_final and args.save_final)
+        )
+        save_archive = (
+            step % args.save_archive_every == 0
+            or (is_final and args.save_final)
+        )
         if save_latest:
             save_checkpoint(
                 student_model=student_model,
@@ -842,7 +910,7 @@ def main() -> None:
                 output_dir=output_dir,
                 step=step,
                 bridge_checkpoint=args.bridge_ckpt,
-                scale_ema=scale_ema,
+                map_scale_ema=map_scale_ema,
                 history=history,
                 cfg=cfg,
                 args=args,
@@ -851,6 +919,12 @@ def main() -> None:
                 ctx=ctx,
             )
 
+    if ctx.is_main:
+        (output_dir / "history.json").write_text(
+            json.dumps(history, indent=2),
+            encoding="utf-8",
+        )
+    barrier()
     rank0_print(ctx, f"Completed Exp6 Hybrid recovery at step={args.steps}.")
     cleanup_distributed()
 

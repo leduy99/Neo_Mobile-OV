@@ -24,13 +24,15 @@ CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-${CONDA_ENV}/bin/torchrun}"
 CONFIG="${CONFIG:-configs/mobile_ov_neodragon.yaml}"
 MANIFEST="${MANIFEST:-data/openvid_neodragon_2s_latents/latent_manifest.csv}"
-OUT="${OUT:-output/neo_exp6_hybrid_recovery/${SLURM_JOB_ID}}"
+RUN_NAME="${RUN_NAME:-exp6_v1_pilot}"
+OUT="${OUT:-output/neo_exp6_hybrid_recovery/${RUN_NAME}}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+BRIDGE_STEP="${BRIDGE_STEP:-80000}"
 
 if [[ -z "${BRIDGE_CKPT:-}" ]]; then
   BRIDGE_CANDIDATES=(
-    "output/neo_exp1_rollout_64k_to100k/17174692/neodragon_rollout_bridge_latest.pt"
-    "output/neo_exp1_rollout_64k_to100k/neodragon_rollout_bridge_latest.pt"
+    "output/neo_exp1_rollout_64k_to100k/17174692/neodragon_rollout_bridge_step080000.pt"
+    "output/neo_exp1_rollout_64k_to100k/neodragon_rollout_bridge_step080000.pt"
     "checkpoints/hf_mobile_ov/neo_exp1_rollout_64k_to100k/17174692/neodragon_rollout_bridge_latest.pt"
   )
   BRIDGE_CKPT="${BRIDGE_CANDIDATES[0]}"
@@ -59,11 +61,25 @@ for required in "${MANIFEST}" "${BRIDGE_CKPT}" "${TORCHRUN_BIN}"; do
   fi
 done
 
+ACTUAL_BRIDGE_STEP="$("${CONDA_ENV}/bin/python" - "${BRIDGE_CKPT}" <<'PY'
+import sys
+import torch
+
+payload = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+print(int(payload.get("step", -1)))
+PY
+)"
+if [[ "${ACTUAL_BRIDGE_STEP}" != "${BRIDGE_STEP}" ]]; then
+  echo "Bridge step mismatch: expected=${BRIDGE_STEP} actual=${ACTUAL_BRIDGE_STEP}" >&2
+  exit 1
+fi
+BRIDGE_SHA256="$(sha256sum "${BRIDGE_CKPT}" | awk '{print $1}')"
+
 echo "Exp6: recover NeoDragon Hybrid's 6x3 one-step transition maps"
 echo "MANIFEST=${MANIFEST}"
-echo "BRIDGE_CKPT=${BRIDGE_CKPT}"
-echo "OUT=${OUT} RESUME=${RESUME:-auto}"
-echo "STEPS=${STEPS:-20000} PARITY_STEPS=${PARITY_STEPS:-500} MAP_END_STEP=${MAP_END_STEP:-5000}"
+echo "BRIDGE_CKPT=${BRIDGE_CKPT} STEP=${ACTUAL_BRIDGE_STEP} SHA256=${BRIDGE_SHA256}"
+echo "RUN_NAME=${RUN_NAME} OUT=${OUT} RESUME=${RESUME:-auto}"
+echo "STEPS=${STEPS:-2000} PARITY_STEPS=${PARITY_STEPS:-100} MAP_END_STEP=${MAP_END_STEP:-1000}"
 echo "GLOBAL_BATCH=$((NPROC_PER_NODE * ${BATCH_SIZE:-1}))"
 echo "LR middle/edge/io=${MIDDLE_LR:-1e-6}/${EDGE_LR:-2.5e-7}/${IO_LR:-5e-7}"
 nvidia-smi || true
@@ -76,11 +92,12 @@ nvidia-smi || true
   --config "${CONFIG}" \
   --manifest "${MANIFEST}" \
   --bridge-ckpt "${BRIDGE_CKPT}" \
+  --bridge-sha256 "${BRIDGE_SHA256}" \
   --output-dir "${OUT}" \
   --resume "${RESUME:-auto}" \
-  --steps "${STEPS:-20000}" \
-  --parity-steps "${PARITY_STEPS:-500}" \
-  --map-end-step "${MAP_END_STEP:-5000}" \
+  --steps "${STEPS:-2000}" \
+  --parity-steps "${PARITY_STEPS:-100}" \
+  --map-end-step "${MAP_END_STEP:-1000}" \
   --batch-size "${BATCH_SIZE:-1}" \
   --middle-lr "${MIDDLE_LR:-1e-6}" \
   --edge-lr "${EDGE_LR:-2.5e-7}" \

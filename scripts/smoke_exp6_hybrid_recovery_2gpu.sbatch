@@ -44,7 +44,8 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
   --batch-size 1 \
   --max-samples 8 \
   --no-save-optimizer \
+  --no-save-final \
   --log-every 1 \
-  --save-latest-every 2 \
-  --save-archive-every 2 \
+  --save-latest-every "${SAVE_LATEST_EVERY:-1000}" \
+  --save-archive-every "${SAVE_ARCHIVE_EVERY:-1000}" \
   ${EXTRA_ARGS:-}

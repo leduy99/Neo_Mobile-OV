@@ -15,6 +15,7 @@ from new_mobile_ov.training.neodragon_hybrid_recovery import (
     rollout_state_to_position,
     run_stage_endpoint,
     teacher_forced_state_to_position,
+    transition_cosine_distance,
 )
 
 
@@ -138,6 +139,14 @@ def test_normalization_and_trust_margin() -> None:
     assert student_gap < margin
     assert loss.item() == 0.0
     assert normalized_charbonnier(student, monolithic, scale=0.2).item() > 0.0
+
+
+def test_transition_cosine_ignores_shared_endpoint_content() -> None:
+    start = torch.tensor([[[[[100.0, 100.0]]]]])
+    prediction = start + torch.tensor([[[[[1.0, 0.0]]]]])
+    target = start + torch.tensor([[[[[0.0, 1.0]]]]])
+    loss = transition_cosine_distance(prediction, target, start=start)
+    assert torch.isclose(loss, torch.tensor(1.0))
 
 
 def test_teacher_forcing_uses_real_history() -> None:
