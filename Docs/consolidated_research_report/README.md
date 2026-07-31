@@ -1,6 +1,6 @@
 # Mobile-OV Consolidated Research Report
 
-**Coverage:** experiments and measurements completed through 2026-07-30
+**Coverage:** experiments and measurements completed through 2026-07-31
 
 **Repository:** `New-Mobile-OV`
 
@@ -22,6 +22,7 @@ from interpretations and proposed next steps.
 | [Part 4: Model, Speed, Memory, and Quality Measurements](PART_4_MEASUREMENTS_AND_DEPLOYMENT.md) | How large and fast are the components, and what do the measured diagnostics actually mean? |
 | [Part 5: Conclusions and Roadmap](PART_5_CONCLUSIONS_AND_ROADMAP.md) | Which findings are confirmed, what should not be repeated, and what is the lowest-risk next direction? |
 | [Appendix: Evidence Index](APPENDIX_EVIDENCE_INDEX.md) | Which script, checkpoint family, metric file, and visual artifact supports each result? |
+| [Exp6 Decision Matrix](../EXP6_DECISION_MATRIX_96_PROMPT_ABLATION.md) | Does Exp6 fail because of condition mismatch or multi-transition credit assignment? |
 
 ## Executive Result
 
@@ -95,6 +96,7 @@ needed:
 - `Docs/NEODRAGON_EXP2_EXP3_EXP4_FAILURE_POSTMORTEM.md`
 - `Docs/NEODRAGON_FULL_ROLLOUT_DISTILLATION.md`
 - `Docs/NEODRAGON_HYBRID_RECOVERY_EXP6.md`
+- `Docs/EXP6_DECISION_MATRIX_96_PROMPT_ABLATION.md`
 - `Docs/SSD1B_IMAGE_BRIDGE_DISTILLATION.md`
 - `Docs/SSD1B_IMAGE_BRIDGE_100K_EVALUATION_AND_V2.md`
 - `Docs/IMAGE_BRIDGE_V1_V2_AND_EXP6_RESULTS.md`
