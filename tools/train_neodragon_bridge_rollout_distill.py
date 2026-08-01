@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -90,6 +92,64 @@ def atomic_torch_save(payload: dict, destination: Path) -> None:
     temporary.replace(destination)
 
 
+def newest_checkpoint(output_dir: Path) -> Path | None:
+    """Return the highest-step resumable checkpoint without relying on latest."""
+    best: tuple[int, Path] | None = None
+    for path in output_dir.glob("neodragon_rollout_bridge_step*.pt"):
+        try:
+            step = int(path.stem.rsplit("step", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if best is None or step > best[0]:
+            best = (step, path)
+    best_path = output_dir / "neodragon_rollout_bridge_best.pt"
+    if best_path.is_file():
+        try:
+            payload = torch.load(best_path, map_location="cpu", weights_only=False)
+            step = int(payload.get("step", -1))
+            if best is None or step > best[0]:
+                best = (step, best_path)
+        except Exception:
+            pass
+    return None if best is None else best[1]
+
+
+def make_validation_dataset(
+    dataset: VideoPromptDataset,
+    validation_samples: int,
+) -> VideoPromptDataset | None:
+    """Reserve a deterministic, caption-balanced tail split for model selection."""
+    if validation_samples <= 0:
+        return None
+    if len(dataset.rows) <= validation_samples:
+        raise ValueError(
+            f"validation_samples={validation_samples} must be smaller than dataset size={len(dataset.rows)}"
+        )
+
+    validation = copy.copy(dataset)
+    held_out = dataset.rows[-validation_samples:]
+    dataset.rows = dataset.rows[:-validation_samples]
+    validation.rows = []
+    validation.caption_aug = False
+
+    columns = dataset.caption_variant_columns or ["caption_short", "caption_medium", "caption_long"]
+    for index, source in enumerate(held_out):
+        row = dict(source)
+        preferred = columns[index % len(columns)] if columns else dataset.prompt_col
+        prompt = dataset._valid_text(row.get(preferred))
+        if not prompt:
+            prompt = (
+                dataset._valid_text(row.get(dataset.prompt_col))
+                or dataset._valid_text(row.get(dataset.caption_fallback_column))
+                or dataset._valid_text(row.get("caption"))
+            )
+        row[dataset.prompt_col] = prompt
+        row[dataset.caption_fallback_column] = prompt
+        row["caption"] = prompt
+        validation.rows.append(row)
+    return validation
+
+
 def learning_rate_scale(
     global_step: int,
     *,
@@ -132,6 +192,10 @@ def save_checkpoint(
     args: argparse.Namespace,
     history: list[dict[str, float]],
     ctx,
+    validation: dict[str, float] | None,
+    best_score: float | None,
+    save_latest: bool,
+    save_best: bool,
     archive: bool,
 ) -> None:
     state = full_state_dict(bridge_model, parallel)
@@ -145,6 +209,8 @@ def save_checkpoint(
             "config": cfg,
             "args": vars(args),
             "history": history,
+            "validation": validation,
+            "best_score": best_score,
             "target": "neodragon_hybrid_full_rollout_condition",
             "architecture": {
                 "bridge_contract": "original_neodragon_direct_condition",
@@ -155,10 +221,16 @@ def save_checkpoint(
                 "fp32_master_trainable_parameters": True,
             },
         }
-        atomic_torch_save(
-            payload,
-            output_dir / "neodragon_rollout_bridge_latest.pt",
-        )
+        if save_latest:
+            atomic_torch_save(
+                payload,
+                output_dir / "neodragon_rollout_bridge_latest.pt",
+            )
+        if save_best:
+            atomic_torch_save(
+                payload,
+                output_dir / "neodragon_rollout_bridge_best.pt",
+            )
         if archive:
             atomic_torch_save(
                 payload,
@@ -170,9 +242,105 @@ def save_checkpoint(
         )
         rank0_print(
             ctx,
-            f"Saved rollout bridge step={global_step} latest=true archive={archive}",
+            f"Saved rollout bridge step={global_step} latest={save_latest} "
+            f"best={save_best} archive={archive}",
         )
     barrier()
+
+
+@torch.no_grad()
+def evaluate_validation(
+    *,
+    bridge_model: torch.nn.Module,
+    validation_loader: DataLoader,
+    teacher_text: torch.nn.Module,
+    teacher_context_adapter: torch.nn.Module,
+    prompt_modifier: str,
+    frozen_dit: torch.nn.Module,
+    scheduler,
+    representation_weights: dict[str, float],
+    args: argparse.Namespace,
+    ctx,
+    inference_dtype: torch.dtype,
+) -> dict[str, float]:
+    """Evaluate a fixed held-out split with deterministic full-rollout noise."""
+    bridge_model.eval()
+    generator = torch.Generator(device=ctx.device)
+    generator.manual_seed(args.validation_seed + ctx.rank)
+    totals = torch.zeros(4, device=ctx.device, dtype=torch.float64)
+
+    for batch in validation_loader:
+        prompts = [str(prompt) + prompt_modifier for prompt in batch["prompt"]]
+        with torch.autocast(
+            device_type=ctx.device.type,
+            dtype=inference_dtype,
+            enabled=ctx.device.type == "cuda",
+        ):
+            teacher_tokens, teacher_mask, teacher_pooled = teacher_text(
+                prompts,
+                ctx.device,
+            )
+            teacher_tokens = teacher_context_adapter(teacher_tokens)
+            student_tokens, student_mask, student_pooled = bridge_model(prompts)
+            representation = bridge_representation_losses(
+                student_tokens,
+                teacher_tokens,
+                teacher_mask,
+                student_pooled,
+                teacher_pooled,
+            )
+            representation_loss = weighted_loss_sum(
+                representation,
+                representation_weights,
+            )
+            effect_batch = min(args.functional_batch_size, len(prompts))
+            latents = batch["latents"][:effect_batch].to(
+                device=ctx.device,
+                dtype=inference_dtype,
+                non_blocking=True,
+            )
+            rollout = rollout_distillation_loss(
+                dit=frozen_dit,
+                scheduler=scheduler,
+                anchor_latent=latents[:, :, :1],
+                student_tokens=student_tokens[:effect_batch],
+                student_mask=student_mask[:effect_batch],
+                student_pooled=student_pooled[:effect_batch],
+                teacher_tokens=teacher_tokens[:effect_batch],
+                teacher_mask=teacher_mask[:effect_batch],
+                teacher_pooled=teacher_pooled[:effect_batch],
+                num_generated_units=args.generated_units,
+                num_stages=args.num_stages,
+                generator=generator,
+            )
+            rollout_loss = (
+                args.rollout_mse_weight * rollout.mse
+                + args.rollout_cos_weight * rollout.cosine
+            )
+            total_loss = representation_loss + rollout_loss
+
+        totals += torch.tensor(
+            [
+                float(total_loss),
+                float(representation_loss),
+                float(rollout.mse),
+                1.0,
+            ],
+            device=ctx.device,
+            dtype=torch.float64,
+        )
+
+    if ctx.is_distributed:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    count = totals[3].clamp_min(1.0)
+    metrics = {
+        "loss": float((totals[0] / count).cpu()),
+        "representation_loss": float((totals[1] / count).cpu()),
+        "rollout_mse": float((totals[2] / count).cpu()),
+        "batches": float(totals[3].cpu()),
+    }
+    bridge_model.train()
+    return metrics
 
 
 def parse_args() -> argparse.Namespace:
@@ -219,8 +387,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-grad-norm", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--save-latest-every", type=int, default=5000)
+    parser.add_argument(
+        "--save-latest",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write the rolling latest checkpoint. Disable for archive+best-only runs.",
+    )
     parser.add_argument("--save-archive-every", type=int, default=10000)
     parser.add_argument("--archive-start-step", type=int, default=70000)
+    parser.add_argument("--best-every", type=int, default=0)
+    parser.add_argument("--best-min-delta", type=float, default=0.0)
+    parser.add_argument("--validation-samples", type=int, default=0)
+    parser.add_argument("--validation-seed", type=int, default=2407)
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--parallel", choices=["none", "ddp"], default="ddp")
     return parser.parse_args()
@@ -234,6 +412,10 @@ def main() -> None:
         raise ValueError("This experiment must preserve NeoDragon hybrid's 6x3=18 calls.")
     if args.save_latest_every < 1 or args.save_archive_every < 1:
         raise ValueError("Checkpoint intervals must be positive")
+    if args.best_every < 0 or args.validation_samples < 0:
+        raise ValueError("best_every and validation_samples must be non-negative")
+    if args.best_every > 0 and args.validation_samples < 1:
+        raise ValueError("--best-every requires --validation-samples")
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     ctx = setup_distributed()
@@ -269,8 +451,11 @@ def main() -> None:
 
     latest_path = output_dir / "neodragon_rollout_bridge_latest.pt"
     resume_path: Path | None = None
-    if args.resume == "auto" and latest_path.is_file():
-        resume_path = latest_path
+    if args.resume == "auto":
+        if args.save_latest and latest_path.is_file():
+            resume_path = latest_path
+        else:
+            resume_path = newest_checkpoint(output_dir)
     elif args.resume not in {"", "none", "auto"}:
         resume_path = Path(args.resume)
     checkpoint_path = resume_path or Path(args.init_checkpoint)
@@ -312,6 +497,12 @@ def main() -> None:
         )
         stage_log(ctx, "DistributedDataParallel ready")
     trainable = [parameter for parameter in bridge_model.parameters() if parameter.requires_grad]
+    non_fp32 = [parameter.dtype for parameter in trainable if parameter.dtype != torch.float32]
+    if non_fp32:
+        raise RuntimeError(
+            "Optimizer-owned bridge parameters must use FP32 master weights; "
+            f"found dtypes={sorted({str(dtype) for dtype in non_fp32})}"
+        )
     optimizer = torch.optim.AdamW(
         trainable,
         lr=args.lr,
@@ -341,6 +532,7 @@ def main() -> None:
         caption_variant_weights=caption_weights,
         caption_fallback_column=args.caption_fallback_column,
     )
+    validation_dataset = make_validation_dataset(dataset, args.validation_samples)
     if not dataset.has_latents:
         raise ValueError("Full rollout distillation requires latent_path in the manifest.")
     sampler = (
@@ -371,6 +563,36 @@ def main() -> None:
             use_latents=True,
         ),
     )
+    validation_loader = None
+    if validation_dataset is not None:
+        validation_sampler = (
+            DistributedSampler(
+                validation_dataset,
+                num_replicas=ctx.world_size,
+                rank=ctx.rank,
+                shuffle=False,
+                drop_last=True,
+            )
+            if ctx.is_distributed
+            else None
+        )
+        validation_loader = DataLoader(
+            validation_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            sampler=validation_sampler,
+            num_workers=0,
+            drop_last=True,
+            collate_fn=lambda batch: collate_video_batch(
+                batch,
+                num_frames=cfg.data.frame_num,
+                height=cfg.data.height,
+                width=cfg.data.width,
+                target_fps=24.0,
+                latent_root=Path(args.manifest).expanduser().parent,
+                use_latents=True,
+            ),
+        )
     stage_log(ctx, f"latent data loader ready with {len(dataset)} rows")
     start_epoch, start_batch = divmod(current_step, len(loader))
     batches = cycle_loader(
@@ -417,6 +639,50 @@ def main() -> None:
         f"Data rows={len(dataset)} loader_batches={len(loader)} "
         f"start_epoch={start_epoch} start_batch={start_batch}",
     )
+    rank0_print(
+        ctx,
+        f"Checkpoint policy: latest={args.save_latest} archive_every={args.save_archive_every} "
+        f"best_every={args.best_every} validation_samples={args.validation_samples}",
+    )
+
+    best_score = float(checkpoint.get("best_score", float("inf"))) if resume_path is not None else float("inf")
+    if validation_loader is not None and not math.isfinite(best_score):
+        baseline_validation = evaluate_validation(
+            bridge_model=bridge_model,
+            validation_loader=validation_loader,
+            teacher_text=teacher_text,
+            teacher_context_adapter=teacher_context_adapter,
+            prompt_modifier=prompt_modifier,
+            frozen_dit=frozen_dit,
+            scheduler=scheduler,
+            representation_weights=representation_weights,
+            args=args,
+            ctx=ctx,
+            inference_dtype=inference_dtype,
+        )
+        best_score = baseline_validation["loss"]
+        save_checkpoint(
+            bridge_model=bridge_model,
+            optimizer=optimizer,
+            parallel=args.parallel,
+            output_dir=output_dir,
+            global_step=current_step,
+            initial_step=initial_step,
+            init_checkpoint=str(args.init_checkpoint),
+            cfg=cfg,
+            args=args,
+            history=history,
+            ctx=ctx,
+            validation=baseline_validation,
+            best_score=best_score,
+            save_latest=False,
+            save_best=True,
+            archive=False,
+        )
+        rank0_print(
+            ctx,
+            f"Initial validation step={current_step} score={best_score:.6f}",
+        )
 
     progress = tqdm(
         range(current_step + 1, args.target_step + 1),
@@ -585,15 +851,47 @@ def main() -> None:
                     lr=f"{item['lr']:.2e}",
                 )
 
-        save_latest = (
-            global_step % args.save_latest_every == 0
+        validation = None
+        save_best = False
+        if validation_loader is not None and (
+            global_step % args.best_every == 0
             or global_step == args.target_step
+        ):
+            validation = evaluate_validation(
+                bridge_model=bridge_model,
+                validation_loader=validation_loader,
+                teacher_text=teacher_text,
+                teacher_context_adapter=teacher_context_adapter,
+                prompt_modifier=prompt_modifier,
+                frozen_dit=frozen_dit,
+                scheduler=scheduler,
+                representation_weights=representation_weights,
+                args=args,
+                ctx=ctx,
+                inference_dtype=inference_dtype,
+            )
+            candidate_score = validation["loss"]
+            save_best = candidate_score < best_score - args.best_min_delta
+            if save_best:
+                best_score = candidate_score
+            rank0_print(
+                ctx,
+                f"Validation step={global_step} score={candidate_score:.6f} "
+                f"best={best_score:.6f} improved={save_best}",
+            )
+
+        save_latest = bool(
+            args.save_latest
+            and (
+                global_step % args.save_latest_every == 0
+                or global_step == args.target_step
+            )
         )
         save_archive = bool(
             global_step >= args.archive_start_step
             and global_step % args.save_archive_every == 0
         )
-        if save_latest:
+        if save_latest or save_best or save_archive:
             save_checkpoint(
                 bridge_model=bridge_model,
                 optimizer=optimizer,
@@ -606,6 +904,10 @@ def main() -> None:
                 args=args,
                 history=history,
                 ctx=ctx,
+                validation=validation,
+                best_score=best_score,
+                save_latest=save_latest,
+                save_best=save_best,
                 archive=save_archive,
             )
 
