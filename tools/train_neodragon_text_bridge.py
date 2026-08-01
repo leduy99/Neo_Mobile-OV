@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import sys
@@ -10,6 +11,7 @@ from pathlib import Path
 
 import pandas as pd
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
@@ -112,6 +114,22 @@ class PromptDataset(Dataset):
         return str(random.choices(variants, weights=weights, k=1)[0][0])
 
 
+def reserve_validation_prompts(dataset: PromptDataset, size: int) -> list[str]:
+    """Remove a deterministic, caption-balanced holdout from the training set."""
+    if size <= 0:
+        return []
+    if len(dataset.items) <= size:
+        raise ValueError(f"validation_size={size} must be smaller than dataset size={len(dataset.items)}")
+    held_out = dataset.items[-size:]
+    dataset.items = dataset.items[:-size]
+    prompts: list[str] = []
+    for index, item in enumerate(held_out):
+        variants = item["variants"]
+        assert isinstance(variants, list) and variants
+        prompts.append(str(variants[index % len(variants)][0]))
+    return prompts
+
+
 def clean_text(value: object) -> str:
     if value is None:
         return ""
@@ -150,6 +168,51 @@ def dtype_from_name(name: str) -> torch.dtype:
     if name in {"fp16", "float16"}:
         return torch.float16
     return torch.float32
+
+
+def promote_trainable_parameters_to_fp32(module: torch.nn.Module) -> None:
+    for parameter in module.parameters():
+        if parameter.requires_grad:
+            parameter.data = parameter.data.float()
+
+
+def learning_rate_scale(
+    global_step: int,
+    *,
+    initial_step: int,
+    target_step: int,
+    warmup_steps: int,
+    final_scale: float,
+) -> float:
+    progress_step = global_step - initial_step
+    total = max(target_step - initial_step, 1)
+    if warmup_steps > 0 and progress_step <= warmup_steps:
+        return 0.2 + 0.8 * progress_step / float(warmup_steps)
+    denominator = max(total - warmup_steps, 1)
+    progress = min(max((progress_step - warmup_steps) / denominator, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return float(final_scale) + (1.0 - float(final_scale)) * cosine
+
+
+def newest_text_checkpoint(output_dir: Path) -> Path | None:
+    best: tuple[int, Path] | None = None
+    for path in output_dir.glob("neodragon_text_bridge_step*.pt"):
+        try:
+            step = int(path.stem.rsplit("step", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if best is None or step > best[0]:
+            best = (step, path)
+    best_path = output_dir / "neodragon_text_bridge_best.pt"
+    if best_path.is_file():
+        try:
+            payload = torch.load(best_path, map_location="cpu", weights_only=False)
+            step = int(payload.get("step", -1))
+            if best is None or step > best[0]:
+                best = (step, best_path)
+        except Exception:
+            pass
+    return None if best is None else best[1]
 
 
 def load_neodragon_text_modules(cfg, device: torch.device, dtype: torch.dtype):
@@ -220,7 +283,15 @@ def load_neodragon_functional_modules(cfg, device: torch.device, dtype: torch.dt
     return dit, PyramidFlowMatchEulerDiscreteScheduler()
 
 
-def sample_functional_input(cfg, scheduler, batch_size: int, device: torch.device, dtype: torch.dtype):
+def sample_functional_input(
+    cfg,
+    scheduler,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    generator: torch.Generator | None = None,
+):
     from neodragon.utils.generation_utils import _get_pyramid_latent, _prepare_past_condition_latents
 
     latent_t = ((int(cfg.data.frame_num) - 1) // 8) + 1
@@ -234,9 +305,12 @@ def sample_functional_input(cfg, scheduler, batch_size: int, device: torch.devic
         latent_w,
         device=device,
         dtype=dtype,
+        generator=generator,
     )
-    unit_index = int(torch.randint(1, latent_t, (1,), device=device).item())
-    stage = int(torch.randint(0, scheduler.config.stages, (1,), device=device).item())
+    unit_index = int(torch.randint(1, latent_t, (1,), device=device, generator=generator).item())
+    stage = int(
+        torch.randint(0, scheduler.config.stages, (1,), device=device, generator=generator).item()
+    )
     past_units = [latents[:, :, i : i + 1] for i in range(unit_index)]
     past_conditions = _prepare_past_condition_latents(
         past_units,
@@ -244,8 +318,14 @@ def sample_functional_input(cfg, scheduler, batch_size: int, device: torch.devic
         do_classifier_free_guidance=False,
     )
     clean = _get_pyramid_latent(latents[:, :, unit_index : unit_index + 1], scheduler.config.stages)[stage]
-    noise = torch.randn_like(clean)
-    t_idx = torch.randint(0, scheduler.config.num_train_timesteps, (batch_size,), device=device)
+    noise = torch.randn(clean.shape, device=device, dtype=dtype, generator=generator)
+    t_idx = torch.randint(
+        0,
+        scheduler.config.num_train_timesteps,
+        (batch_size,),
+        device=device,
+        generator=generator,
+    )
     sigmas = scheduler.sigmas_per_stage[stage].to(device=device, dtype=dtype)[t_idx]
     timestep = scheduler.timesteps_per_stage[stage].to(device=device, dtype=dtype)[t_idx]
     while sigmas.dim() < clean.dim():
@@ -283,12 +363,193 @@ def wrap_bridge(
     raise ValueError(f"Unknown --parallel={parallel}")
 
 
+def atomic_torch_save(payload: dict, destination: Path) -> None:
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    torch.save(payload, temporary)
+    temporary.replace(destination)
+
+
+def save_text_checkpoint(
+    *,
+    bridge_model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    parallel: str,
+    out_dir: Path,
+    step: int,
+    initial_step: int,
+    init_checkpoint: str,
+    init_checkpoint_step: int,
+    cfg,
+    args: argparse.Namespace,
+    history: list[dict[str, float]],
+    ctx,
+    validation: dict[str, float] | None,
+    best_score: float | None,
+    save_latest: bool,
+    save_best: bool,
+    save_archive: bool,
+) -> None:
+    state = full_state_dict(bridge_model, parallel)
+    if ctx.is_main:
+        payload = {
+            "step": int(step),
+            "initial_step": int(initial_step),
+            "init_checkpoint": init_checkpoint or None,
+            "init_checkpoint_step": int(init_checkpoint_step),
+            "bridge": state,
+            "optimizer": optimizer.state_dict() if args.save_optimizer else None,
+            "config": cfg,
+            "args": vars(args),
+            "history": history,
+            "validation": validation,
+            "best_score": best_score,
+            "target": "neodragon_dit_condition_direct",
+            "architecture": {
+                "bridge_contract": "original_neodragon_direct_condition",
+                "functional_distillation": True,
+                "functional_calls_per_step": 1,
+                "fp32_master_trainable_parameters": bool(args.trainable_fp32),
+            },
+            "parallel": {
+                "backend": args.parallel,
+                "world_size": ctx.world_size,
+            },
+            "shapes": {
+                "prompt_embeds": [None, 128, 1536],
+                "prompt_mask": [None, 128],
+                "pooled_prompt_embeds": [None, 2048],
+            },
+        }
+        if save_latest:
+            atomic_torch_save(payload, out_dir / "neodragon_text_bridge_latest.pt")
+        if save_best:
+            atomic_torch_save(payload, out_dir / "neodragon_text_bridge_best.pt")
+        if save_archive:
+            atomic_torch_save(payload, out_dir / f"neodragon_text_bridge_step{step:06d}.pt")
+        (out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+        rank0_print(
+            ctx,
+            f"Saved text bridge step={step} latest={save_latest} best={save_best} archive={save_archive}",
+        )
+    barrier()
+
+
+@torch.no_grad()
+def evaluate_text_bridge_validation(
+    *,
+    bridge_model: torch.nn.Module,
+    prompts: list[str],
+    batch_size: int,
+    teacher: torch.nn.Module,
+    context_adapter: torch.nn.Module,
+    prompt_modifier: str,
+    functional_dit: torch.nn.Module,
+    functional_scheduler,
+    cfg,
+    args: argparse.Namespace,
+    ctx,
+    frozen_dtype: torch.dtype,
+) -> dict[str, float]:
+    bridge_model.eval()
+    local_prompts = prompts[ctx.rank :: ctx.world_size]
+    generator = torch.Generator(device=ctx.device)
+    generator.manual_seed(args.validation_seed + ctx.rank)
+    totals = torch.zeros(4, device=ctx.device, dtype=torch.float64)
+
+    for start in range(0, len(local_prompts), batch_size):
+        raw_batch = local_prompts[start : start + batch_size]
+        batch = [p + prompt_modifier for p in raw_batch] if args.append_prompt_modifier else raw_batch
+        with torch.autocast(
+            device_type=ctx.device.type,
+            dtype=frozen_dtype,
+            enabled=ctx.device.type == "cuda",
+        ):
+            target_tokens, target_mask, target_pooled = teacher(batch, ctx.device)
+            target_tokens = context_adapter(target_tokens)
+            pred_tokens, pred_mask, pred_pooled = bridge_model(batch)
+            raw_token_loss = masked_token_mse(pred_tokens, target_tokens, target_mask)
+            normalized_token_loss = masked_token_mse(
+                pred_tokens,
+                target_tokens,
+                target_mask,
+                normalize_tokens=True,
+            )
+            pooled_loss = F.mse_loss(pred_pooled.float(), target_pooled.float())
+            cos_loss = masked_token_cosine(pred_tokens, target_tokens, target_mask)
+            norm_loss = token_norm_alignment(pred_tokens, target_tokens, target_mask)
+            pooled_cos_loss = pooled_cosine(pred_pooled, target_pooled)
+            relational_loss = relational_cosine(pred_tokens, target_tokens, target_mask)
+
+            effect_bs = min(args.functional_batch_size, len(batch))
+            stage_input, timestep, _, _ = sample_functional_input(
+                cfg,
+                functional_scheduler,
+                effect_bs,
+                ctx.device,
+                frozen_dtype,
+                generator=generator,
+            )
+            teacher_prediction = functional_dit(
+                sample=[stage_input],
+                encoder_hidden_states=target_tokens[:effect_bs].to(dtype=frozen_dtype),
+                encoder_attention_mask=target_mask[:effect_bs],
+                pooled_projections=target_pooled[:effect_bs].to(dtype=frozen_dtype),
+                timestep_ratio=timestep,
+            )[0]
+            student_prediction = functional_dit(
+                sample=[stage_input],
+                encoder_hidden_states=pred_tokens[:effect_bs],
+                encoder_attention_mask=pred_mask[:effect_bs],
+                pooled_projections=pred_pooled[:effect_bs],
+                timestep_ratio=timestep,
+            )[0]
+            functional_loss = F.mse_loss(student_prediction.float(), teacher_prediction.float())
+            functional_cos_loss = flat_cosine_distance(student_prediction, teacher_prediction)
+            representation_loss = (
+                args.raw_token_weight * raw_token_loss
+                + args.normalized_token_weight * normalized_token_loss
+                + args.cos_weight * cos_loss
+                + args.token_norm_weight * norm_loss
+                + args.pooled_weight * pooled_loss
+                + args.pooled_cos_weight * pooled_cos_loss
+                + args.relational_weight * relational_loss
+            )
+            total_loss = representation_loss + (
+                args.functional_weight * functional_loss
+                + args.functional_cos_weight * functional_cos_loss
+            )
+
+        totals += torch.tensor(
+            [float(total_loss), float(representation_loss), float(functional_loss), 1.0],
+            device=ctx.device,
+            dtype=torch.float64,
+        )
+
+    if ctx.is_distributed:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    count = totals[3].clamp_min(1.0)
+    metrics = {
+        "loss": float((totals[0] / count).cpu()),
+        "representation_loss": float((totals[1] / count).cpu()),
+        "functional_loss": float((totals[2] / count).cpu()),
+        "batches": float(totals[3].cpu()),
+    }
+    bridge_model.train()
+    return metrics
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/mobile_ov_neodragon.yaml")
     parser.add_argument("--prompts", required=True, help="Text file or CSV/TSV with prompt/caption/text column.")
     parser.add_argument("--output-dir", default="output/neodragon_text_bridge_train")
     parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument(
+        "--target-step",
+        type=int,
+        default=-1,
+        help="Optional final global step. Overrides --steps after loading init/resume state.",
+    )
     parser.add_argument(
         "--init-checkpoint",
         default="",
@@ -302,6 +563,8 @@ def main() -> None:
     )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr-warmup-steps", type=int, default=0)
+    parser.add_argument("--lr-final-scale", type=float, default=1.0)
     parser.add_argument("--max-prompts", type=int, default=-1)
     parser.add_argument(
         "--caption-aug",
@@ -337,6 +600,28 @@ def main() -> None:
     parser.add_argument("--functional-batch-size", type=int, default=1)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=500)
+    parser.add_argument("--resume", default="none")
+    parser.add_argument(
+        "--save-latest",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--archive-every", type=int, default=0)
+    parser.add_argument("--archive-start-step", type=int, default=0)
+    parser.add_argument("--best-every", type=int, default=0)
+    parser.add_argument("--best-min-delta", type=float, default=0.0)
+    parser.add_argument("--validation-size", type=int, default=0)
+    parser.add_argument("--validation-seed", type=int, default=2407)
+    parser.add_argument(
+        "--trainable-fp32",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--save-optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--dtype", default=None)
     parser.add_argument("--append-prompt-modifier", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--parallel", choices=["none", "ddp", "fsdp", "deepspeed"], default="none")
@@ -371,6 +656,16 @@ def main() -> None:
         raise ValueError("--functional-every and --functional-batch-size must be >= 1.")
     if args.steps < 1 or args.log_every < 1 or args.save_every < 1:
         raise ValueError("--steps, --log-every, and --save-every must be >= 1.")
+    if args.target_step == 0 or args.target_step < -1:
+        raise ValueError("--target-step must be -1 or a positive integer.")
+    if args.archive_every < 0 or args.best_every < 0 or args.validation_size < 0:
+        raise ValueError("archive, best, and validation intervals must be non-negative.")
+    if args.best_every > 0 and args.validation_size < 1:
+        raise ValueError("--best-every requires --validation-size.")
+    if args.validation_size > 0 and args.best_every < 1:
+        raise ValueError("--validation-size requires --best-every.")
+    if not 0.0 < args.lr_final_scale <= 1.0:
+        raise ValueError("--lr-final-scale must be in (0, 1].")
     if args.step_offset < -1:
         raise ValueError("--step-offset must be -1 or a non-negative integer.")
     if args.step_offset == -1 and not args.init_checkpoint:
@@ -395,6 +690,15 @@ def main() -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
     barrier()
 
+    resume_path: Path | None = None
+    if args.resume == "auto":
+        resume_path = newest_text_checkpoint(out_dir)
+    elif args.resume not in {"", "none", "auto"}:
+        resume_path = Path(args.resume)
+    checkpoint_path = resume_path or (Path(args.init_checkpoint) if args.init_checkpoint else None)
+    if checkpoint_path is not None and not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Bridge checkpoint does not exist: {checkpoint_path}")
+
     caption_columns = split_csv_list(args.caption_variant_columns)
     caption_weights = parse_float_list(args.caption_variant_weights)
     if caption_weights is not None and len(caption_weights) != len(caption_columns):
@@ -410,6 +714,11 @@ def main() -> None:
         caption_variant_weights=caption_weights,
         caption_fallback_column=args.caption_fallback_column,
     )
+    validation_prompts = reserve_validation_prompts(dataset, args.validation_size)
+    if validation_prompts and len(validation_prompts) % ctx.world_size != 0:
+        raise ValueError(
+            f"validation_size={len(validation_prompts)} must be divisible by world_size={ctx.world_size}"
+        )
     sampler = DistributedSampler(dataset, num_replicas=ctx.world_size, rank=ctx.rank, shuffle=True) if ctx.is_distributed else None
     loader = DataLoader(
         dataset,
@@ -443,15 +752,17 @@ def main() -> None:
             f"every={args.functional_every} batch={args.functional_batch_size}",
         )
     bridge = MobileOVNeodragonTextBridge(cfg.bridge, device=ctx.device, dtype=frozen_dtype).train()
+    if args.trainable_fp32:
+        promote_trainable_parameters_to_fp32(bridge)
     init_checkpoint_step = 0
-    if args.init_checkpoint:
-        init_path = Path(args.init_checkpoint)
-        if not init_path.is_file():
-            raise FileNotFoundError(f"Bridge init checkpoint does not exist: {init_path}")
-        checkpoint = torch.load(init_path, map_location="cpu", weights_only=False)
+    checkpoint: dict = {}
+    if checkpoint_path is not None:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         bridge_state = checkpoint.get("bridge", checkpoint.get("student_state", checkpoint))
         if not isinstance(bridge_state, dict):
-            raise TypeError(f"Bridge state in {init_path} must be a mapping, got {type(bridge_state).__name__}")
+            raise TypeError(
+                f"Bridge state in {checkpoint_path} must be a mapping, got {type(bridge_state).__name__}"
+            )
         bridge.load_state_dict(bridge_state, strict=True)
         init_checkpoint_step = int(checkpoint.get("step", 0))
         if args.step_offset == -1:
@@ -459,9 +770,25 @@ def main() -> None:
         rank0_print(
             ctx,
             "Warm-started bridge: "
-            f"checkpoint={init_path} checkpoint_step={init_checkpoint_step} "
+            f"checkpoint={checkpoint_path} checkpoint_step={init_checkpoint_step} "
             f"global_step_offset={args.step_offset}",
         )
+    training_initial_step = (
+        int(checkpoint.get("initial_step", init_checkpoint_step))
+        if resume_path is not None
+        else init_checkpoint_step
+    )
+    if args.target_step > 0:
+        if args.target_step <= args.step_offset:
+            rank0_print(
+                ctx,
+                f"Nothing to train: checkpoint_step={args.step_offset} target_step={args.target_step}",
+            )
+            cleanup_distributed()
+            return
+        args.steps = args.target_step - args.step_offset
+    else:
+        args.target_step = args.step_offset + args.steps
     start_epoch, start_batch = divmod(args.step_offset, len(loader))
     batches = cycle_loader(
         loader,
@@ -477,6 +804,14 @@ def main() -> None:
 
     deepspeed_engine = None
     opt = None
+    trainable = [p for p in bridge_model.parameters() if p.requires_grad]
+    if args.trainable_fp32:
+        non_fp32 = [p.dtype for p in trainable if p.dtype != torch.float32]
+        if non_fp32:
+            raise RuntimeError(
+                "Optimizer-owned bridge parameters must use FP32 master weights; "
+                f"found dtypes={sorted({str(dtype) for dtype in non_fp32})}"
+            )
     if args.parallel == "deepspeed":
         import deepspeed
 
@@ -489,7 +824,6 @@ def main() -> None:
         )
         if ctx.is_main:
             write_deepspeed_config(ds_config, out_dir)
-        trainable = [p for p in bridge_model.parameters() if p.requires_grad]
         opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.0)
         deepspeed_engine, opt, _, _ = deepspeed.initialize(
             model=bridge_model,
@@ -500,13 +834,82 @@ def main() -> None:
         )
         bridge_model = deepspeed_engine
     else:
-        opt = torch.optim.AdamW((p for p in bridge_model.parameters() if p.requires_grad), lr=args.lr, weight_decay=0.0)
+        opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.0)
 
-    history: list[dict[str, float]] = []
+    if resume_path is not None and args.save_optimizer and checkpoint.get("optimizer") is not None:
+        assert opt is not None
+        opt.load_state_dict(checkpoint["optimizer"])
+
+    history: list[dict[str, float]] = list(checkpoint.get("history", [])) if resume_path is not None else []
+    best_score = (
+        float(checkpoint.get("best_score", float("inf")))
+        if resume_path is not None
+        else float("inf")
+    )
+    if validation_prompts:
+        if functional_dit is None or functional_scheduler is None:
+            raise ValueError("Validation model selection requires functional distillation to be enabled.")
+        if not math.isfinite(best_score):
+            baseline_validation = evaluate_text_bridge_validation(
+                bridge_model=bridge_model,
+                prompts=validation_prompts,
+                batch_size=args.batch_size,
+                teacher=teacher,
+                context_adapter=context_adapter,
+                prompt_modifier=prompt_modifier,
+                functional_dit=functional_dit,
+                functional_scheduler=functional_scheduler,
+                cfg=cfg,
+                args=args,
+                ctx=ctx,
+                frozen_dtype=frozen_dtype,
+            )
+            best_score = baseline_validation["loss"]
+            assert opt is not None
+            save_text_checkpoint(
+                bridge_model=bridge_model,
+                optimizer=opt,
+                parallel=args.parallel,
+                out_dir=out_dir,
+                step=args.step_offset,
+                initial_step=training_initial_step,
+                init_checkpoint=str(checkpoint_path or ""),
+                init_checkpoint_step=init_checkpoint_step,
+                cfg=cfg,
+                args=args,
+                history=history,
+                ctx=ctx,
+                validation=baseline_validation,
+                best_score=best_score,
+                save_latest=False,
+                save_best=True,
+                save_archive=False,
+            )
+            rank0_print(
+                ctx,
+                f"Initial validation step={args.step_offset} score={best_score:.6f}",
+            )
+
+    rank0_print(
+        ctx,
+        f"Exp1 distillation: current_step={args.step_offset} target_step={args.target_step} "
+        f"trainable_params={sum(p.numel() for p in trainable):,} "
+        f"master_dtype={next(iter(trainable)).dtype} full_rollout=False",
+    )
     iterator = range(1, args.steps + 1)
     pbar = tqdm(iterator, desc="Train Mobile-OV Neodragon text bridge", disable=not ctx.is_main)
     for additional_step in pbar:
         step = args.step_offset + additional_step
+        lr_scale = learning_rate_scale(
+            step,
+            initial_step=training_initial_step,
+            target_step=args.target_step,
+            warmup_steps=args.lr_warmup_steps,
+            final_scale=args.lr_final_scale,
+        )
+        assert opt is not None
+        for group in opt.param_groups:
+            group["lr"] = args.lr * lr_scale
         prompts_raw = [str(x) for x in next(batches)]
         prompts = [p + prompt_modifier for p in prompts_raw] if args.append_prompt_modifier else prompts_raw
 
@@ -514,7 +917,14 @@ def main() -> None:
             target_tokens, target_mask, target_pooled = teacher(prompts, ctx.device)
             target_tokens = context_adapter(target_tokens)
 
-        pred_tokens, pred_mask, pred_pooled = bridge_model(prompts)
+        # Keep optimizer-owned bridge weights in FP32 while preserving the
+        # released BF16 condition contract expected by NeoDragon.
+        with torch.autocast(
+            device_type=ctx.device.type,
+            dtype=frozen_dtype,
+            enabled=ctx.device.type == "cuda",
+        ):
+            pred_tokens, pred_mask, pred_pooled = bridge_model(prompts)
         target_tokens = target_tokens.float()
         target_pooled = target_pooled.float()
         target_mask = target_mask.to(device=ctx.device)
@@ -633,6 +1043,7 @@ def main() -> None:
                 "target_norm": scalar_mean(target_norm.detach(), ctx),
                 "target_mask_tokens": scalar_mean(mask_tok.detach(), ctx),
                 "world_size": float(ctx.world_size),
+                "lr": float(args.lr * lr_scale),
             }
             if ctx.is_main:
                 history.append(item)
@@ -645,42 +1056,71 @@ def main() -> None:
                     norm=f"{item['pred_norm']:.1f}/{item['target_norm']:.1f}",
                 )
 
-        if additional_step % args.save_every == 0 or additional_step == args.steps:
-            state = full_state_dict(bridge_model, args.parallel)
-            if ctx.is_main:
-                payload = {
-                    "step": step,
-                    "additional_step": additional_step,
-                    "step_offset": args.step_offset,
-                    "init_checkpoint": args.init_checkpoint or None,
-                    "init_checkpoint_step": init_checkpoint_step,
-                    "bridge": state,
-                    "config": cfg,
-                    "args": vars(args),
-                    "history": history,
-                    "target": "neodragon_dit_condition_direct",
-                    "architecture": {
-                        "bridge_contract": "original_neodragon_direct_condition",
-                        "functional_distillation": functional_enabled,
-                    },
-                    "parallel": {
-                        "backend": args.parallel,
-                        "world_size": ctx.world_size,
-                        "deepspeed_zero_stage": args.deepspeed_zero_stage if args.parallel == "deepspeed" else None,
-                    },
-                    "shapes": {
-                        "prompt_embeds": [None, 128, 1536],
-                        "prompt_mask": [None, 128],
-                        "pooled_prompt_embeds": [None, 2048],
-                    },
-                }
-                torch.save(payload, out_dir / "neodragon_text_bridge_latest.pt")
-                if args.keep_step_checkpoints:
-                    torch.save(payload, out_dir / f"neodragon_text_bridge_step{step:06d}.pt")
-                (out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-            barrier()
+        validation = None
+        save_best = False
+        if validation_prompts and (
+            step % args.best_every == 0
+            or step == args.target_step
+        ):
+            assert functional_dit is not None and functional_scheduler is not None
+            validation = evaluate_text_bridge_validation(
+                bridge_model=bridge_model,
+                prompts=validation_prompts,
+                batch_size=args.batch_size,
+                teacher=teacher,
+                context_adapter=context_adapter,
+                prompt_modifier=prompt_modifier,
+                functional_dit=functional_dit,
+                functional_scheduler=functional_scheduler,
+                cfg=cfg,
+                args=args,
+                ctx=ctx,
+                frozen_dtype=frozen_dtype,
+            )
+            candidate_score = validation["loss"]
+            save_best = candidate_score < best_score - args.best_min_delta
+            if save_best:
+                best_score = candidate_score
+            rank0_print(
+                ctx,
+                f"Validation step={step} score={candidate_score:.6f} "
+                f"best={best_score:.6f} improved={save_best}",
+            )
 
-    rank0_print(ctx, f"Saved bridge to {out_dir / 'neodragon_text_bridge_latest.pt'}")
+        save_latest = bool(
+            args.save_latest
+            and (additional_step % args.save_every == 0 or step == args.target_step)
+        )
+        save_archive = bool(
+            args.archive_every > 0
+            and step >= args.archive_start_step
+            and step % args.archive_every == 0
+        )
+        if args.keep_step_checkpoints and args.archive_every == 0:
+            save_archive = additional_step % args.save_every == 0 or step == args.target_step
+        if save_latest or save_best or save_archive:
+            assert opt is not None
+            save_text_checkpoint(
+                bridge_model=bridge_model,
+                optimizer=opt,
+                parallel=args.parallel,
+                out_dir=out_dir,
+                step=step,
+                initial_step=training_initial_step,
+                init_checkpoint=str(checkpoint_path or ""),
+                init_checkpoint_step=init_checkpoint_step,
+                cfg=cfg,
+                args=args,
+                history=history,
+                ctx=ctx,
+                validation=validation,
+                best_score=best_score,
+                save_latest=save_latest,
+                save_best=save_best,
+                save_archive=save_archive,
+            )
+
+    rank0_print(ctx, f"Completed bridge training at global step {args.target_step} in {out_dir}")
     cleanup_distributed()
 
 

@@ -23,7 +23,7 @@ export TRITON_CACHE_DIR=/proj/cvl/users/x_fahkh2/caches
 CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-${CONDA_ENV}/bin/torchrun}"
 CONFIG="${CONFIG:-configs/mobile_ov_neodragon.yaml}"
-MANIFEST="${MANIFEST:-data/openvid_neodragon_2s_latents/latent_manifest.csv}"
+PROMPTS="${PROMPTS:-download_data/data/openvid/manifests/openvid_all_recaptions_merged.csv}"
 REMOTE_EXP1="output/neo_exp1_bridge_functional/17108893/neodragon_text_bridge_latest.pt"
 LOCAL_EXP1="checkpoints/hf_mobile_ov/neo_exp1_bridge_functional/17108893/neodragon_text_bridge_latest.pt"
 
@@ -35,9 +35,7 @@ if [[ -z "${INIT_CHECKPOINT:-}" ]]; then
   fi
 fi
 
-# Stable output path lets a resubmitted job resume from the newest best/archive
-# checkpoint without a rolling latest file.
-OUT="${OUT:-output/neo_exp1_rollout_64k_to200k_v2}"
+OUT="${OUT:-output/neo_exp1_distill_64k_to200k_v2}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 
 mkdir -p logs "${OUT}"
@@ -50,42 +48,43 @@ export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export TORCH_DIST_TIMEOUT_MINUTES="${TORCH_DIST_TIMEOUT_MINUTES:-60}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-for required in "${MANIFEST}" "${INIT_CHECKPOINT}" "${TORCHRUN_BIN}"; do
+for required in "${PROMPTS}" "${INIT_CHECKPOINT}" "${TORCHRUN_BIN}"; do
   if [[ ! -e "${required}" ]]; then
     echo "Missing required path: ${required}" >&2
     exit 1
   fi
 done
 
-echo "Exp1-200K-v2: FP32 bridge masters + frozen Hybrid DiT + full 18-call rollout"
-echo "CONFIG=${CONFIG}"
-echo "MANIFEST=${MANIFEST}"
+echo "Exp1-200K-v2: original Exp1 distillation, no full rollout"
+echo "PROMPTS=${PROMPTS}"
 echo "INIT_CHECKPOINT=${INIT_CHECKPOINT}"
 echo "OUT=${OUT} RESUME=${RESUME:-auto}"
 echo "TARGET_STEP=${TARGET_STEP:-200000} LR=${LR:-1e-5}"
-echo "archive=10K best-validation=2K latest=disabled"
+echo "archive=10K best-validation=2K latest=disabled FP32-master=true"
 nvidia-smi || true
 
 "${TORCHRUN_BIN}" \
   --standalone \
   --nnodes=1 \
   --nproc_per_node="${NPROC_PER_NODE}" \
-  tools/train_neodragon_bridge_rollout_distill.py \
+  tools/train_neodragon_text_bridge.py \
   --config "${CONFIG}" \
-  --manifest "${MANIFEST}" \
+  --prompts "${PROMPTS}" \
+  --output-dir "${OUT}" \
   --init-checkpoint "${INIT_CHECKPOINT}" \
   --resume "${RESUME:-auto}" \
-  --output-dir "${OUT}" \
   --target-step "${TARGET_STEP:-200000}" \
+  --steps 1 \
   --batch-size "${BATCH_SIZE:-4}" \
-  --functional-batch-size "${FUNCTIONAL_BATCH_SIZE:-1}" \
   --parallel ddp \
+  --trainable-fp32 \
+  --save-optimizer \
   --lr "${LR:-1e-5}" \
   --lr-warmup-steps "${LR_WARMUP_STEPS:-500}" \
   --lr-final-scale "${LR_FINAL_SCALE:-0.1}" \
-  --rollout-ramp-steps "${ROLLOUT_RAMP_STEPS:-2000}" \
-  --rollout-mse-weight "${ROLLOUT_MSE_WEIGHT:-1.0}" \
-  --rollout-cos-weight "${ROLLOUT_COS_WEIGHT:-0.1}" \
+  --caption-variant-columns caption_short,caption_medium,caption_long \
+  --caption-variant-weights 1,1,1 \
+  --caption-fallback-column caption \
   --raw-token-weight 0.25 \
   --normalized-token-weight 1.0 \
   --cos-weight 0.5 \
@@ -93,15 +92,19 @@ nvidia-smi || true
   --pooled-weight 0.25 \
   --pooled-cos-weight 0.2 \
   --relational-weight 0.1 \
-  --caption-variant-columns caption_short,caption_medium,caption_long \
-  --caption-variant-weights 1,1,1 \
-  --caption-fallback-column caption \
+  --functional-weight 1.0 \
+  --functional-cos-weight 0.1 \
+  --functional-start-step 1 \
+  --functional-ramp-steps 2000 \
+  --functional-every 1 \
+  --functional-batch-size "${FUNCTIONAL_BATCH_SIZE:-1}" \
   --best-every "${BEST_EVERY:-2000}" \
-  --validation-samples "${VALIDATION_SAMPLES:-96}" \
+  --validation-size "${VALIDATION_SIZE:-96}" \
   --validation-seed "${VALIDATION_SEED:-2407}" \
-  --save-archive-every "${SAVE_ARCHIVE_EVERY:-10000}" \
+  --archive-every "${ARCHIVE_EVERY:-10000}" \
   --archive-start-step "${ARCHIVE_START_STEP:-70000}" \
   --no-save-latest \
+  --save-every 5000 \
   --log-every "${LOG_EVERY:-20}" \
   ${EXTRA_ARGS:-}
 
