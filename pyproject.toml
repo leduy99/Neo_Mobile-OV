@@ -9,7 +9,7 @@ description = "New Mobile-OV research branch with current Mobile-OV and Mobile-O
 requires-python = ">=3.10"
 dependencies = [
   "accelerate",
-  "diffusers>=0.32.2,<0.35",
+  "diffusers==0.39.0",
   "einops",
   "hf-xet",
   "opencv-python",
@@ -22,7 +22,8 @@ dependencies = [
   "torch",
   "torchvision",
   "tqdm",
-  "transformers>=4.46.0",
+  "qwen-vl-utils==0.0.14",
+  "transformers==4.57.3",
 ]
 
 [tool.setuptools.packages.find]

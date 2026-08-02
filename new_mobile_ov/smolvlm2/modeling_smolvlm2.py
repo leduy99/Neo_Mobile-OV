@@ -29,6 +29,16 @@ def _ensure_transformers_gelutanh_compat() -> None:
                     return F.gelu(x, approximate="tanh")
 
             hf_acts.GELUTanh = GELUTanh
+        if not hasattr(hf_acts, "PytorchGELUTanh"):
+            # Transformers 4.57 renamed this class, while existing converted
+            # Mobile-OV checkpoints still reference the old pickle symbol.
+            # Do not alias GELUTanh directly: old pickles bypass __init__, so
+            # the new class' `act` member would not exist after unpickling.
+            class PytorchGELUTanh(nn.Module):
+                def forward(self, x: torch.Tensor) -> torch.Tensor:
+                    return F.gelu(x, approximate="tanh")
+
+            hf_acts.PytorchGELUTanh = PytorchGELUTanh
         if not hasattr(hf_acts, "SiLUActivation"):
             class SiLUActivation(nn.Module):
                 def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -306,8 +316,36 @@ class SmolVLMModel(nn.Module):
         # Use no_grad() instead of inference_mode() to allow gradients to flow
         # when model is frozen but projection layer needs gradients
         # inference_mode() would block ALL gradients, even for downstream layers
-        with torch.no_grad() if not self.training else torch.enable_grad():
-            outputs = self._model(**model_inputs)
+        # Bridge callers need hidden states, not vocabulary logits. Newer
+        # transformers releases may drop hidden states from the causal-LM
+        # wrapper output even when requested, while the multimodal base model
+        # keeps the stable hidden-state contract. Calling it directly is also
+        # cheaper because it skips the frozen LM head.
+        forward_model = self._model
+        base_model = getattr(self._model, "model", None)
+        if output_hidden_states and isinstance(base_model, nn.Module):
+            forward_model = base_model
+        captured_input = []
+        captured_layers = []
+        hooks = []
+        text_model = getattr(forward_model, "text_model", None)
+        decoder_layers = getattr(text_model, "layers", None)
+        if output_hidden_states and decoder_layers:
+            def capture_input(_module, args):
+                if not captured_input and args:
+                    captured_input.append(args[0])
+
+            def capture_output(_module, _args, output):
+                captured_layers.append(output[0] if isinstance(output, (tuple, list)) else output)
+
+            hooks.append(decoder_layers[0].register_forward_pre_hook(capture_input))
+            hooks.extend(layer.register_forward_hook(capture_output) for layer in decoder_layers)
+        try:
+            with torch.no_grad() if not self.training else torch.enable_grad():
+                outputs = forward_model(**model_inputs)
+        finally:
+            for hook in hooks:
+                hook.remove()
         
         # Extract hidden states
         if hasattr(outputs, "last_hidden_state"):
@@ -319,14 +357,24 @@ class SmolVLMModel(nn.Module):
         else:
             raise ValueError(f"Unexpected output format: {type(outputs)}")
         
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if hidden_states is None and captured_input and captured_layers:
+            # Transformers 4.57's LlamaModel only exposes last_hidden_state.
+            # Reconstruct the conventional embedding + per-layer tuple from
+            # hooks so converted checkpoints retain their previous contract.
+            hidden_states = (
+                captured_input[0],
+                *captured_layers[:-1],
+                last_hidden,
+            )
+
         if return_dict:
             return SmolVLMOutput(
                 last_hidden_state=last_hidden,
-                hidden_states=getattr(outputs, "hidden_states", None),
+                hidden_states=hidden_states,
                 attentions=getattr(outputs, "attentions", None),
             )
         else:
-            hidden_states = getattr(outputs, "hidden_states", None)
             attentions = getattr(outputs, "attentions", None)
             return (last_hidden, hidden_states, attentions)
     

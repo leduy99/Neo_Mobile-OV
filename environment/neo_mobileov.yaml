@@ -55,7 +55,7 @@ dependencies:
       - decorator==5.2.1
       - decord==0.6.0
       - deepspeed==0.16.6
-      - diffusers==0.32.2
+      - diffusers==0.39.0
       - dill==0.3.8
       - distro==1.9.0
       - distvae==0.0.0b5
@@ -80,7 +80,7 @@ dependencies:
       - httpcore==1.0.7
       - httpx==0.28.1
       - hf-xet==1.1.5
-      - huggingface-hub==0.30.2
+      - huggingface-hub==0.36.2
       - idna==3.10
       - imageio==2.37.0
       - imageio-ffmpeg==0.6.0
@@ -162,7 +162,7 @@ dependencies:
       - ruff==0.9.10
       - s3transfer==0.11.4
       - safehttpx==0.1.6
-      - safetensors==0.5.3
+      - safetensors==0.8.0
       - scikit-video==1.1.11
       - scipy==1.15.2
       - semantic-version==2.10.0
@@ -180,7 +180,7 @@ dependencies:
       - tensorboardx==2.6.2.2
       - termcolor==2.5.0
       - timm==1.0.15
-      - tokenizers==0.21.0
+      - tokenizers==0.22.2
       - tomli==2.4.1
       - tomlkit==0.13.2
       - torch==2.6.0+cu118
@@ -188,7 +188,7 @@ dependencies:
       - torchvision==0.21.0+cu118
       - tqdm==4.67.1
       - traitlets==5.14.3
-      - transformers==4.51.1
+      - transformers==4.57.3
       - triton==3.2.0
       - typer==0.15.2
       - typing-extensions==4.12.2

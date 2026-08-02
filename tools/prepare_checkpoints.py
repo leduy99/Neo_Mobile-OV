@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# ruff: noqa: E402
 from __future__ import annotations
 
 import argparse
@@ -10,7 +11,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from new_mobile_ov.checkpoints import ensure_neodragon_assets, ensure_smolvlm2_checkpoint
+from new_mobile_ov.checkpoints import (
+    ensure_dreamlite_checkpoint,
+    ensure_neodragon_assets,
+    ensure_smolvlm2_checkpoint,
+)
 from new_mobile_ov.config import load_config
 
 
@@ -19,6 +24,7 @@ def main() -> None:
     parser.add_argument("--config", default="configs/mobile_ov_neodragon.yaml")
     parser.add_argument("--skip-smolvlm2", action="store_true")
     parser.add_argument("--skip-neodragon", action="store_true")
+    parser.add_argument("--skip-dreamlite", action="store_true")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -40,6 +46,12 @@ def main() -> None:
                 "neodragon_cache_dir": cache_dir,
                 "neodragon_model_path": model_path,
             }
+        )
+    if not args.skip_dreamlite and cfg.dreamlite.enabled:
+        result["dreamlite_checkpoint_dir"] = ensure_dreamlite_checkpoint(
+            cfg.dreamlite.checkpoint_dir,
+            model_id=cfg.dreamlite.model_id,
+            revision=cfg.dreamlite.revision,
         )
 
     print(json.dumps(result, indent=2))

@@ -7,7 +7,11 @@ from typing import Any, Dict, Literal, Optional
 import yaml
 
 
-GenerationBackendName = Literal["mobile_ov_current", "mobile_o_sana_0_5b", "mobile_ov_neodragon"]
+GenerationBackendName = Literal[
+    "mobile_ov_current",
+    "mobile_o_sana_0_5b",
+    "mobile_ov_neodragon",
+]
 
 
 @dataclass
@@ -44,6 +48,32 @@ class ImageBridgeConfig:
     lexical_gate_init: float = 0.2
     ff_mult: int = 4
     dropout: float = 0.0
+
+
+@dataclass
+class DreamLiteBridgeConfig:
+    sequence_length: int = 128
+    condition_dim: int = 2048
+    attention_dim: int = 512
+    num_heads: int = 8
+    num_layers: int = 2
+    num_fuse_layers: int = 4
+    lexical_gate_init: float = 0.2
+    ff_mult: int = 4
+    dropout: float = 0.0
+    disable_image_splitting: bool = True
+    processor_model_id: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+
+
+@dataclass
+class DreamLiteConfig:
+    enabled: bool = False
+    model_id: str = "carlofkl/DreamLite-mobile"
+    revision: str = "diffusers"
+    checkpoint_dir: str = "checkpoints/dreamlite-mobile"
+    num_inference_steps: int = 4
+    height: int = 512
+    width: int = 512
 
 
 @dataclass
@@ -93,6 +123,8 @@ class TrainConfig:
 class NewMobileOVConfig:
     bridge: BridgeConfig = field(default_factory=BridgeConfig)
     image_bridge: ImageBridgeConfig = field(default_factory=ImageBridgeConfig)
+    dreamlite_bridge: DreamLiteBridgeConfig = field(default_factory=DreamLiteBridgeConfig)
+    dreamlite: DreamLiteConfig = field(default_factory=DreamLiteConfig)
     backend: BackendConfig = field(default_factory=BackendConfig)
     motion: MotionConfig = field(default_factory=MotionConfig)
     data: DataConfig = field(default_factory=DataConfig)

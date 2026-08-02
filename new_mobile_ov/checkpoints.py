@@ -16,6 +16,8 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_SMOLVLM2_MODEL_ID = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
 DEFAULT_NEODRAGON_MODEL_ID = "karnewar/Neodragon"
 DEFAULT_NEODRAGON_REPO_URL = "https://github.com/Qualcomm-AI-research/neodragon.git"
+DEFAULT_DREAMLITE_MODEL_ID = "carlofkl/DreamLite-mobile"
+DEFAULT_DREAMLITE_REVISION = "diffusers"
 
 
 def repo_root() -> Path:
@@ -269,3 +271,84 @@ def ensure_neodragon_assets(
 
     local_model_path = snapshot_download(model_id, cache_dir=str(cache), local_files_only=model_cache.exists())
     return str(repo), str(cache), str(local_model_path)
+
+
+def ensure_dreamlite_checkpoint(
+    path: str | os.PathLike[str] | None = None,
+    *,
+    model_id: str | None = None,
+    revision: str | None = None,
+) -> str:
+    """Download the gated DreamLite-mobile diffusers checkpoint once per filesystem.
+
+    DreamLite source is provided by the pinned diffusers dependency, so this
+    function downloads weights only and never clones an auxiliary repository.
+    The user must have accepted the model license and configured HF_TOKEN.
+    """
+
+    target = resolve_repo_path(path, default="checkpoints/dreamlite-mobile")
+    model_id = (
+        model_id
+        or os.environ.get("MOBILEOV_DREAMLITE_MODEL_ID")
+        or DEFAULT_DREAMLITE_MODEL_ID
+    ).strip()
+    revision = (
+        revision
+        or os.environ.get("MOBILEOV_DREAMLITE_REVISION")
+        or DEFAULT_DREAMLITE_REVISION
+    ).strip()
+    marker = target / ".download_complete"
+    required = (
+        target / "model_index.json",
+        target / "unet",
+        target / "vae",
+        target / "scheduler",
+        target / "text_encoder",
+        target / "tokenizer",
+        target / "processor",
+    )
+    if all(item.exists() for item in required):
+        marker.touch(exist_ok=True)
+        return str(target)
+    if os.environ.get("MOBILEOV_DREAMLITE_AUTO_DOWNLOAD", "1").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        raise FileNotFoundError(
+            f"Missing DreamLite checkpoint: {target}. Enable auto-download or "
+            "set MOBILEOV_DREAMLITE_MODEL_ID/MOBILEOV_DREAMLITE_REVISION."
+        )
+
+    def action() -> None:
+        from huggingface_hub import snapshot_download
+
+        target.mkdir(parents=True, exist_ok=True)
+        LOGGER.info(
+            "Downloading gated DreamLite checkpoint repo=%s revision=%s into %s",
+            model_id,
+            revision,
+            target,
+        )
+        snapshot_download(
+            repo_id=model_id,
+            revision=revision,
+            local_dir=str(target),
+            token=os.environ.get("HF_TOKEN") or None,
+        )
+        missing = [str(item) for item in required if not item.exists()]
+        if missing:
+            raise FileNotFoundError(
+                f"DreamLite download completed without required assets: {missing}"
+            )
+        marker.touch()
+
+    try:
+        _with_file_lock(marker, action)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not prepare {model_id}@{revision}. DreamLite is gated; accept "
+            "its Hugging Face terms and export HF_TOKEN before submitting the job."
+        ) from exc
+    return str(target)
