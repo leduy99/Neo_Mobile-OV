@@ -16,6 +16,33 @@ from new_mobile_ov.smolvlm2 import SmolVLMModel, load_smolvlm2_from_ckpt
 
 DreamLiteMode = Literal["generate", "edit"]
 
+DREAMLITE_GENERATION_TEMPLATE = (
+    "<|im_start|>system\nDescribe the image by detailing the color, shape, size, "
+    "texture, quantity, text, spatial relationships of the objects and background:"
+    "<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
+)
+
+
+def dreamlite_generation_texts(prompts: Sequence[str]) -> list[str]:
+    prompts = _clean_prompts(prompts, "image")
+    return [DREAMLITE_GENERATION_TEMPLATE.format(f"[Generate]: {prompt}") for prompt in prompts]
+
+
+def dreamlite_generation_lengths(
+    tokenizer,
+    prompts: Sequence[str],
+    *,
+    prefix_tokens: int,
+    max_length: int,
+) -> torch.Tensor:
+    encoded = tokenizer(
+        text=dreamlite_generation_texts(prompts),
+        padding=True,
+        return_tensors="pt",
+    )
+    lengths = encoded.attention_mask.sum(dim=1) - int(prefix_tokens)
+    return lengths.clamp(min=1, max=int(max_length))
+
 
 class DreamLiteCondition(NamedTuple):
     """Condition contract consumed by DreamLite's internal text projection."""
@@ -208,6 +235,10 @@ class MobileOVDreamLiteImageBridge(nn.Module):
         self.dreamlite_cfg = dreamlite_cfg
         self.sequence_length = int(dreamlite_cfg.sequence_length)
         self.condition_dim = int(dreamlite_cfg.condition_dim)
+        self.variable_length_generation = bool(dreamlite_cfg.variable_length_generation)
+        self.native_tokenizer_path = str(dreamlite_cfg.native_tokenizer_path)
+        self.native_generation_prefix_tokens = int(dreamlite_cfg.native_generation_prefix_tokens)
+        self._native_tokenizer = None
         self.feature_provider = SmolVLM2MultimodalFeatureProvider(
             bridge_cfg,
             dreamlite_cfg,
@@ -250,6 +281,33 @@ class MobileOVDreamLiteImageBridge(nn.Module):
             nn.Linear(attention_dim, self.condition_dim),
         )
         self.to(device=device, dtype=dtype)
+
+    def _get_native_tokenizer(self):
+        if self._native_tokenizer is None:
+            from transformers import Qwen2TokenizerFast
+
+            self._native_tokenizer = Qwen2TokenizerFast.from_pretrained(
+                self.native_tokenizer_path,
+                local_files_only=True,
+            )
+        return self._native_tokenizer
+
+    def _generation_query_mask(
+        self,
+        prompts: Sequence[str],
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        tokenizer = self._get_native_tokenizer()
+        lengths = dreamlite_generation_lengths(
+            tokenizer,
+            prompts,
+            prefix_tokens=self.native_generation_prefix_tokens,
+            max_length=self.sequence_length,
+        ).to(device=device)
+        batch_length = int(lengths.max().item())
+        positions = torch.arange(batch_length, device=device)
+        return positions.unsqueeze(0) < lengths.unsqueeze(1)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -312,14 +370,21 @@ class MobileOVDreamLiteImageBridge(nn.Module):
         mode_index = 0 if mode == "generate" else 1
         mode_value = self.mode_embedding.weight[mode_index].to(dtype=source.dtype)
         source = source + mode_value.view(1, 1, -1)
-        queries = self.queries.expand(source.shape[0], -1, -1).to(dtype=source.dtype)
+        if mode == "generate" and self.variable_length_generation:
+            query_mask = self._generation_query_mask(prompts, device=source.device)
+        else:
+            query_mask = torch.ones(
+                source.shape[0],
+                self.sequence_length,
+                dtype=torch.bool,
+                device=source.device,
+            )
+        query_length = query_mask.shape[1]
+        queries = self.queries[:, :query_length].expand(source.shape[0], -1, -1).to(dtype=source.dtype)
         queries = queries + mode_value.view(1, 1, -1)
         for block in self.query_blocks:
-            queries = block(queries, source, source_mask)
+            queries = block(queries, source, source_mask, query_mask=query_mask)
         prompt_embeds = self.condition_head(queries)
-        attention_mask = torch.ones(
-            prompt_embeds.shape[:2],
-            dtype=torch.long,
-            device=prompt_embeds.device,
-        )
+        prompt_embeds = prompt_embeds * query_mask.to(dtype=prompt_embeds.dtype).unsqueeze(-1)
+        attention_mask = query_mask.to(dtype=torch.long)
         return DreamLiteCondition(prompt_embeds=prompt_embeds, attention_mask=attention_mask)

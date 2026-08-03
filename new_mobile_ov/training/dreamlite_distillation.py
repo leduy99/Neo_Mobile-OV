@@ -9,7 +9,11 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
 
-from new_mobile_ov.bridge.dreamlite_image_bridge import DreamLiteCondition, DreamLiteMode
+from new_mobile_ov.bridge.dreamlite_image_bridge import (
+    DreamLiteCondition,
+    DreamLiteMode,
+    dreamlite_generation_texts,
+)
 from new_mobile_ov.checkpoints import ensure_dreamlite_checkpoint
 from new_mobile_ov.config import DreamLiteConfig
 from new_mobile_ov.generation.backends.dreamlite import DreamLiteMobileBackend
@@ -45,6 +49,26 @@ def relative_mse(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor
 def _masked_mean(tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     weights = mask.to(device=tokens.device, dtype=tokens.dtype).unsqueeze(-1)
     return (tokens * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+
+
+def _masked_token_average(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    weights = mask.to(device=values.device, dtype=values.dtype)
+    return (values * weights).sum() / weights.sum().clamp_min(1.0)
+
+
+def _masked_feature_moments(
+    tokens: torch.Tensor,
+    mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    weights = mask.to(device=tokens.device, dtype=tokens.dtype).unsqueeze(-1)
+    count = weights.sum(dim=1).clamp_min(1.0)
+    mean = (tokens * weights).sum(dim=1) / count
+    variance = ((tokens - mean.unsqueeze(1)).pow(2) * weights).sum(dim=1) / count
+    return mean, variance.clamp_min(1e-8).sqrt()
+
+
+def _relative_feature_mse(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return (prediction - target).pow(2).mean() / target.pow(2).mean().clamp_min(1e-6)
 
 
 def _resize_valid_tokens(
@@ -118,6 +142,63 @@ def dreamlite_representation_losses(
     }
 
 
+def dreamlite_direct_representation_losses(
+    student: DreamLiteCondition,
+    teacher: DreamLiteCondition,
+) -> dict[str, torch.Tensor]:
+    """Match native Qwen condition positions without sequence interpolation."""
+
+    common_length = min(student.prompt_embeds.shape[1], teacher.prompt_embeds.shape[1])
+    if common_length < 1:
+        raise RuntimeError("DreamLite conditions must contain at least one token.")
+    student_tokens = student.prompt_embeds[:, :common_length].float()
+    teacher_tokens = teacher.prompt_embeds[:, :common_length].float()
+    student_mask = student.attention_mask[:, :common_length].bool()
+    teacher_mask = teacher.attention_mask[:, :common_length].bool()
+    common_mask = student_mask & teacher_mask
+    if not bool(common_mask.any()):
+        raise RuntimeError("Student and teacher DreamLite conditions share no valid tokens.")
+
+    student_normalized = F.layer_norm(student_tokens, (student_tokens.shape[-1],))
+    teacher_normalized = F.layer_norm(teacher_tokens, (teacher_tokens.shape[-1],))
+    token_mse = (student_normalized - teacher_normalized).pow(2).mean(dim=-1)
+    token_cosine = 1.0 - F.cosine_similarity(student_tokens, teacher_tokens, dim=-1)
+    student_norm = student_tokens.norm(dim=-1)
+    teacher_norm = teacher_tokens.norm(dim=-1)
+    token_norm = ((student_norm - teacher_norm) / teacher_norm.clamp_min(1e-4)).pow(2)
+
+    student_pool = _masked_mean(student_tokens, common_mask)
+    teacher_pool = _masked_mean(teacher_tokens, common_mask)
+    student_mean, student_std = _masked_feature_moments(student_tokens, common_mask)
+    teacher_mean, teacher_std = _masked_feature_moments(teacher_tokens, common_mask)
+    if student_tokens.shape[0] > 1:
+        student_rel = F.normalize(student_pool, dim=-1) @ F.normalize(student_pool, dim=-1).T
+        teacher_rel = F.normalize(teacher_pool, dim=-1) @ F.normalize(teacher_pool, dim=-1).T
+        geometry = F.mse_loss(student_rel, teacher_rel)
+        prompt_variance = _relative_feature_mse(
+            student_pool.std(dim=0, unbiased=False),
+            teacher_pool.std(dim=0, unbiased=False),
+        )
+    else:
+        geometry = student_tokens.new_zeros(())
+        prompt_variance = student_tokens.new_zeros(())
+    return {
+        "token_normalized_mse": _masked_token_average(token_mse, common_mask),
+        "token_cosine": _masked_token_average(token_cosine, common_mask),
+        "token_norm": _masked_token_average(token_norm, common_mask),
+        "pooled_normalized_mse": F.mse_loss(
+            F.layer_norm(student_pool, (student_pool.shape[-1],)),
+            F.layer_norm(teacher_pool, (teacher_pool.shape[-1],)),
+        ),
+        "pooled_cosine": pooled_cosine(student_pool, teacher_pool),
+        "geometry": geometry,
+        "variance": prompt_variance,
+        "token_mean": _relative_feature_mse(student_mean, teacher_mean),
+        "token_std": _relative_feature_mse(student_std, teacher_std),
+        "mask_agreement": (student_mask == teacher_mask).float().mean(),
+    }
+
+
 class DreamLiteFrozenQwenTeacher:
     """Native BF16 Qwen3-VL condition used only while distilling the bridge."""
 
@@ -180,12 +261,7 @@ class DreamLiteFrozenQwenTeacher:
     ) -> DreamLiteCondition:
         prompts = [" ".join(str(value).strip().split()) for value in prompts]
         if mode == "generate":
-            template = (
-                "<|im_start|>system\nDescribe the image by detailing the color, shape, size, "
-                "texture, quantity, text, spatial relationships of the objects and background:"
-                "<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
-            )
-            text = [template.format(f"[Generate]: {prompt}") for prompt in prompts]
+            text = dreamlite_generation_texts(prompts)
             encoded = self.tokenizer(text=text, padding=True, return_tensors="pt").to(self.device)
             outputs = self.text_encoder(
                 input_ids=encoded.input_ids,
@@ -267,6 +343,13 @@ class DreamLiteFrozenController:
         if images is None:
             return self.backend.random_latents(batch_size, height, width).zero_()
         return self.backend.encode_source_images(images, height=height, width=width)
+
+    def project_condition(self, condition: DreamLiteCondition) -> DreamLiteCondition:
+        projected = self.backend.unet.process_encoder_hidden_states(
+            condition.prompt_embeds.to(dtype=self.backend.dtype),
+            added_cond_kwargs={},
+        )
+        return DreamLiteCondition(projected, condition.attention_mask)
 
     def functional_loss(
         self,

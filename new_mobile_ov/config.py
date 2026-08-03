@@ -63,6 +63,9 @@ class DreamLiteBridgeConfig:
     dropout: float = 0.0
     disable_image_splitting: bool = True
     processor_model_id: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+    variable_length_generation: bool = False
+    native_tokenizer_path: str = "checkpoints/dreamlite-mobile/tokenizer"
+    native_generation_prefix_tokens: int = 34
 
 
 @dataclass

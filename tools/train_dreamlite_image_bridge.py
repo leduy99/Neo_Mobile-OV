@@ -34,6 +34,7 @@ from new_mobile_ov.training.dreamlite_distillation import (
     DreamLiteFrozenController,
     DreamLiteFrozenQwenTeacher,
     DreamLiteFunctionalResult,
+    dreamlite_direct_representation_losses,
     dreamlite_representation_losses,
 )
 from new_mobile_ov.training.neodragon_objectives import linear_ramp
@@ -180,7 +181,7 @@ def lr_scale(step: int, *, total_steps: int, warmup_steps: int, final_scale: flo
 
 
 def representation_total(losses: dict[str, torch.Tensor], args) -> torch.Tensor:
-    return (
+    total = (
         args.token_mse_weight * losses["token_normalized_mse"]
         + args.token_cos_weight * losses["token_cosine"]
         + args.token_norm_weight * losses["token_norm"]
@@ -188,6 +189,23 @@ def representation_total(losses: dict[str, torch.Tensor], args) -> torch.Tensor:
         + args.pooled_cos_weight * losses["pooled_cosine"]
         + args.geometry_weight * losses["geometry"]
         + args.variance_weight * losses["variance"]
+    )
+    if "token_mean" in losses:
+        total = total + args.token_mean_weight * losses["token_mean"]
+    if "token_std" in losses:
+        total = total + args.token_std_weight * losses["token_std"]
+    return total
+
+
+def projected_representation_total(
+    losses: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    return (
+        0.50 * losses["token_normalized_mse"]
+        + losses["token_cosine"]
+        + 0.50 * losses["pooled_cosine"]
+        + 0.25 * losses["token_mean"]
+        + 0.25 * losses["token_std"]
     )
 
 
@@ -222,6 +240,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pooled-cos-weight", type=float, default=1.00)
     parser.add_argument("--geometry-weight", type=float, default=0.25)
     parser.add_argument("--variance-weight", type=float, default=0.05)
+    parser.add_argument(
+        "--representation-mode",
+        choices=("interpolated", "direct"),
+        default="interpolated",
+    )
+    parser.add_argument("--token-mean-weight", type=float, default=0.0)
+    parser.add_argument("--token-std-weight", type=float, default=0.0)
+    parser.add_argument("--projected-weight", type=float, default=0.0)
     parser.add_argument("--representation-final-scale", type=float, default=0.25)
     parser.add_argument("--functional-weight", type=float, default=5.0)
     parser.add_argument("--functional-cos-weight", type=float, default=0.5)
@@ -404,8 +430,22 @@ def main() -> None:
             ):
                 student = bridge(prompts, mode=mode, images=images)
                 teacher_condition = teacher.encode(prompts, mode=mode, images=images)
-                repr_losses = dreamlite_representation_losses(student, teacher_condition)
+                use_direct_alignment = args.representation_mode == "direct" and mode == "generate"
+                if use_direct_alignment:
+                    repr_losses = dreamlite_direct_representation_losses(student, teacher_condition)
+                    projected_student = controller.project_condition(student)
+                    projected_teacher = controller.project_condition(teacher_condition)
+                    projected_losses = dreamlite_direct_representation_losses(
+                        projected_student,
+                        projected_teacher,
+                    )
+                    projected_value = projected_representation_total(projected_losses)
+                else:
+                    repr_losses = dreamlite_representation_losses(student, teacher_condition)
+                    projected_losses = None
+                    projected_value = student.prompt_embeds.new_zeros((), dtype=torch.float32)
                 repr_value = representation_total(repr_losses, args)
+                repr_value = repr_value + args.projected_weight * projected_value
                 if current_step < args.closed_loop_start_step:
                     repr_scale = 1.0
                 else:
@@ -491,8 +531,21 @@ def main() -> None:
                     "phase": phase,
                     "loss": scalar_mean(loss.detach(), context),
                     "representation": scalar_mean(repr_value.detach(), context),
+                    "projected_representation": scalar_mean(projected_value.detach(), context),
                     "token_cosine": scalar_mean(repr_losses["token_cosine"].detach(), context),
                     "pooled_cosine": scalar_mean(repr_losses["pooled_cosine"].detach(), context),
+                    "token_mean": scalar_mean(
+                        repr_losses.get("token_mean", repr_value.new_zeros(())).detach(),
+                        context,
+                    ),
+                    "token_std": scalar_mean(
+                        repr_losses.get("token_std", repr_value.new_zeros(())).detach(),
+                        context,
+                    ),
+                    "mask_agreement": scalar_mean(
+                        repr_losses.get("mask_agreement", repr_value.new_ones(())).detach(),
+                        context,
+                    ),
                     "functional_relative_mse": scalar_mean(functional.relative_mse.detach(), context),
                     "closed_terminal_relative_mse": scalar_mean(closed.terminal_relative_mse.detach(), context),
                     "grad_norm": scalar_mean(torch.as_tensor(grad_norm, device=context.device), context),
@@ -521,7 +574,11 @@ def main() -> None:
                         "bridge": {key: value.detach().cpu() for key, value in module.trainable_state_dict().items()},
                         "optimizer": optimizer.state_dict(),
                         "config": vars(args),
-                        "architecture": "MobileOVDreamLiteImageBridge",
+                        "architecture": (
+                            "MobileOVDreamLiteCompactBridgeV3"
+                            if args.representation_mode == "direct"
+                            else "MobileOVDreamLiteImageBridge"
+                        ),
                         "teacher": "Qwen3-VL BF16 from DreamLite-mobile",
                         "functional_teacher": "frozen DreamLite-mobile UNet, native 4-call schedule",
                     }

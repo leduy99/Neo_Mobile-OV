@@ -164,6 +164,7 @@ class ImageQueryBlock(nn.Module):
         queries: torch.Tensor,
         source: torch.Tensor,
         source_mask: torch.Tensor,
+        query_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         cross, _ = self.cross_attention(
             self.query_norm(queries),
@@ -177,10 +178,14 @@ class ImageQueryBlock(nn.Module):
             self.self_norm(queries),
             self.self_norm(queries),
             self.self_norm(queries),
+            key_padding_mask=None if query_mask is None else ~query_mask.bool(),
             need_weights=False,
         )
         queries = queries + self_value
-        return queries + self.ff(self.ff_norm(queries))
+        queries = queries + self.ff(self.ff_norm(queries))
+        if query_mask is not None:
+            queries = queries * query_mask.to(dtype=queries.dtype).unsqueeze(-1)
+        return queries
 
 
 class MobileOVSSD1BImageBridge(nn.Module):
