@@ -12,8 +12,10 @@ from new_mobile_ov.bridge.dreamlite_image_bridge import (
 )
 from new_mobile_ov.config import BridgeConfig, DreamLiteBridgeConfig
 from new_mobile_ov.training.dreamlite_distillation import (
+    DreamLiteFrozenController,
     dreamlite_direct_representation_losses,
     dreamlite_representation_losses,
+    parse_dreamlite_resolution_buckets,
 )
 
 
@@ -158,5 +160,97 @@ def test_direct_losses_ignore_padding_and_are_zero_for_identical_tokens() -> Non
         expected = 1.0 if name == "mask_agreement" else 0.0
         assert torch.allclose(value, value.new_tensor(expected), atol=1e-6), name
     sum(value for name, value in losses.items() if name != "mask_agreement").backward()
+    assert student_tokens.grad is not None
+    assert torch.isfinite(student_tokens.grad).all()
+
+
+def test_resolution_bucket_parser_keeps_actual_and_logical_sizes_separate() -> None:
+    buckets = parse_dreamlite_resolution_buckets(
+        "512x512@1024x1024:20,1024x640@1280x800:10"
+    )
+
+    assert [bucket.label for bucket in buckets] == [
+        "512x512@1024x1024",
+        "1024x640@1280x800",
+    ]
+    assert [bucket.weight for bucket in buckets] == [20.0, 10.0]
+
+
+class FakeScheduler:
+    def step(self, prediction, timestep, latents, return_dict):
+        del timestep
+        assert return_dict is False
+        return (latents + prediction,)
+
+
+class FakeDreamLiteBackend:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def random_latents(self, batch_size, height, width):
+        return torch.zeros(batch_size, 1, height // 8, width // 8)
+
+    def make_scheduler(self):
+        return FakeScheduler()
+
+    def prepare_schedule(self, scheduler, latents, *, num_steps):
+        del scheduler, latents
+        return torch.arange(num_steps, 0, -1)
+
+    def predict(
+        self,
+        latents,
+        timestep,
+        condition,
+        *,
+        source_latents,
+        height,
+        width,
+        time_id_height=None,
+        time_id_width=None,
+    ):
+        del source_latents
+        self.calls.append(
+            {
+                "latents": latents.detach().clone(),
+                "timestep": int(timestep),
+                "height": height,
+                "width": width,
+                "time_id_height": time_id_height,
+                "time_id_width": time_id_width,
+            }
+        )
+        condition_value = condition.prompt_embeds.float().mean(dim=(1, 2))
+        return 0.1 * latents + condition_value[:, None, None, None]
+
+
+def test_functional_loss_uses_teacher_prefix_and_one_shared_target_state() -> None:
+    controller = DreamLiteFrozenController.__new__(DreamLiteFrozenController)
+    controller.backend = FakeDreamLiteBackend()
+    controller.num_steps = 4
+    student_tokens = torch.full((1, 5, 8), 0.75, requires_grad=True)
+    teacher_tokens = torch.full((1, 5, 8), 0.5)
+    mask = torch.ones(1, 5, dtype=torch.long)
+
+    result = controller.functional_loss(
+        DreamLiteCondition(student_tokens, mask),
+        DreamLiteCondition(teacher_tokens, mask),
+        source_images=None,
+        height=64,
+        width=96,
+        time_id_height=800,
+        time_id_width=1280,
+        batch_size=1,
+        call_index=2,
+    )
+    (result.relative_mse + result.cosine).backward()
+
+    calls = controller.backend.calls
+    assert len(calls) == 4  # Two teacher prefix calls, then teacher/student at k=2.
+    assert torch.count_nonzero(calls[-2]["latents"]) > 0
+    assert torch.equal(calls[-2]["latents"], calls[-1]["latents"])
+    assert calls[-1]["time_id_height"] == 800
+    assert calls[-1]["time_id_width"] == 1280
+    assert result.call_index == 2
     assert student_tokens.grad is not None
     assert torch.isfinite(student_tokens.grad).all()

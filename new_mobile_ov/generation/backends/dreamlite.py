@@ -167,12 +167,16 @@ class DreamLiteMobileBackend(nn.Module):
         source_latents: torch.Tensor | None = None,
         height: int,
         width: int,
+        time_id_height: int | None = None,
+        time_id_width: int | None = None,
     ) -> torch.Tensor:
         if source_latents is None:
             source_latents = torch.zeros_like(latents)
         model_input = torch.cat([latents, source_latents], dim=3)
+        time_id_height = int(time_id_height or height)
+        time_id_width = int(time_id_width or width)
         time_ids = torch.tensor(
-            [[width, height]],
+            [[time_id_width, time_id_height]],
             device=latents.device,
             dtype=latents.dtype,
         ).expand(latents.shape[0], -1)
@@ -203,6 +207,8 @@ class DreamLiteMobileBackend(nn.Module):
         source_images: Sequence[Image.Image] | None = None,
         height: int | None = None,
         width: int | None = None,
+        time_id_height: int | None = None,
+        time_id_width: int | None = None,
         num_steps: int | None = None,
         seed: int = 0,
     ) -> list[Image.Image]:
@@ -233,6 +239,8 @@ class DreamLiteMobileBackend(nn.Module):
                 source_latents=source_latents,
                 height=height,
                 width=width,
+                time_id_height=time_id_height,
+                time_id_width=time_id_width,
             )
             latents = scheduler.step(prediction, timestep, latents, return_dict=False)[0]
         return self.decode(latents)

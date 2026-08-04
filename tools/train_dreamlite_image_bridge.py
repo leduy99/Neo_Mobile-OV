@@ -34,8 +34,10 @@ from new_mobile_ov.training.dreamlite_distillation import (
     DreamLiteFrozenController,
     DreamLiteFrozenQwenTeacher,
     DreamLiteFunctionalResult,
+    DreamLiteResolutionBucket,
     dreamlite_direct_representation_losses,
     dreamlite_representation_losses,
+    parse_dreamlite_resolution_buckets,
 )
 from new_mobile_ov.training.neodragon_objectives import linear_ramp
 
@@ -199,14 +201,26 @@ def representation_total(losses: dict[str, torch.Tensor], args) -> torch.Tensor:
 
 def projected_representation_total(
     losses: dict[str, torch.Tensor],
+    args,
 ) -> torch.Tensor:
     return (
         0.50 * losses["token_normalized_mse"]
         + losses["token_cosine"]
-        + 0.50 * losses["pooled_cosine"]
-        + 0.25 * losses["token_mean"]
-        + 0.25 * losses["token_std"]
+        + args.projected_pooled_cos_weight * losses["pooled_cosine"]
+        + args.projected_moment_weight * losses["token_mean"]
+        + args.projected_moment_weight * losses["token_std"]
     )
+
+
+def choose_resolution_bucket(
+    buckets: list[DreamLiteResolutionBucket],
+    *,
+    seed: int,
+    step: int,
+) -> DreamLiteResolutionBucket:
+    # The seed does not contain rank so every DDP process runs the same graph.
+    rng = random.Random(seed + 104729 * step)
+    return rng.choices(buckets, weights=[bucket.weight for bucket in buckets], k=1)[0]
 
 
 def parse_args() -> argparse.Namespace:
@@ -230,6 +244,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-grad-norm", type=float, default=1.0)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
+    parser.add_argument(
+        "--resolution-buckets",
+        default="",
+        help=(
+            "Comma-separated actual@logical resolution buckets: "
+            "WIDTHxHEIGHT@TIME_WIDTHxTIME_HEIGHT:WEIGHT. "
+            "An empty value preserves the legacy --width/--height behavior."
+        ),
+    )
     parser.add_argument("--caption-variant-columns", default="caption_short,caption_medium,caption_long")
     parser.add_argument("--caption-variant-weights", default="1,1,1")
     parser.add_argument("--caption-fallback-column", default="caption")
@@ -248,6 +271,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--token-mean-weight", type=float, default=0.0)
     parser.add_argument("--token-std-weight", type=float, default=0.0)
     parser.add_argument("--projected-weight", type=float, default=0.0)
+    parser.add_argument("--projected-pooled-cos-weight", type=float, default=0.5)
+    parser.add_argument("--projected-moment-weight", type=float, default=0.25)
     parser.add_argument("--representation-final-scale", type=float, default=0.25)
     parser.add_argument("--functional-weight", type=float, default=5.0)
     parser.add_argument("--functional-cos-weight", type=float, default=0.5)
@@ -266,6 +291,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--save-latest-every", type=int, default=5000)
     parser.add_argument("--save-archive-every", type=int, default=10000)
+    parser.add_argument("--training-version", default="legacy")
     return parser.parse_args()
 
 
@@ -278,6 +304,18 @@ def main() -> None:
     inference_dtype = dtype_from_name(args.dtype)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.resolution_buckets:
+        resolution_buckets = parse_dreamlite_resolution_buckets(args.resolution_buckets)
+    else:
+        resolution_buckets = [
+            DreamLiteResolutionBucket(
+                width=args.width,
+                height=args.height,
+                time_id_width=args.width,
+                time_id_height=args.height,
+                weight=1.0,
+            )
+        ]
 
     columns = split_csv(args.caption_variant_columns)
     weights = [float(value) for value in split_csv(args.caption_variant_weights)]
@@ -371,6 +409,11 @@ def main() -> None:
         f"trainable_params={trainable_count:,} generation_rows={len(generation_data)} "
         f"edit_rows={len(edit_loader.dataset) if edit_loader else 0} target_step={args.target_step}",
     )
+    rank0_print(
+        context,
+        "Resolution buckets: "
+        + ", ".join(f"{bucket.label}:{bucket.weight:g}" for bucket in resolution_buckets),
+    )
     generation_epoch = 0
     edit_epoch = 0
     generation_iter = iter(generation_loader)
@@ -409,9 +452,25 @@ def main() -> None:
     try:
         while current_step < args.target_step:
             current_step += 1
+            scale = lr_scale(
+                current_step,
+                total_steps=args.target_step,
+                warmup_steps=args.lr_warmup_steps,
+                final_scale=args.lr_final_scale,
+            )
+            for group in optimizer.param_groups:
+                group["lr"] = args.lr * scale
             # Every DDP rank must execute the same objective branch. Samples
             # remain rank-sharded, but mode selection is deterministic globally.
             mode_rng = random.Random(args.seed + current_step)
+            resolution = choose_resolution_bucket(
+                resolution_buckets,
+                seed=args.seed,
+                step=current_step,
+            )
+            functional_call_index = random.Random(
+                args.seed + 130363 * current_step
+            ).randrange(controller.num_steps)
             use_edit = edit_loader is not None and mode_rng.random() < args.edit_probability
             if use_edit:
                 image_paths, prompts = next_edit()
@@ -439,14 +498,14 @@ def main() -> None:
                         projected_student,
                         projected_teacher,
                     )
-                    projected_value = projected_representation_total(projected_losses)
+                    projected_value = projected_representation_total(projected_losses, args)
                 else:
                     repr_losses = dreamlite_representation_losses(student, teacher_condition)
                     projected_losses = None
                     projected_value = student.prompt_embeds.new_zeros((), dtype=torch.float32)
                 repr_value = representation_total(repr_losses, args)
                 repr_value = repr_value + args.projected_weight * projected_value
-                if current_step < args.closed_loop_start_step:
+                if args.closed_loop_weight <= 0 or current_step < args.closed_loop_start_step:
                     repr_scale = 1.0
                 else:
                     repr_scale = args.representation_final_scale
@@ -474,7 +533,8 @@ def main() -> None:
                     ramp_steps=args.closed_loop_ramp_steps,
                 )
                 run_closed = (
-                    current_step >= args.closed_loop_start_step
+                    args.closed_loop_weight > 0
+                    and current_step >= args.closed_loop_start_step
                     and (current_step - args.closed_loop_start_step) % args.closed_loop_every == 0
                 )
                 if run_closed:
@@ -483,8 +543,8 @@ def main() -> None:
                         student,
                         teacher_condition,
                         source_images=images,
-                        height=args.height,
-                        width=args.width,
+                        height=resolution.height,
+                        width=resolution.width,
                         batch_size=args.closed_loop_batch_size,
                     )
                 elif current_step >= args.functional_start_step:
@@ -493,9 +553,12 @@ def main() -> None:
                         student,
                         teacher_condition,
                         source_images=images,
-                        height=args.height,
-                        width=args.width,
+                        height=resolution.height,
+                        width=resolution.width,
+                        time_id_height=resolution.time_id_height,
+                        time_id_width=resolution.time_id_width,
                         batch_size=args.functional_batch_size,
+                        call_index=functional_call_index,
                     )
                 else:
                     phase = "representation"
@@ -514,14 +577,6 @@ def main() -> None:
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.clip_grad_norm)
             optimizer.step()
-            scale = lr_scale(
-                current_step,
-                total_steps=args.target_step,
-                warmup_steps=args.lr_warmup_steps,
-                final_scale=args.lr_final_scale,
-            )
-            for group in optimizer.param_groups:
-                group["lr"] = args.lr * scale
 
             should_log = current_step == 1 or current_step % args.log_every == 0
             if should_log:
@@ -529,6 +584,11 @@ def main() -> None:
                     "step": current_step,
                     "mode": mode,
                     "phase": phase,
+                    "resolution_bucket": resolution.label,
+                    "actual_width": resolution.width,
+                    "actual_height": resolution.height,
+                    "time_id_width": resolution.time_id_width,
+                    "time_id_height": resolution.time_id_height,
                     "loss": scalar_mean(loss.detach(), context),
                     "representation": scalar_mean(repr_value.detach(), context),
                     "projected_representation": scalar_mean(projected_value.detach(), context),
@@ -547,10 +607,18 @@ def main() -> None:
                         context,
                     ),
                     "functional_relative_mse": scalar_mean(functional.relative_mse.detach(), context),
+                    "functional_call_index": functional.call_index,
                     "closed_terminal_relative_mse": scalar_mean(closed.terminal_relative_mse.detach(), context),
                     "grad_norm": scalar_mean(torch.as_tensor(grad_norm, device=context.device), context),
                     "lr": optimizer.param_groups[0]["lr"],
                 }
+                if context.device.type == "cuda":
+                    item["cuda_peak_allocated_gib"] = (
+                        torch.cuda.max_memory_allocated(context.device) / (1024**3)
+                    )
+                    item["cuda_peak_reserved_gib"] = (
+                        torch.cuda.max_memory_reserved(context.device) / (1024**3)
+                    )
                 if context.is_main:
                     with history_path.open("a", encoding="utf-8") as handle:
                         handle.write(json.dumps(item) + "\n")
@@ -560,6 +628,7 @@ def main() -> None:
                         loss=f"{item['loss']:.4f}",
                         func=f"{item['functional_relative_mse']:.4f}",
                         roll=f"{item['closed_terminal_relative_mse']:.4f}",
+                        res=resolution.label,
                     )
             progress.update(1)
 
@@ -575,12 +644,19 @@ def main() -> None:
                         "optimizer": optimizer.state_dict(),
                         "config": vars(args),
                         "architecture": (
-                            "MobileOVDreamLiteCompactBridgeV3"
+                            "MobileOVDreamLiteCompactBridgeV4"
+                            if args.training_version.lower() == "v4"
+                            else "MobileOVDreamLiteCompactBridgeV3"
                             if args.representation_mode == "direct"
                             else "MobileOVDreamLiteImageBridge"
                         ),
                         "teacher": "Qwen3-VL BF16 from DreamLite-mobile",
-                        "functional_teacher": "frozen DreamLite-mobile UNet, native 4-call schedule",
+                        "functional_teacher": (
+                            "frozen DreamLite-mobile UNet, native 4-call schedule, "
+                            "same-state teacher-forced prefixes"
+                            if args.training_version.lower() == "v4"
+                            else "frozen DreamLite-mobile UNet, native 4-call schedule"
+                        ),
                     }
                     if save_latest:
                         torch.save(payload, output_dir / "dreamlite_image_bridge_latest.pt")

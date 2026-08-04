@@ -40,6 +40,64 @@ class DreamLiteClosedLoopResult:
     calls: int
 
 
+@dataclass(frozen=True)
+class DreamLiteResolutionBucket:
+    width: int
+    height: int
+    time_id_width: int
+    time_id_height: int
+    weight: float
+
+    @property
+    def label(self) -> str:
+        return (
+            f"{self.width}x{self.height}"
+            f"@{self.time_id_width}x{self.time_id_height}"
+        )
+
+
+def parse_dreamlite_resolution_buckets(value: str) -> list[DreamLiteResolutionBucket]:
+    """Parse `actual_widthxheight@logical_widthxheight:weight` buckets."""
+
+    buckets: list[DreamLiteResolutionBucket] = []
+    for raw_item in str(value).split(","):
+        item = raw_item.strip().lower()
+        if not item:
+            continue
+        try:
+            sizes, raw_weight = item.rsplit(":", 1)
+            actual, logical = sizes.split("@", 1)
+            width, height = (int(part) for part in actual.split("x", 1))
+            time_id_width, time_id_height = (
+                int(part) for part in logical.split("x", 1)
+            )
+            weight = float(raw_weight)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Invalid DreamLite resolution bucket "
+                f"{raw_item!r}; expected WIDTHxHEIGHT@TIME_WIDTHxTIME_HEIGHT:WEIGHT"
+            ) from exc
+        dimensions = (width, height, time_id_width, time_id_height)
+        if any(dimension <= 0 or dimension % 8 != 0 for dimension in dimensions):
+            raise ValueError(
+                f"DreamLite resolution dimensions must be positive multiples of 8: {raw_item!r}"
+            )
+        if weight <= 0:
+            raise ValueError(f"DreamLite resolution weight must be positive: {raw_item!r}")
+        buckets.append(
+            DreamLiteResolutionBucket(
+                width=width,
+                height=height,
+                time_id_width=time_id_width,
+                time_id_height=time_id_height,
+                weight=weight,
+            )
+        )
+    if not buckets:
+        raise ValueError("At least one DreamLite resolution bucket is required.")
+    return buckets
+
+
 def relative_mse(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     numerator = (prediction.float() - target.float()).pow(2).mean()
     denominator = target.float().pow(2).mean().clamp_min(1e-6)
@@ -359,7 +417,10 @@ class DreamLiteFrozenController:
         source_images: Sequence[Image.Image] | None,
         height: int,
         width: int,
+        time_id_height: int | None = None,
+        time_id_width: int | None = None,
         batch_size: int,
+        call_index: int | None = None,
     ) -> DreamLiteFunctionalResult:
         effect_batch = min(batch_size, student.prompt_embeds.shape[0])
         student = DreamLiteCondition(
@@ -384,24 +445,58 @@ class DreamLiteFrozenController:
             initial,
             num_steps=self.num_steps,
         )
-        call_index = int(torch.randint(len(timesteps), (1,), device=initial.device).item())
+        if call_index is None:
+            call_index = int(
+                torch.randint(len(timesteps), (1,), device=initial.device).item()
+            )
+        if not 0 <= call_index < len(timesteps):
+            raise ValueError(
+                f"call_index={call_index} is outside the {len(timesteps)}-call schedule"
+            )
+        # Calls after the first never see fresh Gaussian noise in deployment.
+        # Build the native prefix without gradients, then compare teacher and
+        # student predictions on exactly the same detached state.
+        shared_state = initial
+        with torch.no_grad():
+            for prefix_timestep in timesteps[:call_index]:
+                teacher_prefix = self.backend.predict(
+                    shared_state,
+                    prefix_timestep,
+                    teacher,
+                    source_latents=source,
+                    height=height,
+                    width=width,
+                    time_id_height=time_id_height,
+                    time_id_width=time_id_width,
+                )
+                shared_state = scheduler.step(
+                    teacher_prefix,
+                    prefix_timestep,
+                    shared_state,
+                    return_dict=False,
+                )[0]
+        shared_state = shared_state.detach()
         timestep = timesteps[call_index]
         with torch.no_grad():
             teacher_prediction = self.backend.predict(
-                initial,
+                shared_state,
                 timestep,
                 teacher,
                 source_latents=source,
                 height=height,
                 width=width,
+                time_id_height=time_id_height,
+                time_id_width=time_id_width,
             )
         student_prediction = self.backend.predict(
-            initial,
+            shared_state,
             timestep,
             student,
             source_latents=source,
             height=height,
             width=width,
+            time_id_height=time_id_height,
+            time_id_width=time_id_width,
         )
         return DreamLiteFunctionalResult(
             relative_mse=relative_mse(student_prediction, teacher_prediction),
