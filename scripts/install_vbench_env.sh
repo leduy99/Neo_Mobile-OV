@@ -36,7 +36,10 @@ git -C "${VBENCH_REPO}" checkout --detach "${VBENCH_COMMIT}"
 
 ${PIP} install -r "${VBENCH_REPO}/requirements.txt"
 if ! "${PYTHON}" -c 'import detectron2' >/dev/null 2>&1; then
-  ${PIP} install 'detectron2@git+https://github.com/facebookresearch/detectron2.git@v0.6'
+  # Detectron2 imports torch from setup.py, so its build must see the torch
+  # already installed in the VBench environment.
+  ${PIP} install --no-build-isolation \
+    'detectron2@git+https://github.com/facebookresearch/detectron2.git@v0.6'
 fi
 ${PIP} install --no-deps -e "${VBENCH_REPO}"
 "${PYTHON}" -c 'import torch, vbench, detectron2; print(torch.__version__, torch.version.cuda, vbench.__file__)'
