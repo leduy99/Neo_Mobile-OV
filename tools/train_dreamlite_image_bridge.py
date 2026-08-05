@@ -35,6 +35,7 @@ from new_mobile_ov.training.dreamlite_distillation import (
     DreamLiteFrozenQwenTeacher,
     DreamLiteFunctionalResult,
     DreamLiteResolutionBucket,
+    dreamlite_content_aware_representation_losses,
     dreamlite_direct_representation_losses,
     dreamlite_representation_losses,
     parse_dreamlite_resolution_buckets,
@@ -101,6 +102,80 @@ class CaptionDataset(Dataset):
             weights=[weight for _, weight in choices],
             k=1,
         )[0]
+
+
+class CompositionalPromptDataset(Dataset):
+    """Large deterministic prompt curriculum without benchmark prompt leakage."""
+
+    COLORS = (
+        "red", "blue", "green", "yellow", "orange", "white", "black", "silver",
+        "turquoise", "magenta",
+    )
+    OBJECTS = (
+        ("astronaut", "astronauts"),
+        ("red panda", "red pandas"),
+        ("ceramic teapot", "ceramic teapots"),
+        ("kingfisher", "kingfishers"),
+        ("robot", "robots"),
+        ("bicycle", "bicycles"),
+        ("sailboat", "sailboats"),
+        ("fox", "foxes"),
+        ("glass sculpture", "glass sculptures"),
+        ("vintage camera", "vintage cameras"),
+        ("origami crane", "origami cranes"),
+        ("steam locomotive", "steam locomotives"),
+    )
+    ACTIONS = (
+        "standing beside a quiet lake", "walking through fresh snow",
+        "floating above a futuristic city", "resting on a wooden table",
+        "crossing a narrow stone bridge", "surrounded by wildflowers",
+        "under dramatic studio lighting", "reflected in a rain-covered window",
+    )
+    STYLES = (
+        "cinematic photograph", "detailed product photograph", "documentary photograph",
+        "watercolor illustration", "35mm film photograph", "minimalist poster",
+    )
+    RELATIONS = (
+        "to the left of", "to the right of", "behind", "in front of", "above", "below",
+    )
+    TEXTS = ("NORTH", "OPEN", "MOON", "CAFE", "2049", "DREAM")
+    COUNTS = (("one", 1), ("two", 2), ("three", 3), ("four", 4), ("five", 5))
+
+    def __init__(self, length: int, *, seed: int) -> None:
+        self.length = max(int(length), 1)
+        self.seed = int(seed)
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, index: int) -> str:
+        rng = random.Random(self.seed + 1000003 * int(index))
+        kind = rng.randrange(5)
+        color = rng.choice(self.COLORS)
+        singular, plural = rng.choice(self.OBJECTS)
+        action = rng.choice(self.ACTIONS)
+        style = rng.choice(self.STYLES)
+        if kind == 0:
+            count_word, count = rng.choice(self.COUNTS)
+            noun = singular if count == 1 else plural
+            return f"A {style} of {count_word} {color} {noun} {action}."
+        if kind == 1:
+            other_color = rng.choice([value for value in self.COLORS if value != color])
+            other, _ = rng.choice([value for value in self.OBJECTS if value[0] != singular])
+            relation = rng.choice(self.RELATIONS)
+            return f"A {color} {singular} {relation} a {other_color} {other}, {style}."
+        if kind == 2:
+            return (
+                f'A {style} of a {color} {singular} beside a sign clearly reading '
+                f'"{rng.choice(self.TEXTS)}".'
+            )
+        if kind == 3:
+            material = rng.choice(("glass", "wooden", "metal", "porcelain", "paper"))
+            return f"A highly detailed {material} {singular} {action}, centered in a {style}."
+        return (
+            f"Wide composition: a small {color} {singular} {action}; keep the full subject "
+            f"visible with generous background space, {style}."
+        )
 
 
 class EditDataset(Dataset):
@@ -212,6 +287,26 @@ def projected_representation_total(
     )
 
 
+def content_aware_representation_total(
+    losses: dict[str, torch.Tensor],
+    args,
+    *,
+    projected: bool,
+) -> torch.Tensor:
+    scale = args.projected_content_scale if projected else 1.0
+    return scale * (
+        args.content_token_mse_weight * losses["content_token_normalized_mse"]
+        + args.content_token_cos_weight * losses["content_token_cosine"]
+        + args.wrapper_token_weight
+        * (
+            0.5 * losses["wrapper_token_normalized_mse"]
+            + losses["wrapper_token_cosine"]
+        )
+        + args.content_pooled_cos_weight * losses["content_pooled_cosine"]
+        + args.semantic_contrastive_weight * losses["semantic_contrastive"]
+    )
+
+
 def choose_resolution_bucket(
     buckets: list[DreamLiteResolutionBucket],
     *,
@@ -256,6 +351,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--caption-variant-columns", default="caption_short,caption_medium,caption_long")
     parser.add_argument("--caption-variant-weights", default="1,1,1")
     parser.add_argument("--caption-fallback-column", default="caption")
+    parser.add_argument("--semantic-prompt-probability", type=float, default=0.0)
+    parser.add_argument("--semantic-prompt-seed", type=int, default=73129)
     parser.add_argument("--token-mse-weight", type=float, default=0.50)
     parser.add_argument("--token-cos-weight", type=float, default=1.00)
     parser.add_argument("--token-norm-weight", type=float, default=0.05)
@@ -273,12 +370,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--projected-weight", type=float, default=0.0)
     parser.add_argument("--projected-pooled-cos-weight", type=float, default=0.5)
     parser.add_argument("--projected-moment-weight", type=float, default=0.25)
+    parser.add_argument("--content-prefix-tokens", type=int, default=3)
+    parser.add_argument("--content-suffix-tokens", type=int, default=5)
+    parser.add_argument("--content-token-mse-weight", type=float, default=0.5)
+    parser.add_argument("--content-token-cos-weight", type=float, default=1.0)
+    parser.add_argument("--wrapper-token-weight", type=float, default=0.25)
+    parser.add_argument("--content-pooled-cos-weight", type=float, default=0.1)
+    parser.add_argument("--semantic-contrastive-weight", type=float, default=0.2)
+    parser.add_argument("--contrastive-temperature", type=float, default=0.07)
+    parser.add_argument("--projected-content-scale", type=float, default=1.0)
     parser.add_argument("--representation-final-scale", type=float, default=0.25)
     parser.add_argument("--functional-weight", type=float, default=5.0)
     parser.add_argument("--functional-cos-weight", type=float, default=0.5)
     parser.add_argument("--functional-start-step", type=int, default=10001)
     parser.add_argument("--functional-ramp-steps", type=int, default=5000)
     parser.add_argument("--functional-batch-size", type=int, default=1)
+    parser.add_argument("--functional-call-weights", default="1,1,1,1")
+    parser.add_argument("--transition-weight", type=float, default=0.0)
+    parser.add_argument("--transition-cos-weight", type=float, default=0.0)
+    parser.add_argument("--student-state-probability", type=float, default=0.0)
+    parser.add_argument("--student-state-start-step", type=int, default=30001)
+    parser.add_argument("--student-state-ramp-steps", type=int, default=20000)
     parser.add_argument("--closed-loop-weight", type=float, default=2.0)
     parser.add_argument("--closed-loop-prediction-weight", type=float, default=0.5)
     parser.add_argument("--closed-loop-cos-weight", type=float, default=0.1)
@@ -343,6 +455,25 @@ def main() -> None:
         num_workers=0,
         drop_last=True,
     )
+    semantic_data = CompositionalPromptDataset(
+        len(generation_data),
+        seed=args.semantic_prompt_seed,
+    )
+    semantic_sampler = DistributedSampler(
+        semantic_data,
+        num_replicas=context.world_size,
+        rank=context.rank,
+        shuffle=True,
+        seed=args.seed + 31,
+    ) if context.is_distributed else None
+    semantic_loader = DataLoader(
+        semantic_data,
+        batch_size=args.batch_size,
+        sampler=semantic_sampler,
+        shuffle=semantic_sampler is None,
+        num_workers=0,
+        drop_last=True,
+    )
     edit_loader = None
     edit_sampler = None
     if args.edit_manifest:
@@ -387,6 +518,22 @@ def main() -> None:
         device=context.device,
         dtype=inference_dtype,
     )
+    if not 0.0 <= args.semantic_prompt_probability <= 1.0:
+        raise ValueError("semantic prompt probability must be in [0, 1]")
+    if not 0.0 <= args.student_state_probability <= 1.0:
+        raise ValueError("student state probability must be in [0, 1]")
+    functional_call_weights = [
+        float(value) for value in split_csv(args.functional_call_weights)
+    ]
+    if (
+        len(functional_call_weights) != controller.num_steps
+        or any(value < 0 for value in functional_call_weights)
+        or sum(functional_call_weights) <= 0
+    ):
+        raise ValueError(
+            f"functional call weights must contain {controller.num_steps} "
+            "non-negative values with a positive sum"
+        )
     trainable = [parameter for parameter in bridge.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01)
     current_step = 0
@@ -407,6 +554,7 @@ def main() -> None:
         f"DreamLite bridge distillation: world_size={context.world_size} "
         f"batch_per_gpu={args.batch_size} global_batch={args.batch_size * context.world_size} "
         f"trainable_params={trainable_count:,} generation_rows={len(generation_data)} "
+        f"semantic_rows={len(semantic_data)} semantic_probability={args.semantic_prompt_probability:g} "
         f"edit_rows={len(edit_loader.dataset) if edit_loader else 0} target_step={args.target_step}",
     )
     rank0_print(
@@ -417,6 +565,8 @@ def main() -> None:
     generation_epoch = 0
     edit_epoch = 0
     generation_iter = iter(generation_loader)
+    semantic_epoch = 0
+    semantic_iter = iter(semantic_loader)
     edit_iter = iter(edit_loader) if edit_loader else None
     history_path = output_dir / "history.jsonl"
     progress = tqdm(
@@ -449,6 +599,17 @@ def main() -> None:
             edit_iter = iter(edit_loader)
             return next(edit_iter)
 
+    def next_semantic():
+        nonlocal semantic_iter, semantic_epoch
+        try:
+            return next(semantic_iter)
+        except StopIteration:
+            semantic_epoch += 1
+            if semantic_sampler is not None:
+                semantic_sampler.set_epoch(semantic_epoch)
+            semantic_iter = iter(semantic_loader)
+            return next(semantic_iter)
+
     try:
         while current_step < args.target_step:
             current_step += 1
@@ -468,18 +629,34 @@ def main() -> None:
                 seed=args.seed,
                 step=current_step,
             )
-            functional_call_index = random.Random(
-                args.seed + 130363 * current_step
-            ).randrange(controller.num_steps)
+            functional_rng = random.Random(args.seed + 130363 * current_step)
+            functional_call_index = functional_rng.choices(
+                range(controller.num_steps),
+                weights=functional_call_weights,
+                k=1,
+            )[0]
+            student_state_scale = linear_ramp(
+                current_step,
+                start_step=args.student_state_start_step,
+                ramp_steps=args.student_state_ramp_steps,
+            )
+            student_state_probability = args.student_state_probability * student_state_scale
+            functional_state_source = (
+                "student" if functional_rng.random() < student_state_probability else "teacher"
+            )
             use_edit = edit_loader is not None and mode_rng.random() < args.edit_probability
             if use_edit:
                 image_paths, prompts = next_edit()
                 images = [Image.open(path).convert("RGB") for path in image_paths]
                 mode = "edit"
             else:
-                prompts = list(next_generation())
+                use_semantic_prompts = (
+                    mode_rng.random() < args.semantic_prompt_probability
+                )
+                prompts = list(next_semantic() if use_semantic_prompts else next_generation())
                 images = None
                 mode = "generate"
+                prompt_source = "semantic" if use_semantic_prompts else "openvid"
             optimizer.zero_grad(set_to_none=True)
             autocast_enabled = context.device.type == "cuda" and inference_dtype != torch.float32
             with torch.autocast(
@@ -489,8 +666,36 @@ def main() -> None:
             ):
                 student = bridge(prompts, mode=mode, images=images)
                 teacher_condition = teacher.encode(prompts, mode=mode, images=images)
+                use_content_alignment = args.training_version.lower() == "v5" and mode == "generate"
                 use_direct_alignment = args.representation_mode == "direct" and mode == "generate"
-                if use_direct_alignment:
+                if use_content_alignment:
+                    repr_losses = dreamlite_content_aware_representation_losses(
+                        student,
+                        teacher_condition,
+                        prefix_tokens=args.content_prefix_tokens,
+                        suffix_tokens=args.content_suffix_tokens,
+                        contrastive_temperature=args.contrastive_temperature,
+                    )
+                    projected_student = controller.project_condition(student)
+                    projected_teacher = controller.project_condition(teacher_condition)
+                    projected_losses = dreamlite_content_aware_representation_losses(
+                        projected_student,
+                        projected_teacher,
+                        prefix_tokens=args.content_prefix_tokens,
+                        suffix_tokens=args.content_suffix_tokens,
+                        contrastive_temperature=args.contrastive_temperature,
+                    )
+                    projected_value = content_aware_representation_total(
+                        projected_losses,
+                        args,
+                        projected=True,
+                    )
+                    repr_value = content_aware_representation_total(
+                        repr_losses,
+                        args,
+                        projected=False,
+                    ) + args.projected_weight * projected_value
+                elif use_direct_alignment:
                     repr_losses = dreamlite_direct_representation_losses(student, teacher_condition)
                     projected_student = controller.project_condition(student)
                     projected_teacher = controller.project_condition(teacher_condition)
@@ -499,12 +704,14 @@ def main() -> None:
                         projected_teacher,
                     )
                     projected_value = projected_representation_total(projected_losses, args)
+                    repr_value = representation_total(repr_losses, args)
+                    repr_value = repr_value + args.projected_weight * projected_value
                 else:
                     repr_losses = dreamlite_representation_losses(student, teacher_condition)
                     projected_losses = None
                     projected_value = student.prompt_embeds.new_zeros((), dtype=torch.float32)
-                repr_value = representation_total(repr_losses, args)
-                repr_value = repr_value + args.projected_weight * projected_value
+                    repr_value = representation_total(repr_losses, args)
+                    repr_value = repr_value + args.projected_weight * projected_value
                 if args.closed_loop_weight <= 0 or current_step < args.closed_loop_start_step:
                     repr_scale = 1.0
                 else:
@@ -512,7 +719,10 @@ def main() -> None:
                 functional = DreamLiteFunctionalResult(
                     relative_mse=repr_value.new_zeros(()),
                     cosine=repr_value.new_zeros(()),
+                    transition_relative_mse=repr_value.new_zeros(()),
+                    transition_cosine=repr_value.new_zeros(()),
                     call_index=-1,
+                    state_source="none",
                 )
                 closed = DreamLiteClosedLoopResult(
                     prediction_relative_mse=repr_value.new_zeros(()),
@@ -559,6 +769,7 @@ def main() -> None:
                         time_id_width=resolution.time_id_width,
                         batch_size=args.functional_batch_size,
                         call_index=functional_call_index,
+                        state_source=functional_state_source,
                     )
                 else:
                     phase = "representation"
@@ -566,6 +777,8 @@ def main() -> None:
                 loss = loss + functional_scale * (
                     args.functional_weight * functional.relative_mse
                     + args.functional_cos_weight * functional.cosine
+                    + args.transition_weight * functional.transition_relative_mse
+                    + args.transition_cos_weight * functional.transition_cosine
                 )
                 loss = loss + closed_scale * args.closed_loop_weight * (
                     args.closed_loop_prediction_weight * closed.prediction_relative_mse
@@ -583,6 +796,7 @@ def main() -> None:
                 item = {
                     "step": current_step,
                     "mode": mode,
+                    "prompt_source": prompt_source if mode == "generate" else "edit",
                     "phase": phase,
                     "resolution_bucket": resolution.label,
                     "actual_width": resolution.width,
@@ -592,8 +806,30 @@ def main() -> None:
                     "loss": scalar_mean(loss.detach(), context),
                     "representation": scalar_mean(repr_value.detach(), context),
                     "projected_representation": scalar_mean(projected_value.detach(), context),
-                    "token_cosine": scalar_mean(repr_losses["token_cosine"].detach(), context),
-                    "pooled_cosine": scalar_mean(repr_losses["pooled_cosine"].detach(), context),
+                    "token_cosine": scalar_mean(
+                        repr_losses.get("token_cosine", repr_losses.get("content_token_cosine")).detach(),
+                        context,
+                    ),
+                    "pooled_cosine": scalar_mean(
+                        repr_losses.get("pooled_cosine", repr_losses.get("content_pooled_cosine")).detach(),
+                        context,
+                    ),
+                    "content_token_cosine": scalar_mean(
+                        repr_losses.get("content_token_cosine", repr_value.new_zeros(())).detach(),
+                        context,
+                    ),
+                    "wrapper_token_cosine": scalar_mean(
+                        repr_losses.get("wrapper_token_cosine", repr_value.new_zeros(())).detach(),
+                        context,
+                    ),
+                    "semantic_contrastive": scalar_mean(
+                        repr_losses.get("semantic_contrastive", repr_value.new_zeros(())).detach(),
+                        context,
+                    ),
+                    "content_fraction": scalar_mean(
+                        repr_losses.get("content_fraction", repr_value.new_zeros(())).detach(),
+                        context,
+                    ),
                     "token_mean": scalar_mean(
                         repr_losses.get("token_mean", repr_value.new_zeros(())).detach(),
                         context,
@@ -608,6 +844,11 @@ def main() -> None:
                     ),
                     "functional_relative_mse": scalar_mean(functional.relative_mse.detach(), context),
                     "functional_call_index": functional.call_index,
+                    "functional_state_source": functional.state_source,
+                    "functional_transition_relative_mse": scalar_mean(
+                        functional.transition_relative_mse.detach(),
+                        context,
+                    ),
                     "closed_terminal_relative_mse": scalar_mean(closed.terminal_relative_mse.detach(), context),
                     "grad_norm": scalar_mean(torch.as_tensor(grad_norm, device=context.device), context),
                     "lr": optimizer.param_groups[0]["lr"],
@@ -622,14 +863,19 @@ def main() -> None:
                 if context.is_main:
                     with history_path.open("a", encoding="utf-8") as handle:
                         handle.write(json.dumps(item) + "\n")
-                    progress.set_postfix(
-                        mode=mode,
-                        phase=phase,
-                        loss=f"{item['loss']:.4f}",
-                        func=f"{item['functional_relative_mse']:.4f}",
-                        roll=f"{item['closed_terminal_relative_mse']:.4f}",
-                        res=resolution.label,
-                    )
+                    postfix = {
+                        "mode": mode,
+                        "phase": phase,
+                        "loss": f"{item['loss']:.4f}",
+                        "func": f"{item['functional_relative_mse']:.4f}",
+                        "res": resolution.label,
+                    }
+                    if args.training_version.lower() == "v5":
+                        postfix["trans"] = f"{item['functional_transition_relative_mse']:.4f}"
+                        postfix["state"] = item["functional_state_source"]
+                    else:
+                        postfix["roll"] = f"{item['closed_terminal_relative_mse']:.4f}"
+                    progress.set_postfix(**postfix)
             progress.update(1)
 
             save_latest = current_step % args.save_latest_every == 0 or current_step == args.target_step
@@ -644,7 +890,9 @@ def main() -> None:
                         "optimizer": optimizer.state_dict(),
                         "config": vars(args),
                         "architecture": (
-                            "MobileOVDreamLiteCompactBridgeV4"
+                            "MobileOVDreamLiteCompactBridgeV5"
+                            if args.training_version.lower() == "v5"
+                            else "MobileOVDreamLiteCompactBridgeV4"
                             if args.training_version.lower() == "v4"
                             else "MobileOVDreamLiteCompactBridgeV3"
                             if args.representation_mode == "direct"
@@ -653,7 +901,9 @@ def main() -> None:
                         "teacher": "Qwen3-VL BF16 from DreamLite-mobile",
                         "functional_teacher": (
                             "frozen DreamLite-mobile UNet, native 4-call schedule, "
-                            "same-state teacher-forced prefixes"
+                            "mixed teacher/student-prefix same-state prediction and transition distillation"
+                            if args.training_version.lower() == "v5"
+                            else "same-state teacher-forced prefixes"
                             if args.training_version.lower() == "v4"
                             else "frozen DreamLite-mobile UNet, native 4-call schedule"
                         ),

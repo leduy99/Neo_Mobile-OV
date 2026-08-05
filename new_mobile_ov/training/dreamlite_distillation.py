@@ -27,7 +27,10 @@ from new_mobile_ov.training.neodragon_objectives import (
 class DreamLiteFunctionalResult:
     relative_mse: torch.Tensor
     cosine: torch.Tensor
+    transition_relative_mse: torch.Tensor
+    transition_cosine: torch.Tensor
     call_index: int
+    state_source: str
 
 
 @dataclass
@@ -257,6 +260,119 @@ def dreamlite_direct_representation_losses(
     }
 
 
+def _content_and_wrapper_masks(
+    common_mask: torch.Tensor,
+    *,
+    prefix_tokens: int,
+    suffix_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split DreamLite's retained Qwen sequence into prompt and template tokens."""
+
+    content_mask = torch.zeros_like(common_mask)
+    for row_index, row_mask in enumerate(common_mask):
+        valid_length = int(row_mask.sum().item())
+        content_start = min(max(int(prefix_tokens), 0), valid_length)
+        content_end = max(content_start, valid_length - max(int(suffix_tokens), 0))
+        if content_end == content_start and valid_length > 0:
+            content_start = min(content_start, valid_length - 1)
+            content_end = content_start + 1
+        content_mask[row_index, content_start:content_end] = True
+    content_mask &= common_mask
+    return content_mask, common_mask & ~content_mask
+
+
+def _masked_direct_token_losses(
+    student_tokens: torch.Tensor,
+    teacher_tokens: torch.Tensor,
+    mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not bool(mask.any()):
+        zero = student_tokens.new_zeros(())
+        return zero, zero
+    student_normalized = F.layer_norm(student_tokens, (student_tokens.shape[-1],))
+    teacher_normalized = F.layer_norm(teacher_tokens, (teacher_tokens.shape[-1],))
+    token_mse = (student_normalized - teacher_normalized).pow(2).mean(dim=-1)
+    token_cosine = 1.0 - F.cosine_similarity(student_tokens, teacher_tokens, dim=-1)
+    return (
+        _masked_token_average(token_mse, mask),
+        _masked_token_average(token_cosine, mask),
+    )
+
+
+def _semantic_contrastive_loss(
+    student_pool: torch.Tensor,
+    teacher_pool: torch.Tensor,
+    *,
+    temperature: float,
+) -> torch.Tensor:
+    if student_pool.shape[0] < 2:
+        return student_pool.new_zeros(())
+    temperature = max(float(temperature), 1e-4)
+    logits = F.normalize(student_pool, dim=-1) @ F.normalize(teacher_pool, dim=-1).T
+    logits = logits / temperature
+    labels = torch.arange(logits.shape[0], device=logits.device)
+    return 0.5 * (
+        F.cross_entropy(logits, labels)
+        + F.cross_entropy(logits.T, labels)
+    )
+
+
+def dreamlite_content_aware_representation_losses(
+    student: DreamLiteCondition,
+    teacher: DreamLiteCondition,
+    *,
+    prefix_tokens: int = 3,
+    suffix_tokens: int = 5,
+    contrastive_temperature: float = 0.07,
+) -> dict[str, torch.Tensor]:
+    """Prioritize prompt semantics while retaining weak template supervision."""
+
+    common_length = min(student.prompt_embeds.shape[1], teacher.prompt_embeds.shape[1])
+    if common_length < 1:
+        raise RuntimeError("DreamLite conditions must contain at least one token.")
+    student_tokens = student.prompt_embeds[:, :common_length].float()
+    teacher_tokens = teacher.prompt_embeds[:, :common_length].float()
+    student_mask = student.attention_mask[:, :common_length].bool()
+    teacher_mask = teacher.attention_mask[:, :common_length].bool()
+    common_mask = student_mask & teacher_mask
+    if not bool(common_mask.any()):
+        raise RuntimeError("Student and teacher DreamLite conditions share no valid tokens.")
+    content_mask, wrapper_mask = _content_and_wrapper_masks(
+        common_mask,
+        prefix_tokens=prefix_tokens,
+        suffix_tokens=suffix_tokens,
+    )
+    content_mse, content_cosine = _masked_direct_token_losses(
+        student_tokens,
+        teacher_tokens,
+        content_mask,
+    )
+    wrapper_mse, wrapper_cosine = _masked_direct_token_losses(
+        student_tokens,
+        teacher_tokens,
+        wrapper_mask,
+    )
+    student_content_pool = _masked_mean(student_tokens, content_mask)
+    teacher_content_pool = _masked_mean(teacher_tokens, content_mask)
+    return {
+        "content_token_normalized_mse": content_mse,
+        "content_token_cosine": content_cosine,
+        "wrapper_token_normalized_mse": wrapper_mse,
+        "wrapper_token_cosine": wrapper_cosine,
+        "content_pooled_cosine": pooled_cosine(
+            student_content_pool,
+            teacher_content_pool,
+        ),
+        "semantic_contrastive": _semantic_contrastive_loss(
+            student_content_pool,
+            teacher_content_pool,
+            temperature=contrastive_temperature,
+        ),
+        "content_fraction": content_mask.float().sum() / common_mask.float().sum().clamp_min(1.0),
+        "mask_agreement": (student_mask == teacher_mask).float().mean(),
+    }
+
+
 class DreamLiteFrozenQwenTeacher:
     """Native BF16 Qwen3-VL condition used only while distilling the bridge."""
 
@@ -421,6 +537,7 @@ class DreamLiteFrozenController:
         time_id_width: int | None = None,
         batch_size: int,
         call_index: int | None = None,
+        state_source: str = "teacher",
     ) -> DreamLiteFunctionalResult:
         effect_batch = min(batch_size, student.prompt_embeds.shape[0])
         student = DreamLiteCondition(
@@ -439,12 +556,20 @@ class DreamLiteFrozenController:
             height=height,
             width=width,
         )
-        scheduler = self.backend.make_scheduler()
+        teacher_scheduler = self.backend.make_scheduler()
+        student_scheduler = self.backend.make_scheduler()
         timesteps = self.backend.prepare_schedule(
-            scheduler,
+            teacher_scheduler,
             initial,
             num_steps=self.num_steps,
         )
+        student_timesteps = self.backend.prepare_schedule(
+            student_scheduler,
+            initial,
+            num_steps=self.num_steps,
+        )
+        if len(student_timesteps) != len(timesteps):
+            raise RuntimeError("DreamLite teacher/student schedulers produced different call counts.")
         if call_index is None:
             call_index = int(
                 torch.randint(len(timesteps), (1,), device=initial.device).item()
@@ -453,28 +578,38 @@ class DreamLiteFrozenController:
             raise ValueError(
                 f"call_index={call_index} is outside the {len(timesteps)}-call schedule"
             )
-        # Calls after the first never see fresh Gaussian noise in deployment.
-        # Build the native prefix without gradients, then compare teacher and
-        # student predictions on exactly the same detached state.
+        if state_source not in {"teacher", "student"}:
+            raise ValueError(f"Unsupported functional state_source={state_source!r}")
+        prefix_condition = teacher if state_source == "teacher" else student
+        # Both schedulers consume the same detached prefix predictions. At call
+        # k teacher and student therefore see one identical state, including for
+        # the on-policy student-state branch.
         shared_state = initial
         with torch.no_grad():
             for prefix_timestep in timesteps[:call_index]:
-                teacher_prefix = self.backend.predict(
+                prefix_prediction = self.backend.predict(
                     shared_state,
                     prefix_timestep,
-                    teacher,
+                    prefix_condition,
                     source_latents=source,
                     height=height,
                     width=width,
                     time_id_height=time_id_height,
                     time_id_width=time_id_width,
                 )
-                shared_state = scheduler.step(
-                    teacher_prefix,
+                next_state = teacher_scheduler.step(
+                    prefix_prediction,
                     prefix_timestep,
                     shared_state,
                     return_dict=False,
                 )[0]
+                student_scheduler.step(
+                    prefix_prediction,
+                    prefix_timestep,
+                    shared_state,
+                    return_dict=False,
+                )
+                shared_state = next_state
         shared_state = shared_state.detach()
         timestep = timesteps[call_index]
         with torch.no_grad():
@@ -498,10 +633,26 @@ class DreamLiteFrozenController:
             time_id_height=time_id_height,
             time_id_width=time_id_width,
         )
+        with torch.no_grad():
+            teacher_next = teacher_scheduler.step(
+                teacher_prediction,
+                timestep,
+                shared_state,
+                return_dict=False,
+            )[0]
+        student_next = student_scheduler.step(
+            student_prediction,
+            student_timesteps[call_index],
+            shared_state,
+            return_dict=False,
+        )[0]
         return DreamLiteFunctionalResult(
             relative_mse=relative_mse(student_prediction, teacher_prediction),
             cosine=flat_cosine_distance(student_prediction, teacher_prediction),
+            transition_relative_mse=relative_mse(student_next, teacher_next),
+            transition_cosine=flat_cosine_distance(student_next, teacher_next),
             call_index=call_index,
+            state_source=state_source,
         )
 
     def closed_loop_loss(

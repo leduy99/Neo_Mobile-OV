@@ -1,0 +1,53 @@
+bridge:
+  smolvlm2_ckpt_path: checkpoints/smolvlm2_500m/smolvlm2_500m.pt
+  adapter_ckpt_dir:
+  tokenizer_model_id: HuggingFaceTB/SmolVLM2-500M-Video-Instruct
+  max_length: 256
+
+dreamlite_bridge:
+  sequence_length: 128
+  condition_dim: 2048
+  attention_dim: 384
+  num_heads: 6
+  num_layers: 2
+  num_fuse_layers: 4
+  lexical_gate_init: 0.2
+  ff_mult: 3
+  dropout: 0.0
+  disable_image_splitting: true
+  processor_model_id: HuggingFaceTB/SmolVLM2-500M-Video-Instruct
+  variable_length_generation: true
+  native_tokenizer_path: checkpoints/dreamlite-mobile/tokenizer
+  native_generation_prefix_tokens: 34
+
+dreamlite:
+  enabled: true
+  model_id: carlofkl/DreamLite-mobile
+  revision: diffusers
+  checkpoint_dir: checkpoints/dreamlite-mobile
+  num_inference_steps: 4
+  height: 512
+  width: 512
+
+backend:
+  name: mobile_ov_neodragon
+  dtype: bf16
+  extra:
+    repo_path: checkpoints/neodragon_repo
+    cache_dir: checkpoints/neodragon
+    repo_url: https://github.com/Qualcomm-AI-research/neodragon.git
+    mode: hybrid
+    model_id: karnewar/Neodragon
+
+data:
+  output_dir: output/dreamlite_compact_v5
+  height: 512
+  width: 512
+
+train:
+  batch_size: 4
+  lr: 0.00004
+  total_steps: 120000
+  log_every: 20
+  save_every: 5000
+  dtype: bf16

@@ -13,6 +13,7 @@ from new_mobile_ov.bridge.dreamlite_image_bridge import (
 from new_mobile_ov.config import BridgeConfig, DreamLiteBridgeConfig
 from new_mobile_ov.training.dreamlite_distillation import (
     DreamLiteFrozenController,
+    dreamlite_content_aware_representation_losses,
     dreamlite_direct_representation_losses,
     dreamlite_representation_losses,
     parse_dreamlite_resolution_buckets,
@@ -164,6 +165,33 @@ def test_direct_losses_ignore_padding_and_are_zero_for_identical_tokens() -> Non
     assert torch.isfinite(student_tokens.grad).all()
 
 
+def test_content_aware_losses_separate_prompt_and_wrapper_tokens() -> None:
+    tokens = torch.randn(2, 12, 32)
+    mask = torch.ones(2, 12, dtype=torch.long)
+    student_tokens = tokens.clone()
+    # With 3 prefix and 5 suffix tokens, positions 3:7 are prompt content.
+    student_tokens[:, 3:7] += 0.5
+    student_tokens.requires_grad_(True)
+    losses = dreamlite_content_aware_representation_losses(
+        DreamLiteCondition(student_tokens, mask),
+        DreamLiteCondition(tokens, mask),
+        prefix_tokens=3,
+        suffix_tokens=5,
+    )
+
+    assert losses["content_token_cosine"] > 0
+    assert torch.allclose(losses["wrapper_token_cosine"], torch.zeros(()), atol=1e-6)
+    assert torch.allclose(losses["content_fraction"], torch.tensor(1 / 3), atol=1e-6)
+    total = sum(
+        value
+        for name, value in losses.items()
+        if name not in {"mask_agreement", "content_fraction"}
+    )
+    total.backward()
+    assert student_tokens.grad is not None
+    assert student_tokens.grad[:, 3:7].norm() > 0
+
+
 def test_resolution_bucket_parser_keeps_actual_and_logical_sizes_separate() -> None:
     buckets = parse_dreamlite_resolution_buckets(
         "512x512@1024x1024:20,1024x640@1280x800:10"
@@ -243,7 +271,12 @@ def test_functional_loss_uses_teacher_prefix_and_one_shared_target_state() -> No
         batch_size=1,
         call_index=2,
     )
-    (result.relative_mse + result.cosine).backward()
+    (
+        result.relative_mse
+        + result.cosine
+        + result.transition_relative_mse
+        + result.transition_cosine
+    ).backward()
 
     calls = controller.backend.calls
     assert len(calls) == 4  # Two teacher prefix calls, then teacher/student at k=2.
@@ -252,5 +285,33 @@ def test_functional_loss_uses_teacher_prefix_and_one_shared_target_state() -> No
     assert calls[-1]["time_id_height"] == 800
     assert calls[-1]["time_id_width"] == 1280
     assert result.call_index == 2
+    assert result.state_source == "teacher"
     assert student_tokens.grad is not None
     assert torch.isfinite(student_tokens.grad).all()
+
+
+def test_functional_loss_can_use_detached_student_prefix_without_state_mismatch() -> None:
+    controller = DreamLiteFrozenController.__new__(DreamLiteFrozenController)
+    controller.backend = FakeDreamLiteBackend()
+    controller.num_steps = 4
+    student_tokens = torch.full((1, 5, 8), 0.75, requires_grad=True)
+    teacher_tokens = torch.full((1, 5, 8), 0.5)
+    mask = torch.ones(1, 5, dtype=torch.long)
+
+    result = controller.functional_loss(
+        DreamLiteCondition(student_tokens, mask),
+        DreamLiteCondition(teacher_tokens, mask),
+        source_images=None,
+        height=64,
+        width=96,
+        batch_size=1,
+        call_index=2,
+        state_source="student",
+    )
+    result.transition_relative_mse.backward()
+
+    calls = controller.backend.calls
+    assert len(calls) == 4
+    assert torch.equal(calls[-2]["latents"], calls[-1]["latents"])
+    assert result.state_source == "student"
+    assert student_tokens.grad is not None
