@@ -44,7 +44,10 @@ if ! "${PYTHON}" -c 'import detectron2' >/dev/null 2>&1; then
   MAX_JOBS="${DETECTRON2_MAX_JOBS}" ${PIP} install --no-build-isolation \
     "detectron2@git+https://github.com/facebookresearch/detectron2.git@${DETECTRON2_COMMIT}"
 fi
-${PIP} install --no-deps -e "${VBENCH_REPO}"
+"${PYTHON}" -c 'import torch; print(f"Installing VBench with torch={torch.__version__}")'
+# VBench's build metadata imports torch, so editable installation must use the
+# active environment instead of pip's temporary, torch-less build environment.
+${PIP} install --no-build-isolation --no-deps -e "${VBENCH_REPO}"
 "${PYTHON}" -c 'import torch, vbench, detectron2; print(torch.__version__, torch.version.cuda, vbench.__file__)'
 touch "${READY}"
 echo "VBench environment ready: ${VBENCH_ENV}"
