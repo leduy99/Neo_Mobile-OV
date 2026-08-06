@@ -6,7 +6,9 @@ BASE_PYTHON="${BASE_PYTHON:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov/bin/pytho
 VBENCH_ENV="${VBENCH_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_vbench}"
 VBENCH_REPO="${VBENCH_REPO:-${ROOT}/checkpoints/vbench_repo}"
 VBENCH_COMMIT="${VBENCH_COMMIT:-40e965bb183d44db976cba7d39eeb0eff85fb349}"
-READY="${VBENCH_ENV}/.mobileov_vbench_ready_${VBENCH_COMMIT}"
+DETECTRON2_COMMIT="${DETECTRON2_COMMIT:-e0ec4e189d438848521aee7926f9900e114229f5}"
+DETECTRON2_MAX_JOBS="${DETECTRON2_MAX_JOBS:-4}"
+READY="${VBENCH_ENV}/.mobileov_vbench_ready_${VBENCH_COMMIT}_${DETECTRON2_COMMIT}"
 
 if [[ -f "${READY}" ]] && "${VBENCH_ENV}/bin/python" -c 'import torch, vbench, detectron2' >/dev/null 2>&1; then
   echo "VBench environment already ready: ${VBENCH_ENV}"
@@ -37,9 +39,10 @@ git -C "${VBENCH_REPO}" checkout --detach "${VBENCH_COMMIT}"
 ${PIP} install -r "${VBENCH_REPO}/requirements.txt"
 if ! "${PYTHON}" -c 'import detectron2' >/dev/null 2>&1; then
   # Detectron2 imports torch from setup.py, so its build must see the torch
-  # already installed in the VBench environment.
-  ${PIP} install --no-build-isolation \
-    'detectron2@git+https://github.com/facebookresearch/detectron2.git@v0.6'
+  # already installed in the VBench environment. This commit is verified with
+  # Python 3.10 and torch 2.5.1+cu121; the 2021 v0.6 tag is not.
+  MAX_JOBS="${DETECTRON2_MAX_JOBS}" ${PIP} install --no-build-isolation \
+    "detectron2@git+https://github.com/facebookresearch/detectron2.git@${DETECTRON2_COMMIT}"
 fi
 ${PIP} install --no-deps -e "${VBENCH_REPO}"
 "${PYTHON}" -c 'import torch, vbench, detectron2; print(torch.__version__, torch.version.cuda, vbench.__file__)'

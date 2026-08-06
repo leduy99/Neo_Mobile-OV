@@ -11,7 +11,9 @@
 
 set -euo pipefail
 
-module load buildenv-nvhpc/24.5-cuda12.4
+# Detectron2 is compiled against the cu121 PyTorch installed by
+# install_vbench_env.sh, so use Berzelius's matching GCC/CUDA toolchain.
+module load buildenv-gcccuda/12.1.1-gcc12.3.0
 
 export PYTHONPATH="./:${PYTHONPATH:-}"
 export HF_HOME=/proj/cvl/users/x_fahkh2/caches
