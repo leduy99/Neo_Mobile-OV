@@ -69,7 +69,14 @@ class CaptionDataset(Dataset):
         frame = pd.read_csv(path, sep=sep, low_memory=False)
         fallback = fallback_column if fallback_column in frame.columns else None
         if fallback is None:
-            fallback = next((name for name in ("caption", "prompt", "text") if name in frame.columns), None)
+            fallback = next(
+                (
+                    name
+                    for name in ("caption", "prompt", "text")
+                    if name in frame.columns
+                ),
+                None,
+            )
         available_variants = [name for name in variant_columns if name in frame.columns]
         if fallback is None and not available_variants:
             raise ValueError(f"{path} has no caption, prompt, or text column.")
@@ -108,8 +115,16 @@ class CompositionalPromptDataset(Dataset):
     """Large deterministic prompt curriculum without benchmark prompt leakage."""
 
     COLORS = (
-        "red", "blue", "green", "yellow", "orange", "white", "black", "silver",
-        "turquoise", "magenta",
+        "red",
+        "blue",
+        "green",
+        "yellow",
+        "orange",
+        "white",
+        "black",
+        "silver",
+        "turquoise",
+        "magenta",
     )
     OBJECTS = (
         ("astronaut", "astronauts"),
@@ -126,17 +141,30 @@ class CompositionalPromptDataset(Dataset):
         ("steam locomotive", "steam locomotives"),
     )
     ACTIONS = (
-        "standing beside a quiet lake", "walking through fresh snow",
-        "floating above a futuristic city", "resting on a wooden table",
-        "crossing a narrow stone bridge", "surrounded by wildflowers",
-        "under dramatic studio lighting", "reflected in a rain-covered window",
+        "standing beside a quiet lake",
+        "walking through fresh snow",
+        "floating above a futuristic city",
+        "resting on a wooden table",
+        "crossing a narrow stone bridge",
+        "surrounded by wildflowers",
+        "under dramatic studio lighting",
+        "reflected in a rain-covered window",
     )
     STYLES = (
-        "cinematic photograph", "detailed product photograph", "documentary photograph",
-        "watercolor illustration", "35mm film photograph", "minimalist poster",
+        "cinematic photograph",
+        "detailed product photograph",
+        "documentary photograph",
+        "watercolor illustration",
+        "35mm film photograph",
+        "minimalist poster",
     )
     RELATIONS = (
-        "to the left of", "to the right of", "behind", "in front of", "above", "below",
+        "to the left of",
+        "to the right of",
+        "behind",
+        "in front of",
+        "above",
+        "below",
     )
     TEXTS = ("NORTH", "OPEN", "MOON", "CAFE", "2049", "DREAM")
     COUNTS = (("one", 1), ("two", 2), ("three", 3), ("four", 4), ("five", 5))
@@ -161,12 +189,14 @@ class CompositionalPromptDataset(Dataset):
             return f"A {style} of {count_word} {color} {noun} {action}."
         if kind == 1:
             other_color = rng.choice([value for value in self.COLORS if value != color])
-            other, _ = rng.choice([value for value in self.OBJECTS if value[0] != singular])
+            other, _ = rng.choice(
+                [value for value in self.OBJECTS if value[0] != singular]
+            )
             relation = rng.choice(self.RELATIONS)
             return f"A {color} {singular} {relation} a {other_color} {other}, {style}."
         if kind == 2:
             return (
-                f'A {style} of a {color} {singular} beside a sign clearly reading '
+                f"A {style} of a {color} {singular} beside a sign clearly reading "
                 f'"{rng.choice(self.TEXTS)}".'
             )
         if kind == 3:
@@ -193,13 +223,29 @@ class EditDataset(Dataset):
         else:
             sep = "\t" if path.suffix.lower() == ".tsv" else ","
             frame = pd.read_csv(path, sep=sep, low_memory=False)
-        image_column = image_column if image_column in frame.columns else next(
-            (name for name in ("source_image", "image_path", "image") if name in frame.columns),
-            "",
+        image_column = (
+            image_column
+            if image_column in frame.columns
+            else next(
+                (
+                    name
+                    for name in ("source_image", "image_path", "image")
+                    if name in frame.columns
+                ),
+                "",
+            )
         )
-        instruction_column = instruction_column if instruction_column in frame.columns else next(
-            (name for name in ("instruction", "edit_instruction", "prompt", "text") if name in frame.columns),
-            "",
+        instruction_column = (
+            instruction_column
+            if instruction_column in frame.columns
+            else next(
+                (
+                    name
+                    for name in ("instruction", "edit_instruction", "prompt", "text")
+                    if name in frame.columns
+                ),
+                "",
+            )
         )
         if not image_column or not instruction_column:
             raise ValueError(
@@ -249,12 +295,16 @@ def unwrap(model):
     return getattr(model, "module", model)
 
 
-def lr_scale(step: int, *, total_steps: int, warmup_steps: int, final_scale: float) -> float:
+def lr_scale(
+    step: int, *, total_steps: int, warmup_steps: int, final_scale: float
+) -> float:
     if step <= warmup_steps:
         return max(step / float(max(warmup_steps, 1)), 1e-3)
     progress = (step - warmup_steps) / float(max(total_steps - warmup_steps, 1))
     progress = min(max(progress, 0.0), 1.0)
-    return final_scale + (1.0 - final_scale) * 0.5 * (1.0 + math.cos(math.pi * progress))
+    return final_scale + (1.0 - final_scale) * 0.5 * (
+        1.0 + math.cos(math.pi * progress)
+    )
 
 
 def representation_total(losses: dict[str, torch.Tensor], args) -> torch.Tensor:
@@ -303,6 +353,9 @@ def content_aware_representation_total(
             + losses["wrapper_token_cosine"]
         )
         + args.content_pooled_cos_weight * losses["content_pooled_cosine"]
+        + args.content_pooled_mse_weight * losses["content_pooled_normalized_mse"]
+        + args.content_token_mean_weight * losses["content_token_mean"]
+        + args.content_token_std_weight * losses["content_token_std"]
         + args.semantic_contrastive_weight * losses["semantic_contrastive"]
     )
 
@@ -319,7 +372,9 @@ def choose_resolution_bucket(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Distill Qwen3-VL into the Mobile-OV DreamLite bridge.")
+    parser = argparse.ArgumentParser(
+        description="Distill Qwen3-VL into the Mobile-OV DreamLite bridge."
+    )
     parser.add_argument("--config", default="configs/mobile_ov_dreamlite.yaml")
     parser.add_argument("--generation-prompts", required=True)
     parser.add_argument("--edit-manifest", default=None)
@@ -348,7 +403,9 @@ def parse_args() -> argparse.Namespace:
             "An empty value preserves the legacy --width/--height behavior."
         ),
     )
-    parser.add_argument("--caption-variant-columns", default="caption_short,caption_medium,caption_long")
+    parser.add_argument(
+        "--caption-variant-columns", default="caption_short,caption_medium,caption_long"
+    )
     parser.add_argument("--caption-variant-weights", default="1,1,1")
     parser.add_argument("--caption-fallback-column", default="caption")
     parser.add_argument("--semantic-prompt-probability", type=float, default=0.0)
@@ -376,8 +433,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--content-token-cos-weight", type=float, default=1.0)
     parser.add_argument("--wrapper-token-weight", type=float, default=0.25)
     parser.add_argument("--content-pooled-cos-weight", type=float, default=0.1)
+    parser.add_argument("--content-pooled-mse-weight", type=float, default=0.0)
+    parser.add_argument("--content-token-mean-weight", type=float, default=0.0)
+    parser.add_argument("--content-token-std-weight", type=float, default=0.0)
     parser.add_argument("--semantic-contrastive-weight", type=float, default=0.2)
     parser.add_argument("--contrastive-temperature", type=float, default=0.07)
+    parser.add_argument(
+        "--global-contrastive",
+        action="store_true",
+        help="Use the full distributed batch as contrastive candidates.",
+    )
     parser.add_argument("--projected-content-scale", type=float, default=1.0)
     parser.add_argument("--representation-final-scale", type=float, default=0.25)
     parser.add_argument("--functional-weight", type=float, default=5.0)
@@ -432,7 +497,9 @@ def main() -> None:
     columns = split_csv(args.caption_variant_columns)
     weights = [float(value) for value in split_csv(args.caption_variant_weights)]
     if len(columns) != len(weights):
-        raise ValueError("caption variant columns and weights must have the same length")
+        raise ValueError(
+            "caption variant columns and weights must have the same length"
+        )
     generation_data = CaptionDataset(
         args.generation_prompts,
         variant_columns=columns,
@@ -440,13 +507,17 @@ def main() -> None:
         fallback_column=args.caption_fallback_column,
         max_samples=args.max_samples,
     )
-    generation_sampler = DistributedSampler(
-        generation_data,
-        num_replicas=context.world_size,
-        rank=context.rank,
-        shuffle=True,
-        seed=args.seed,
-    ) if context.is_distributed else None
+    generation_sampler = (
+        DistributedSampler(
+            generation_data,
+            num_replicas=context.world_size,
+            rank=context.rank,
+            shuffle=True,
+            seed=args.seed,
+        )
+        if context.is_distributed
+        else None
+    )
     generation_loader = DataLoader(
         generation_data,
         batch_size=args.batch_size,
@@ -459,13 +530,17 @@ def main() -> None:
         len(generation_data),
         seed=args.semantic_prompt_seed,
     )
-    semantic_sampler = DistributedSampler(
-        semantic_data,
-        num_replicas=context.world_size,
-        rank=context.rank,
-        shuffle=True,
-        seed=args.seed + 31,
-    ) if context.is_distributed else None
+    semantic_sampler = (
+        DistributedSampler(
+            semantic_data,
+            num_replicas=context.world_size,
+            rank=context.rank,
+            shuffle=True,
+            seed=args.seed + 31,
+        )
+        if context.is_distributed
+        else None
+    )
     semantic_loader = DataLoader(
         semantic_data,
         batch_size=args.batch_size,
@@ -483,13 +558,17 @@ def main() -> None:
             instruction_column=args.edit_instruction_column,
             max_samples=args.max_samples,
         )
-        edit_sampler = DistributedSampler(
-            edit_data,
-            num_replicas=context.world_size,
-            rank=context.rank,
-            shuffle=True,
-            seed=args.seed + 17,
-        ) if context.is_distributed else None
+        edit_sampler = (
+            DistributedSampler(
+                edit_data,
+                num_replicas=context.world_size,
+                rank=context.rank,
+                shuffle=True,
+                seed=args.seed + 17,
+            )
+            if context.is_distributed
+            else None
+        )
         edit_loader = DataLoader(
             edit_data,
             batch_size=args.batch_size,
@@ -500,7 +579,10 @@ def main() -> None:
             collate_fn=edit_collate,
         )
 
-    rank0_print(context, "Loading frozen SmolVLM2, Qwen3-VL teacher, and DreamLite controller...")
+    rank0_print(
+        context,
+        "Loading frozen SmolVLM2, Qwen3-VL teacher, and DreamLite controller...",
+    )
     bridge = MobileOVDreamLiteImageBridge(
         config.bridge,
         config.dreamlite_bridge,
@@ -534,16 +616,27 @@ def main() -> None:
             f"functional call weights must contain {controller.num_steps} "
             "non-negative values with a positive sum"
         )
-    trainable = [parameter for parameter in bridge.parameters() if parameter.requires_grad]
-    optimizer = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01)
+    trainable = [
+        parameter for parameter in bridge.parameters() if parameter.requires_grad
+    ]
+    optimizer = torch.optim.AdamW(
+        trainable, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01
+    )
     current_step = 0
-    resume_path = output_dir / "dreamlite_image_bridge_latest.pt" if args.resume == "auto" else Path(args.resume)
+    resume_path = (
+        output_dir / "dreamlite_image_bridge_latest.pt"
+        if args.resume == "auto"
+        else Path(args.resume)
+    )
     if args.resume != "none" and resume_path.is_file():
         payload = torch.load(resume_path, map_location="cpu", weights_only=False)
         bridge.load_trainable_state_dict(payload["bridge"])
         optimizer.load_state_dict(payload["optimizer"])
         current_step = int(payload["step"])
-        rank0_print(context, f"Resumed DreamLite bridge from {resume_path} at step={current_step}")
+        rank0_print(
+            context,
+            f"Resumed DreamLite bridge from {resume_path} at step={current_step}",
+        )
     if context.is_distributed:
         ddp_devices = [context.local_rank] if context.device.type == "cuda" else None
         bridge = DDP(bridge, device_ids=ddp_devices, broadcast_buffers=False)
@@ -560,7 +653,9 @@ def main() -> None:
     rank0_print(
         context,
         "Resolution buckets: "
-        + ", ".join(f"{bucket.label}:{bucket.weight:g}" for bucket in resolution_buckets),
+        + ", ".join(
+            f"{bucket.label}:{bucket.weight:g}" for bucket in resolution_buckets
+        ),
     )
     generation_epoch = 0
     edit_epoch = 0
@@ -640,11 +735,17 @@ def main() -> None:
                 start_step=args.student_state_start_step,
                 ramp_steps=args.student_state_ramp_steps,
             )
-            student_state_probability = args.student_state_probability * student_state_scale
-            functional_state_source = (
-                "student" if functional_rng.random() < student_state_probability else "teacher"
+            student_state_probability = (
+                args.student_state_probability * student_state_scale
             )
-            use_edit = edit_loader is not None and mode_rng.random() < args.edit_probability
+            functional_state_source = (
+                "student"
+                if functional_rng.random() < student_state_probability
+                else "teacher"
+            )
+            use_edit = (
+                edit_loader is not None and mode_rng.random() < args.edit_probability
+            )
             if use_edit:
                 image_paths, prompts = next_edit()
                 images = [Image.open(path).convert("RGB") for path in image_paths]
@@ -653,12 +754,16 @@ def main() -> None:
                 use_semantic_prompts = (
                     mode_rng.random() < args.semantic_prompt_probability
                 )
-                prompts = list(next_semantic() if use_semantic_prompts else next_generation())
+                prompts = list(
+                    next_semantic() if use_semantic_prompts else next_generation()
+                )
                 images = None
                 mode = "generate"
                 prompt_source = "semantic" if use_semantic_prompts else "openvid"
             optimizer.zero_grad(set_to_none=True)
-            autocast_enabled = context.device.type == "cuda" and inference_dtype != torch.float32
+            autocast_enabled = (
+                context.device.type == "cuda" and inference_dtype != torch.float32
+            )
             with torch.autocast(
                 device_type=context.device.type,
                 dtype=inference_dtype,
@@ -666,8 +771,12 @@ def main() -> None:
             ):
                 student = bridge(prompts, mode=mode, images=images)
                 teacher_condition = teacher.encode(prompts, mode=mode, images=images)
-                use_content_alignment = args.training_version.lower() == "v5" and mode == "generate"
-                use_direct_alignment = args.representation_mode == "direct" and mode == "generate"
+                use_content_alignment = (
+                    args.training_version.lower() in {"v5", "v6"} and mode == "generate"
+                )
+                use_direct_alignment = (
+                    args.representation_mode == "direct" and mode == "generate"
+                )
                 if use_content_alignment:
                     repr_losses = dreamlite_content_aware_representation_losses(
                         student,
@@ -675,6 +784,7 @@ def main() -> None:
                         prefix_tokens=args.content_prefix_tokens,
                         suffix_tokens=args.content_suffix_tokens,
                         contrastive_temperature=args.contrastive_temperature,
+                        global_contrastive=args.global_contrastive,
                     )
                     projected_student = controller.project_condition(student)
                     projected_teacher = controller.project_condition(teacher_condition)
@@ -684,35 +794,50 @@ def main() -> None:
                         prefix_tokens=args.content_prefix_tokens,
                         suffix_tokens=args.content_suffix_tokens,
                         contrastive_temperature=args.contrastive_temperature,
+                        global_contrastive=args.global_contrastive,
                     )
                     projected_value = content_aware_representation_total(
                         projected_losses,
                         args,
                         projected=True,
                     )
-                    repr_value = content_aware_representation_total(
-                        repr_losses,
-                        args,
-                        projected=False,
-                    ) + args.projected_weight * projected_value
+                    repr_value = (
+                        content_aware_representation_total(
+                            repr_losses,
+                            args,
+                            projected=False,
+                        )
+                        + args.projected_weight * projected_value
+                    )
                 elif use_direct_alignment:
-                    repr_losses = dreamlite_direct_representation_losses(student, teacher_condition)
+                    repr_losses = dreamlite_direct_representation_losses(
+                        student, teacher_condition
+                    )
                     projected_student = controller.project_condition(student)
                     projected_teacher = controller.project_condition(teacher_condition)
                     projected_losses = dreamlite_direct_representation_losses(
                         projected_student,
                         projected_teacher,
                     )
-                    projected_value = projected_representation_total(projected_losses, args)
+                    projected_value = projected_representation_total(
+                        projected_losses, args
+                    )
                     repr_value = representation_total(repr_losses, args)
                     repr_value = repr_value + args.projected_weight * projected_value
                 else:
-                    repr_losses = dreamlite_representation_losses(student, teacher_condition)
+                    repr_losses = dreamlite_representation_losses(
+                        student, teacher_condition
+                    )
                     projected_losses = None
-                    projected_value = student.prompt_embeds.new_zeros((), dtype=torch.float32)
+                    projected_value = student.prompt_embeds.new_zeros(
+                        (), dtype=torch.float32
+                    )
                     repr_value = representation_total(repr_losses, args)
                     repr_value = repr_value + args.projected_weight * projected_value
-                if args.closed_loop_weight <= 0 or current_step < args.closed_loop_start_step:
+                if (
+                    args.closed_loop_weight <= 0
+                    or current_step < args.closed_loop_start_step
+                ):
                     repr_scale = 1.0
                 else:
                     repr_scale = args.representation_final_scale
@@ -745,7 +870,9 @@ def main() -> None:
                 run_closed = (
                     args.closed_loop_weight > 0
                     and current_step >= args.closed_loop_start_step
-                    and (current_step - args.closed_loop_start_step) % args.closed_loop_every == 0
+                    and (current_step - args.closed_loop_start_step)
+                    % args.closed_loop_every
+                    == 0
                 )
                 if run_closed:
                     phase = "closed_loop"
@@ -784,7 +911,8 @@ def main() -> None:
                     args.closed_loop_prediction_weight * closed.prediction_relative_mse
                     + args.closed_loop_cos_weight
                     * (closed.prediction_cosine + closed.transition_cosine)
-                    + args.closed_loop_transition_weight * closed.transition_relative_mse
+                    + args.closed_loop_transition_weight
+                    * closed.transition_relative_mse
                     + args.closed_loop_terminal_weight * closed.terminal_relative_mse
                 )
             loss.backward()
@@ -805,61 +933,106 @@ def main() -> None:
                     "time_id_height": resolution.time_id_height,
                     "loss": scalar_mean(loss.detach(), context),
                     "representation": scalar_mean(repr_value.detach(), context),
-                    "projected_representation": scalar_mean(projected_value.detach(), context),
+                    "projected_representation": scalar_mean(
+                        projected_value.detach(), context
+                    ),
                     "token_cosine": scalar_mean(
-                        repr_losses.get("token_cosine", repr_losses.get("content_token_cosine")).detach(),
+                        repr_losses.get(
+                            "token_cosine", repr_losses.get("content_token_cosine")
+                        ).detach(),
                         context,
                     ),
                     "pooled_cosine": scalar_mean(
-                        repr_losses.get("pooled_cosine", repr_losses.get("content_pooled_cosine")).detach(),
+                        repr_losses.get(
+                            "pooled_cosine", repr_losses.get("content_pooled_cosine")
+                        ).detach(),
                         context,
                     ),
                     "content_token_cosine": scalar_mean(
-                        repr_losses.get("content_token_cosine", repr_value.new_zeros(())).detach(),
+                        repr_losses.get(
+                            "content_token_cosine", repr_value.new_zeros(())
+                        ).detach(),
                         context,
                     ),
                     "wrapper_token_cosine": scalar_mean(
-                        repr_losses.get("wrapper_token_cosine", repr_value.new_zeros(())).detach(),
+                        repr_losses.get(
+                            "wrapper_token_cosine", repr_value.new_zeros(())
+                        ).detach(),
                         context,
                     ),
                     "semantic_contrastive": scalar_mean(
-                        repr_losses.get("semantic_contrastive", repr_value.new_zeros(())).detach(),
+                        repr_losses.get(
+                            "semantic_contrastive", repr_value.new_zeros(())
+                        ).detach(),
+                        context,
+                    ),
+                    "semantic_batch_size": scalar_mean(
+                        repr_losses.get(
+                            "semantic_batch_size", repr_value.new_zeros(())
+                        ).detach(),
+                        context,
+                    ),
+                    "content_pooled_normalized_mse": scalar_mean(
+                        repr_losses.get(
+                            "content_pooled_normalized_mse",
+                            repr_value.new_zeros(()),
+                        ).detach(),
                         context,
                     ),
                     "content_fraction": scalar_mean(
-                        repr_losses.get("content_fraction", repr_value.new_zeros(())).detach(),
+                        repr_losses.get(
+                            "content_fraction", repr_value.new_zeros(())
+                        ).detach(),
                         context,
                     ),
                     "token_mean": scalar_mean(
-                        repr_losses.get("token_mean", repr_value.new_zeros(())).detach(),
+                        repr_losses.get(
+                            "token_mean",
+                            repr_losses.get(
+                                "content_token_mean", repr_value.new_zeros(())
+                            ),
+                        ).detach(),
                         context,
                     ),
                     "token_std": scalar_mean(
-                        repr_losses.get("token_std", repr_value.new_zeros(())).detach(),
+                        repr_losses.get(
+                            "token_std",
+                            repr_losses.get(
+                                "content_token_std", repr_value.new_zeros(())
+                            ),
+                        ).detach(),
                         context,
                     ),
                     "mask_agreement": scalar_mean(
-                        repr_losses.get("mask_agreement", repr_value.new_ones(())).detach(),
+                        repr_losses.get(
+                            "mask_agreement", repr_value.new_ones(())
+                        ).detach(),
                         context,
                     ),
-                    "functional_relative_mse": scalar_mean(functional.relative_mse.detach(), context),
+                    "functional_relative_mse": scalar_mean(
+                        functional.relative_mse.detach(), context
+                    ),
                     "functional_call_index": functional.call_index,
                     "functional_state_source": functional.state_source,
                     "functional_transition_relative_mse": scalar_mean(
                         functional.transition_relative_mse.detach(),
                         context,
                     ),
-                    "closed_terminal_relative_mse": scalar_mean(closed.terminal_relative_mse.detach(), context),
-                    "grad_norm": scalar_mean(torch.as_tensor(grad_norm, device=context.device), context),
+                    "closed_terminal_relative_mse": scalar_mean(
+                        closed.terminal_relative_mse.detach(), context
+                    ),
+                    "grad_norm": scalar_mean(
+                        torch.as_tensor(grad_norm, device=context.device), context
+                    ),
                     "lr": optimizer.param_groups[0]["lr"],
                 }
                 if context.device.type == "cuda":
-                    item["cuda_peak_allocated_gib"] = (
-                        torch.cuda.max_memory_allocated(context.device) / (1024**3)
-                    )
-                    item["cuda_peak_reserved_gib"] = (
-                        torch.cuda.max_memory_reserved(context.device) / (1024**3)
-                    )
+                    item["cuda_peak_allocated_gib"] = torch.cuda.max_memory_allocated(
+                        context.device
+                    ) / (1024**3)
+                    item["cuda_peak_reserved_gib"] = torch.cuda.max_memory_reserved(
+                        context.device
+                    ) / (1024**3)
                 if context.is_main:
                     with history_path.open("a", encoding="utf-8") as handle:
                         handle.write(json.dumps(item) + "\n")
@@ -870,27 +1043,40 @@ def main() -> None:
                         "func": f"{item['functional_relative_mse']:.4f}",
                         "res": resolution.label,
                     }
-                    if args.training_version.lower() == "v5":
-                        postfix["trans"] = f"{item['functional_transition_relative_mse']:.4f}"
+                    if args.training_version.lower() in {"v5", "v6"}:
+                        postfix["trans"] = (
+                            f"{item['functional_transition_relative_mse']:.4f}"
+                        )
                         postfix["state"] = item["functional_state_source"]
                     else:
                         postfix["roll"] = f"{item['closed_terminal_relative_mse']:.4f}"
                     progress.set_postfix(**postfix)
             progress.update(1)
 
-            save_latest = current_step % args.save_latest_every == 0 or current_step == args.target_step
-            save_archive = current_step % args.save_archive_every == 0 or current_step == args.target_step
+            save_latest = (
+                current_step % args.save_latest_every == 0
+                or current_step == args.target_step
+            )
+            save_archive = (
+                current_step % args.save_archive_every == 0
+                or current_step == args.target_step
+            )
             if save_latest or save_archive:
                 barrier()
                 if context.is_main:
                     module = unwrap(bridge)
                     payload = {
                         "step": current_step,
-                        "bridge": {key: value.detach().cpu() for key, value in module.trainable_state_dict().items()},
+                        "bridge": {
+                            key: value.detach().cpu()
+                            for key, value in module.trainable_state_dict().items()
+                        },
                         "optimizer": optimizer.state_dict(),
                         "config": vars(args),
                         "architecture": (
-                            "MobileOVDreamLiteCompactBridgeV5"
+                            "MobileOVDreamLiteCompactBridgeV6"
+                            if args.training_version.lower() == "v6"
+                            else "MobileOVDreamLiteCompactBridgeV5"
                             if args.training_version.lower() == "v5"
                             else "MobileOVDreamLiteCompactBridgeV4"
                             if args.training_version.lower() == "v4"
@@ -902,18 +1088,21 @@ def main() -> None:
                         "functional_teacher": (
                             "frozen DreamLite-mobile UNet, native 4-call schedule, "
                             "mixed teacher/student-prefix same-state prediction and transition distillation"
-                            if args.training_version.lower() == "v5"
+                            if args.training_version.lower() in {"v5", "v6"}
                             else "same-state teacher-forced prefixes"
                             if args.training_version.lower() == "v4"
                             else "frozen DreamLite-mobile UNet, native 4-call schedule"
                         ),
                     }
                     if save_latest:
-                        torch.save(payload, output_dir / "dreamlite_image_bridge_latest.pt")
+                        torch.save(
+                            payload, output_dir / "dreamlite_image_bridge_latest.pt"
+                        )
                     if save_archive:
                         torch.save(
                             payload,
-                            output_dir / f"dreamlite_image_bridge_step{current_step:06d}.pt",
+                            output_dir
+                            / f"dreamlite_image_bridge_step{current_step:06d}.pt",
                         )
                     rank0_print(
                         context,

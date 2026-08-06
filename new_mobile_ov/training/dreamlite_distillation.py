@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Sequence
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
@@ -53,10 +54,7 @@ class DreamLiteResolutionBucket:
 
     @property
     def label(self) -> str:
-        return (
-            f"{self.width}x{self.height}"
-            f"@{self.time_id_width}x{self.time_id_height}"
-        )
+        return f"{self.width}x{self.height}@{self.time_id_width}x{self.time_id_height}"
 
 
 def parse_dreamlite_resolution_buckets(value: str) -> list[DreamLiteResolutionBucket]:
@@ -86,7 +84,9 @@ def parse_dreamlite_resolution_buckets(value: str) -> list[DreamLiteResolutionBu
                 f"DreamLite resolution dimensions must be positive multiples of 8: {raw_item!r}"
             )
         if weight <= 0:
-            raise ValueError(f"DreamLite resolution weight must be positive: {raw_item!r}")
+            raise ValueError(
+                f"DreamLite resolution weight must be positive: {raw_item!r}"
+            )
         buckets.append(
             DreamLiteResolutionBucket(
                 width=width,
@@ -128,7 +128,9 @@ def _masked_feature_moments(
     return mean, variance.clamp_min(1e-8).sqrt()
 
 
-def _relative_feature_mse(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def _relative_feature_mse(
+    prediction: torch.Tensor, target: torch.Tensor
+) -> torch.Tensor:
     return (prediction - target).pow(2).mean() / target.pow(2).mean().clamp_min(1e-6)
 
 
@@ -173,8 +175,12 @@ def dreamlite_representation_losses(
         teacher.attention_mask,
     )
     if student_fp32.shape[0] > 1:
-        student_rel = F.normalize(student_pool, dim=-1) @ F.normalize(student_pool, dim=-1).T
-        teacher_rel = F.normalize(teacher_pool, dim=-1) @ F.normalize(teacher_pool, dim=-1).T
+        student_rel = (
+            F.normalize(student_pool, dim=-1) @ F.normalize(student_pool, dim=-1).T
+        )
+        teacher_rel = (
+            F.normalize(teacher_pool, dim=-1) @ F.normalize(teacher_pool, dim=-1).T
+        )
         geometry = F.mse_loss(student_rel, teacher_rel)
     else:
         geometry = student_fp32.new_zeros(())
@@ -185,10 +191,7 @@ def dreamlite_representation_losses(
         "token_cosine": 1.0
         - F.cosine_similarity(student_fp32, target_fp32, dim=-1).mean(),
         "token_norm": (
-            (
-                student_fp32.norm(dim=-1).mean()
-                - target_fp32.norm(dim=-1).mean()
-            )
+            (student_fp32.norm(dim=-1).mean() - target_fp32.norm(dim=-1).mean())
             / target_fp32.norm(dim=-1).mean().clamp_min(1e-4)
         ).pow(2),
         "pooled_normalized_mse": F.mse_loss(
@@ -197,9 +200,7 @@ def dreamlite_representation_losses(
         ),
         "pooled_cosine": pooled_cosine(student_pool, teacher_pool),
         "geometry": geometry,
-        "variance": (
-            (student_std - teacher_std) / teacher_std.clamp_min(1e-4)
-        ).pow(2),
+        "variance": ((student_std - teacher_std) / teacher_std.clamp_min(1e-4)).pow(2),
     }
 
 
@@ -218,7 +219,9 @@ def dreamlite_direct_representation_losses(
     teacher_mask = teacher.attention_mask[:, :common_length].bool()
     common_mask = student_mask & teacher_mask
     if not bool(common_mask.any()):
-        raise RuntimeError("Student and teacher DreamLite conditions share no valid tokens.")
+        raise RuntimeError(
+            "Student and teacher DreamLite conditions share no valid tokens."
+        )
 
     student_normalized = F.layer_norm(student_tokens, (student_tokens.shape[-1],))
     teacher_normalized = F.layer_norm(teacher_tokens, (teacher_tokens.shape[-1],))
@@ -233,8 +236,12 @@ def dreamlite_direct_representation_losses(
     student_mean, student_std = _masked_feature_moments(student_tokens, common_mask)
     teacher_mean, teacher_std = _masked_feature_moments(teacher_tokens, common_mask)
     if student_tokens.shape[0] > 1:
-        student_rel = F.normalize(student_pool, dim=-1) @ F.normalize(student_pool, dim=-1).T
-        teacher_rel = F.normalize(teacher_pool, dim=-1) @ F.normalize(teacher_pool, dim=-1).T
+        student_rel = (
+            F.normalize(student_pool, dim=-1) @ F.normalize(student_pool, dim=-1).T
+        )
+        teacher_rel = (
+            F.normalize(teacher_pool, dim=-1) @ F.normalize(teacher_pool, dim=-1).T
+        )
         geometry = F.mse_loss(student_rel, teacher_rel)
         prompt_variance = _relative_feature_mse(
             student_pool.std(dim=0, unbiased=False),
@@ -299,22 +306,36 @@ def _masked_direct_token_losses(
     )
 
 
+def _gather_with_gradient(value: torch.Tensor) -> torch.Tensor:
+    """Gather fixed-size prompt summaries while preserving student gradients."""
+
+    if (
+        not (dist.is_available() and dist.is_initialized())
+        or dist.get_world_size() == 1
+    ):
+        return value
+    from torch.distributed.nn.functional import all_gather
+
+    return torch.cat(tuple(all_gather(value)), dim=0)
+
+
 def _semantic_contrastive_loss(
     student_pool: torch.Tensor,
     teacher_pool: torch.Tensor,
     *,
     temperature: float,
+    global_batch: bool = False,
 ) -> torch.Tensor:
+    if global_batch:
+        student_pool = _gather_with_gradient(student_pool)
+        teacher_pool = _gather_with_gradient(teacher_pool)
     if student_pool.shape[0] < 2:
         return student_pool.new_zeros(())
     temperature = max(float(temperature), 1e-4)
     logits = F.normalize(student_pool, dim=-1) @ F.normalize(teacher_pool, dim=-1).T
     logits = logits / temperature
     labels = torch.arange(logits.shape[0], device=logits.device)
-    return 0.5 * (
-        F.cross_entropy(logits, labels)
-        + F.cross_entropy(logits.T, labels)
-    )
+    return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
 
 
 def dreamlite_content_aware_representation_losses(
@@ -324,6 +345,7 @@ def dreamlite_content_aware_representation_losses(
     prefix_tokens: int = 3,
     suffix_tokens: int = 5,
     contrastive_temperature: float = 0.07,
+    global_contrastive: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Prioritize prompt semantics while retaining weak template supervision."""
 
@@ -336,7 +358,9 @@ def dreamlite_content_aware_representation_losses(
     teacher_mask = teacher.attention_mask[:, :common_length].bool()
     common_mask = student_mask & teacher_mask
     if not bool(common_mask.any()):
-        raise RuntimeError("Student and teacher DreamLite conditions share no valid tokens.")
+        raise RuntimeError(
+            "Student and teacher DreamLite conditions share no valid tokens."
+        )
     content_mask, wrapper_mask = _content_and_wrapper_masks(
         common_mask,
         prefix_tokens=prefix_tokens,
@@ -354,6 +378,17 @@ def dreamlite_content_aware_representation_losses(
     )
     student_content_pool = _masked_mean(student_tokens, content_mask)
     teacher_content_pool = _masked_mean(teacher_tokens, content_mask)
+    student_content_mean, student_content_std = _masked_feature_moments(
+        student_tokens,
+        content_mask,
+    )
+    teacher_content_mean, teacher_content_std = _masked_feature_moments(
+        teacher_tokens,
+        content_mask,
+    )
+    semantic_batch_size = student_content_pool.shape[0]
+    if global_contrastive and dist.is_available() and dist.is_initialized():
+        semantic_batch_size *= dist.get_world_size()
     return {
         "content_token_normalized_mse": content_mse,
         "content_token_cosine": content_cosine,
@@ -363,12 +398,29 @@ def dreamlite_content_aware_representation_losses(
             student_content_pool,
             teacher_content_pool,
         ),
+        "content_pooled_normalized_mse": F.mse_loss(
+            F.layer_norm(student_content_pool, (student_content_pool.shape[-1],)),
+            F.layer_norm(teacher_content_pool, (teacher_content_pool.shape[-1],)),
+        ),
+        "content_token_mean": _relative_feature_mse(
+            student_content_mean,
+            teacher_content_mean,
+        ),
+        "content_token_std": _relative_feature_mse(
+            student_content_std,
+            teacher_content_std,
+        ),
         "semantic_contrastive": _semantic_contrastive_loss(
             student_content_pool,
             teacher_content_pool,
             temperature=contrastive_temperature,
+            global_batch=global_contrastive,
         ),
-        "content_fraction": content_mask.float().sum() / common_mask.float().sum().clamp_min(1.0),
+        "semantic_batch_size": student_content_pool.new_tensor(
+            float(semantic_batch_size)
+        ),
+        "content_fraction": content_mask.float().sum()
+        / common_mask.float().sum().clamp_min(1.0),
         "mask_agreement": (student_mask == teacher_mask).float().mean(),
     }
 
@@ -383,7 +435,11 @@ class DreamLiteFrozenQwenTeacher:
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
-        from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
+        from transformers import (
+            Qwen2TokenizerFast,
+            Qwen3VLForConditionalGeneration,
+            Qwen3VLProcessor,
+        )
 
         checkpoint = Path(
             ensure_dreamlite_checkpoint(
@@ -410,12 +466,21 @@ class DreamLiteFrozenQwenTeacher:
         )
 
     @staticmethod
-    def _condition_from_outputs(outputs, attention_mask: torch.Tensor, drop_idx: int, dtype):
+    def _condition_from_outputs(
+        outputs, attention_mask: torch.Tensor, drop_idx: int, dtype
+    ):
         hidden = outputs.hidden_states[-1]
-        valid = [row[row_mask.bool()][drop_idx:] for row, row_mask in zip(hidden, attention_mask)]
+        valid = [
+            row[row_mask.bool()][drop_idx:]
+            for row, row_mask in zip(hidden, attention_mask)
+        ]
         if any(item.shape[0] == 0 for item in valid):
-            raise RuntimeError("DreamLite teacher prefix consumed the full condition sequence.")
-        prompt_embeds = pad_sequence(valid, batch_first=True, padding_value=0).to(dtype=dtype)
+            raise RuntimeError(
+                "DreamLite teacher prefix consumed the full condition sequence."
+            )
+        prompt_embeds = pad_sequence(valid, batch_first=True, padding_value=0).to(
+            dtype=dtype
+        )
         mask = torch.zeros(
             prompt_embeds.shape[:2],
             dtype=torch.long,
@@ -436,7 +501,9 @@ class DreamLiteFrozenQwenTeacher:
         prompts = [" ".join(str(value).strip().split()) for value in prompts]
         if mode == "generate":
             text = dreamlite_generation_texts(prompts)
-            encoded = self.tokenizer(text=text, padding=True, return_tensors="pt").to(self.device)
+            encoded = self.tokenizer(text=text, padding=True, return_tensors="pt").to(
+                self.device
+            )
             outputs = self.text_encoder(
                 input_ids=encoded.input_ids,
                 attention_mask=encoded.attention_mask,
@@ -469,7 +536,10 @@ class DreamLiteFrozenQwenTeacher:
         ]
         encoded = self.processor(
             text=[template.format(value) for value in instructions],
-            images=[image.convert("RGB").resize((256, 256), Image.Resampling.LANCZOS) for image in images],
+            images=[
+                image.convert("RGB").resize((256, 256), Image.Resampling.LANCZOS)
+                for image in images
+            ],
             padding=True,
             return_tensors="pt",
         ).to(self.device)
@@ -569,7 +639,9 @@ class DreamLiteFrozenController:
             num_steps=self.num_steps,
         )
         if len(student_timesteps) != len(timesteps):
-            raise RuntimeError("DreamLite teacher/student schedulers produced different call counts.")
+            raise RuntimeError(
+                "DreamLite teacher/student schedulers produced different call counts."
+            )
         if call_index is None:
             call_index = int(
                 torch.randint(len(timesteps), (1,), device=initial.device).item()
@@ -700,7 +772,9 @@ class DreamLiteFrozenController:
         prediction_cosine = initial.new_zeros((), dtype=torch.float32)
         transition_mse = initial.new_zeros((), dtype=torch.float32)
         transition_cosine = initial.new_zeros((), dtype=torch.float32)
-        for teacher_timestep, student_timestep in zip(teacher_timesteps, student_timesteps):
+        for teacher_timestep, student_timestep in zip(
+            teacher_timesteps, student_timesteps
+        ):
             with torch.no_grad():
                 teacher_prediction = self.backend.predict(
                     teacher_current,

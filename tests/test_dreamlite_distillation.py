@@ -18,6 +18,7 @@ from new_mobile_ov.training.dreamlite_distillation import (
     dreamlite_representation_losses,
     parse_dreamlite_resolution_buckets,
 )
+from new_mobile_ov.training import dreamlite_distillation as distillation_module
 
 
 def make_conditions():
@@ -128,12 +129,18 @@ def test_native_generation_lengths_are_variable_and_capped() -> None:
     assert lengths.tolist() == [7, 19, 128]
 
 
-def test_compact_bridge_has_variable_mask_and_target_parameter_count(monkeypatch) -> None:
+def test_compact_bridge_has_variable_mask_and_target_parameter_count(
+    monkeypatch,
+) -> None:
     bridge = compact_bridge(monkeypatch)
     bridge._native_tokenizer = FakeNativeTokenizer([7, 19, 11])
     condition = bridge(["a", "b", "c"], mode="generate")
 
-    trainable = sum(parameter.numel() for parameter in bridge.parameters() if parameter.requires_grad)
+    trainable = sum(
+        parameter.numel()
+        for parameter in bridge.parameters()
+        if parameter.requires_grad
+    )
     assert 5_000_000 <= trainable <= 6_000_000
     assert condition.prompt_embeds.shape == (3, 19, 2048)
     assert condition.attention_mask.sum(dim=1).tolist() == [7, 19, 11]
@@ -182,6 +189,10 @@ def test_content_aware_losses_separate_prompt_and_wrapper_tokens() -> None:
     assert losses["content_token_cosine"] > 0
     assert torch.allclose(losses["wrapper_token_cosine"], torch.zeros(()), atol=1e-6)
     assert torch.allclose(losses["content_fraction"], torch.tensor(1 / 3), atol=1e-6)
+    assert losses["content_pooled_normalized_mse"] >= 0
+    assert losses["content_token_mean"] >= 0
+    assert losses["content_token_std"] >= 0
+    assert losses["semantic_batch_size"].item() == 2
     total = sum(
         value
         for name, value in losses.items()
@@ -190,6 +201,36 @@ def test_content_aware_losses_separate_prompt_and_wrapper_tokens() -> None:
     total.backward()
     assert student_tokens.grad is not None
     assert student_tokens.grad[:, 3:7].norm() > 0
+
+
+def test_content_aware_global_contrastive_gathers_prompt_summaries(monkeypatch) -> None:
+    tokens = torch.randn(2, 12, 32)
+    student_tokens = (tokens + 0.1 * torch.randn_like(tokens)).requires_grad_(True)
+    mask = torch.ones(2, 12, dtype=torch.long)
+    gathered_shapes = []
+
+    def fake_gather(value: torch.Tensor) -> torch.Tensor:
+        gathered_shapes.append(tuple(value.shape))
+        return torch.cat((value, value.flip(0)), dim=0)
+
+    monkeypatch.setattr(distillation_module, "_gather_with_gradient", fake_gather)
+    monkeypatch.setattr(distillation_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(distillation_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(distillation_module.dist, "get_world_size", lambda: 2)
+    losses = dreamlite_content_aware_representation_losses(
+        DreamLiteCondition(student_tokens, mask),
+        DreamLiteCondition(tokens, mask),
+        prefix_tokens=3,
+        suffix_tokens=5,
+        global_contrastive=True,
+    )
+
+    assert gathered_shapes == [(2, 32), (2, 32)]
+    assert losses["semantic_batch_size"].item() == 4
+    assert torch.isfinite(losses["semantic_contrastive"])
+    losses["semantic_contrastive"].backward()
+    assert student_tokens.grad is not None
+    assert torch.isfinite(student_tokens.grad).all()
 
 
 def test_resolution_bucket_parser_keeps_actual_and_logical_sizes_separate() -> None:
@@ -290,7 +331,9 @@ def test_functional_loss_uses_teacher_prefix_and_one_shared_target_state() -> No
     assert torch.isfinite(student_tokens.grad).all()
 
 
-def test_functional_loss_can_use_detached_student_prefix_without_state_mismatch() -> None:
+def test_functional_loss_can_use_detached_student_prefix_without_state_mismatch() -> (
+    None
+):
     controller = DreamLiteFrozenController.__new__(DreamLiteFrozenController)
     controller.backend = FakeDreamLiteBackend()
     controller.num_steps = 4
