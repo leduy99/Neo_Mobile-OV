@@ -174,6 +174,11 @@ def generate_videos(args, prompts: list[str], device: torch.device, dtype: torch
     repo_path = Path(repo_path).resolve()
     if str(repo_path) not in sys.path:
         sys.path.insert(0, str(repo_path))
+    from new_mobile_ov.generation.neodragon_compat import (
+        install_neodragon_generation_patches,
+    )
+
+    install_neodragon_generation_patches()
     from neodragon.utils.generation_utils import DEFAULT_PROMPT_MODIFIER
 
     state, checkpoint_step = load_bridge_state(Path(args.video_bridge_checkpoint))
