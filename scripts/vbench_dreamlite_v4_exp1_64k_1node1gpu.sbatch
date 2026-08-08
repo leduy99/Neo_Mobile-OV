@@ -38,10 +38,12 @@ ANCHOR_DIR="${RUN_ROOT}/anchors"
 VIDEO_DIR="${RUN_ROOT}/videos"
 SCORE_DIR="${RUN_ROOT}/scores"
 
+IMAGE_CONFIG="${IMAGE_CONFIG:-configs/mobile_ov_dreamlite_compact_v4.yaml}"
 IMAGE_CKPT="${IMAGE_CKPT:-checkpoints/hf_mobile_ov/dreamlite_compact_v4/17208709/dreamlite_image_bridge_latest.pt}"
 VIDEO_CKPT="${VIDEO_CKPT:-checkpoints/hf_mobile_ov/neo_exp1_bridge_functional/17108893/neodragon_text_bridge_latest.pt}"
-IMAGE_HF_FILE="dreamlite_compact_v4/17208709/dreamlite_image_bridge_latest.pt"
-VIDEO_HF_FILE="neo_exp1_bridge_functional/17108893/neodragon_text_bridge_latest.pt"
+IMAGE_HF_FILE="${IMAGE_HF_FILE:-dreamlite_compact_v4/17208709/dreamlite_image_bridge_latest.pt}"
+VIDEO_HF_FILE="${VIDEO_HF_FILE:-neo_exp1_bridge_functional/17108893/neodragon_text_bridge_latest.pt}"
+IMAGE_EXPECTED_STEP="${IMAGE_EXPECTED_STEP:-}"
 HF_REPO="${HF_REPO:-Amshaker/Mobile-OV}"
 MAX_PROMPTS="${MAX_PROMPTS:-0}"
 STOP_FILE="${TMPDIR%/}/mov_vbench_setup_${SLURM_JOB_ID:-local}.stop"
@@ -68,6 +70,20 @@ bash scripts/install_vbench_env.sh
 download_checkpoint() {
   local target="$1"
   local filename="$2"
+  local expected_step="${3:-}"
+  if [[ -f "${target}" && -n "${expected_step}" ]]; then
+    local actual_step
+    actual_step=$("${PYTHON_BIN}" - "${target}" <<'PY'
+import sys, torch
+payload = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+print(int(payload.get("step", -1)))
+PY
+)
+    if [[ "${actual_step}" != "${expected_step}" ]]; then
+      echo "Replacing stale checkpoint ${target}: step=${actual_step}, expected=${expected_step}"
+      rm -f "${target}"
+    fi
+  fi
   [[ -f "${target}" ]] && return 0
   "${PYTHON_BIN}" - "${HF_REPO}" "${filename}" "${target}" <<'PY'
 from huggingface_hub import hf_hub_download
@@ -82,10 +98,20 @@ shutil.copy2(source, temporary)
 temporary.replace(destination)
 print(f"Downloaded {repo}/{filename} -> {destination}")
 PY
+  if [[ -n "${expected_step}" ]]; then
+    "${PYTHON_BIN}" - "${target}" "${expected_step}" <<'PY'
+import sys, torch
+payload = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+actual = int(payload.get("step", -1))
+expected = int(sys.argv[2])
+if actual != expected:
+    raise SystemExit(f"Checkpoint step mismatch: got {actual}, expected {expected}")
+PY
+  fi
 }
-download_checkpoint "${IMAGE_CKPT}" "${IMAGE_HF_FILE}"
+download_checkpoint "${IMAGE_CKPT}" "${IMAGE_HF_FILE}" "${IMAGE_EXPECTED_STEP}"
 download_checkpoint "${VIDEO_CKPT}" "${VIDEO_HF_FILE}"
-"${PYTHON_BIN}" tools/prepare_checkpoints.py --config configs/mobile_ov_dreamlite_compact_v4.yaml
+"${PYTHON_BIN}" tools/prepare_checkpoints.py --config "${IMAGE_CONFIG}"
 
 cleanup_heartbeat
 trap - EXIT INT TERM
@@ -97,12 +123,14 @@ fi
 test -f "${VBENCH_INFO}"
 
 echo "RUN_ROOT=${RUN_ROOT} MAX_PROMPTS=${MAX_PROMPTS}"
+echo "IMAGE_CONFIG=${IMAGE_CONFIG}"
 echo "IMAGE_CKPT=${IMAGE_CKPT}"
 echo "VIDEO_CKPT=${VIDEO_CKPT}"
 nvidia-smi || true
 
 "${PYTHON_BIN}" tools/generate_vbench_dreamlite_exp1.py \
   --vbench-info "${VBENCH_INFO}" \
+  --image-config "${IMAGE_CONFIG}" \
   --image-bridge-checkpoint "${IMAGE_CKPT}" \
   --video-bridge-checkpoint "${VIDEO_CKPT}" \
   --anchor-dir "${ANCHOR_DIR}" \

@@ -233,7 +233,7 @@ def generate_videos(args, prompts: list[str], device: torch.device, dtype: torch
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Resume-safe VBench generation with DreamLite V4 anchors and Exp1-64K video conditioning."
+        description="Resume-safe VBench generation with DreamLite anchors and Exp1-64K video conditioning."
     )
     parser.add_argument("--vbench-info", required=True)
     parser.add_argument("--image-config", default="configs/mobile_ov_dreamlite_compact_v4.yaml")
