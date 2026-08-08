@@ -76,6 +76,49 @@ def valid_result(path: Path, dimension: str) -> bool:
         return False
 
 
+def load_unique_prompts(info_path: Path) -> list[str]:
+    rows = json.loads(info_path.read_text(encoding="utf-8"))
+    prompts: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        prompt = " ".join(str(row["prompt_en"]).strip().split())
+        if prompt and prompt not in seen:
+            prompts.append(prompt)
+            seen.add(prompt)
+    if not prompts:
+        raise RuntimeError(f"No prompts found in {info_path}")
+    return prompts
+
+
+def validate_video_coverage(
+    video_dir: Path,
+    info_path: Path,
+    samples_per_prompt: int,
+) -> dict:
+    prompts = load_unique_prompts(info_path)
+    missing = [
+        str(video_dir / f"{prompt}-{sample_index}.mp4")
+        for prompt in prompts
+        for sample_index in range(samples_per_prompt)
+        if not (video_dir / f"{prompt}-{sample_index}.mp4").is_file()
+        or (video_dir / f"{prompt}-{sample_index}.mp4").stat().st_size == 0
+    ]
+    result = {
+        "unique_prompts": len(prompts),
+        "samples_per_prompt": samples_per_prompt,
+        "expected_videos": len(prompts) * samples_per_prompt,
+        "missing_count": len(missing),
+        "missing_videos": missing,
+    }
+    if missing:
+        preview = "\n".join(missing[:10])
+        raise RuntimeError(
+            f"VBench input coverage is incomplete: missing {len(missing)} of "
+            f"{result['expected_videos']} expected videos. First missing files:\n{preview}"
+        )
+    return result
+
+
 def tabulate(score_dir: Path) -> dict:
     raw = {}
     for dimension in DIMENSIONS:
@@ -109,12 +152,27 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end", type=int, default=len(DIMENSIONS))
+    parser.add_argument("--expected-samples-per-prompt", type=int, default=1)
     args = parser.parse_args()
+
+    if args.expected_samples_per_prompt <= 0:
+        raise ValueError("--expected-samples-per-prompt must be positive")
 
     output = Path(args.output).resolve()
     score_dir = output / "vbench"
     score_dir.mkdir(parents=True, exist_ok=True)
-    evaluator = VBench(torch.device("cuda"), str(Path(args.full_info).resolve()), str(score_dir))
+    info_path = Path(args.full_info).resolve()
+    coverage = validate_video_coverage(
+        Path(args.videos).resolve(),
+        info_path,
+        args.expected_samples_per_prompt,
+    )
+    (score_dir / "coverage.json").write_text(
+        json.dumps(coverage, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Validated VBench input coverage: {json.dumps(coverage)}", flush=True)
+    evaluator = VBench(torch.device("cuda"), str(info_path), str(score_dir))
     for dimension in DIMENSIONS[args.start : args.end]:
         result_path = score_dir / f"{dimension}_eval_results.json"
         if valid_result(result_path, dimension):

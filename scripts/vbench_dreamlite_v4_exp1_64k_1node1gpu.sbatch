@@ -46,6 +46,7 @@ VIDEO_HF_FILE="${VIDEO_HF_FILE:-neo_exp1_bridge_functional/17108893/neodragon_te
 IMAGE_EXPECTED_STEP="${IMAGE_EXPECTED_STEP:-}"
 HF_REPO="${HF_REPO:-Amshaker/Mobile-OV}"
 MAX_PROMPTS="${MAX_PROMPTS:-0}"
+SAMPLES_PER_PROMPT="${SAMPLES_PER_PROMPT:-1}"
 STOP_FILE="${TMPDIR%/}/mov_vbench_setup_${SLURM_JOB_ID:-local}.stop"
 
 mkdir -p logs "${ANCHOR_DIR}" "${VIDEO_DIR}" "${SCORE_DIR}"
@@ -122,7 +123,7 @@ if [[ ! -f "${VBENCH_INFO}" ]]; then
 fi
 test -f "${VBENCH_INFO}"
 
-echo "RUN_ROOT=${RUN_ROOT} MAX_PROMPTS=${MAX_PROMPTS}"
+echo "RUN_ROOT=${RUN_ROOT} MAX_PROMPTS=${MAX_PROMPTS} SAMPLES_PER_PROMPT=${SAMPLES_PER_PROMPT}"
 echo "IMAGE_CONFIG=${IMAGE_CONFIG}"
 echo "IMAGE_CKPT=${IMAGE_CKPT}"
 echo "VIDEO_CKPT=${VIDEO_CKPT}"
@@ -136,6 +137,7 @@ nvidia-smi || true
   --anchor-dir "${ANCHOR_DIR}" \
   --video-dir "${VIDEO_DIR}" \
   --summary "${RUN_ROOT}/generation_summary.json" \
+  --samples-per-prompt "${SAMPLES_PER_PROMPT}" \
   --max-prompts "${MAX_PROMPTS}"
 
 if [[ "${MAX_PROMPTS}" -gt 0 ]]; then
@@ -147,7 +149,8 @@ cd "${VBENCH_REPO}"
 "${VBENCH_ENV}/bin/python" "${ROOT}/tools/evaluate_vbench_resume.py" \
   --videos "${ROOT}/${VIDEO_DIR}" \
   --full-info "${VBENCH_INFO}" \
-  --output "${ROOT}/${SCORE_DIR}"
+  --output "${ROOT}/${SCORE_DIR}" \
+  --expected-samples-per-prompt "${SAMPLES_PER_PROMPT}"
 
-echo "Completed full 1-video-per-prompt VBench run."
+echo "Completed VBench run with ${SAMPLES_PER_PROMPT} independently generated video(s) per prompt."
 cat "${ROOT}/${SCORE_DIR}/vbench/summary.json"

@@ -44,13 +44,36 @@ def load_prompts(info_path: Path, max_prompts: int) -> list[str]:
     return prompts
 
 
-def anchor_path(anchor_dir: Path, index: int, prompt: str) -> Path:
+def anchor_path(
+    anchor_dir: Path,
+    index: int,
+    prompt: str,
+    sample_index: int = 0,
+    samples_per_prompt: int = 1,
+) -> Path:
     digest = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:12]
+    if samples_per_prompt > 1:
+        return anchor_dir / f"{index:04d}_{digest}-{sample_index}.png"
     return anchor_dir / f"{index:04d}_{digest}.png"
 
 
-def video_path(video_dir: Path, prompt: str) -> Path:
-    return video_dir / f"{prompt}-0.mp4"
+def video_path(video_dir: Path, prompt: str, sample_index: int = 0) -> Path:
+    return video_dir / f"{prompt}-{sample_index}.mp4"
+
+
+def sample_seed(
+    base_seed: int,
+    prompt_index: int,
+    sample_index: int,
+    samples_per_prompt: int,
+) -> int:
+    return int(base_seed) + int(prompt_index) * int(samples_per_prompt) + int(sample_index)
+
+
+def sample_items(prompts: list[str], samples_per_prompt: int):
+    for prompt_index, prompt in enumerate(prompts):
+        for sample_index in range(samples_per_prompt):
+            yield prompt_index, prompt, sample_index
 
 
 def valid_image(path: Path, expected_size: tuple[int, int]) -> bool:
@@ -95,14 +118,27 @@ def generate_anchors(args, prompts: list[str], device: torch.device, dtype: torc
     anchor_dir = Path(args.anchor_dir)
     anchor_dir.mkdir(parents=True, exist_ok=True)
     expected_size = (args.anchor_width, args.anchor_height)
+    total = len(prompts) * args.samples_per_prompt
     missing = [
-        (index, prompt)
-        for index, prompt in enumerate(prompts)
-        if not valid_image(anchor_path(anchor_dir, index, prompt), expected_size)
+        (prompt_index, prompt, sample_index)
+        for prompt_index, prompt, sample_index in sample_items(
+            prompts,
+            args.samples_per_prompt,
+        )
+        if not valid_image(
+            anchor_path(
+                anchor_dir,
+                prompt_index,
+                prompt,
+                sample_index,
+                args.samples_per_prompt,
+            ),
+            expected_size,
+        )
     ]
     if not missing:
-        print(f"Anchor phase already complete: {len(prompts)}/{len(prompts)}", flush=True)
-        return {"generated": 0, "reused": len(prompts)}
+        print(f"Anchor phase already complete: {total}/{total}", flush=True)
+        return {"generated": 0, "reused": total}
 
     config = load_config(args.image_config)
     state, checkpoint_step = load_bridge_state(Path(args.image_bridge_checkpoint))
@@ -118,7 +154,7 @@ def generate_anchors(args, prompts: list[str], device: torch.device, dtype: torc
     generated = 0
     started = time.perf_counter()
     with torch.autocast("cuda", dtype=dtype):
-        for index, prompt in missing:
+        for prompt_index, prompt, sample_index in missing:
             condition = bridge([prompt], mode="generate")
             image = backend.generate_images(
                 condition,
@@ -127,9 +163,20 @@ def generate_anchors(args, prompts: list[str], device: torch.device, dtype: torc
                 time_id_height=args.anchor_time_id_height,
                 time_id_width=args.anchor_time_id_width,
                 num_steps=args.image_steps,
-                seed=args.seed + index,
+                seed=sample_seed(
+                    args.seed,
+                    prompt_index,
+                    sample_index,
+                    args.samples_per_prompt,
+                ),
             )[0].convert("RGB")
-            destination = anchor_path(anchor_dir, index, prompt)
+            destination = anchor_path(
+                anchor_dir,
+                prompt_index,
+                prompt,
+                sample_index,
+                args.samples_per_prompt,
+            )
             temporary = destination.with_suffix(".tmp.png")
             image.save(temporary)
             os.replace(temporary, destination)
@@ -137,7 +184,7 @@ def generate_anchors(args, prompts: list[str], device: torch.device, dtype: torc
             if generated == 1 or generated % args.log_every == 0:
                 elapsed = time.perf_counter() - started
                 print(
-                    f"Anchors {len(prompts) - len(missing) + generated}/{len(prompts)} "
+                    f"Anchors {total - len(missing) + generated}/{total} "
                     f"new={generated} rate={generated / max(elapsed, 1e-6):.2f}/s",
                     flush=True,
                 )
@@ -145,7 +192,7 @@ def generate_anchors(args, prompts: list[str], device: torch.device, dtype: torc
     return {
         "checkpoint_step": checkpoint_step,
         "generated": generated,
-        "reused": len(prompts) - generated,
+        "reused": total - generated,
         "seconds": time.perf_counter() - started,
     }
 
@@ -155,14 +202,21 @@ def generate_videos(args, prompts: list[str], device: torch.device, dtype: torch
     anchor_dir = Path(args.anchor_dir)
     video_dir = Path(args.video_dir)
     video_dir.mkdir(parents=True, exist_ok=True)
+    total = len(prompts) * args.samples_per_prompt
     missing = [
-        (index, prompt)
-        for index, prompt in enumerate(prompts)
-        if not valid_video(video_path(video_dir, prompt), args.num_frames)
+        (prompt_index, prompt, sample_index)
+        for prompt_index, prompt, sample_index in sample_items(
+            prompts,
+            args.samples_per_prompt,
+        )
+        if not valid_video(
+            video_path(video_dir, prompt, sample_index),
+            args.num_frames,
+        )
     ]
     if not missing:
-        print(f"Video phase already complete: {len(prompts)}/{len(prompts)}", flush=True)
-        return {"generated": 0, "reused": len(prompts)}
+        print(f"Video phase already complete: {total}/{total}", flush=True)
+        return {"generated": 0, "reused": total}
 
     config = load_config(args.video_config)
     repo_path, _, _ = ensure_neodragon_assets(
@@ -193,12 +247,26 @@ def generate_videos(args, prompts: list[str], device: torch.device, dtype: torch
     backend = build_generation_backend(config.backend, device=device)
     generated = 0
     started = time.perf_counter()
-    for index, prompt in missing:
+    for prompt_index, prompt, sample_index in missing:
         conditioned_prompt = prompt + DEFAULT_PROMPT_MODIFIER
         prompt_embeds, prompt_mask, pooled = bridge.encode([conditioned_prompt])
-        first_frame = Image.open(anchor_path(anchor_dir, index, prompt)).convert("RGB")
-        torch.manual_seed(args.seed + index)
-        torch.cuda.manual_seed_all(args.seed + index)
+        first_frame = Image.open(
+            anchor_path(
+                anchor_dir,
+                prompt_index,
+                prompt,
+                sample_index,
+                args.samples_per_prompt,
+            )
+        ).convert("RGB")
+        seed = sample_seed(
+            args.seed,
+            prompt_index,
+            sample_index,
+            args.samples_per_prompt,
+        )
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
         with torch.autocast("cuda", dtype=dtype):
             frames = backend.generate_video_from_bridge_condition(
                 prompt,
@@ -210,7 +278,7 @@ def generate_videos(args, prompts: list[str], device: torch.device, dtype: torch
                 width=args.video_width,
                 num_frames=args.num_frames,
             )
-        destination = video_path(video_dir, prompt)
+        destination = video_path(video_dir, prompt, sample_index)
         temporary = destination.with_suffix(".tmp.mp4")
         export_to_video(frames, temporary, fps=args.fps)
         os.replace(temporary, destination)
@@ -218,7 +286,7 @@ def generate_videos(args, prompts: list[str], device: torch.device, dtype: torch
         if generated == 1 or generated % args.log_every == 0:
             elapsed = time.perf_counter() - started
             print(
-                f"Videos {len(prompts) - len(missing) + generated}/{len(prompts)} "
+                f"Videos {total - len(missing) + generated}/{total} "
                 f"new={generated} rate={generated / max(elapsed, 1e-6):.2f}/s",
                 flush=True,
             )
@@ -226,7 +294,7 @@ def generate_videos(args, prompts: list[str], device: torch.device, dtype: torch
     return {
         "checkpoint_step": checkpoint_step,
         "generated": generated,
-        "reused": len(prompts) - generated,
+        "reused": total - generated,
         "seconds": time.perf_counter() - started,
     }
 
@@ -252,6 +320,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-frames", type=int, default=49)
     parser.add_argument("--fps", type=int, default=24)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--samples-per-prompt",
+        type=int,
+        default=1,
+        help="Generate independently seeded samples named PROMPT-0.mp4 through PROMPT-(N-1).mp4.",
+    )
     parser.add_argument("--max-prompts", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--summary", required=True)
@@ -262,12 +336,16 @@ def main() -> None:
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("VBench generation requires one allocated CUDA GPU.")
+    if args.samples_per_prompt <= 0:
+        raise ValueError("--samples-per-prompt must be positive")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     device = torch.device("cuda")
     dtype = torch.bfloat16
     prompts = load_prompts(Path(args.vbench_info), args.max_prompts)
     print(
-        f"VBench generation prompts={len(prompts)} anchor={args.anchor_width}x{args.anchor_height}"
+        f"VBench generation prompts={len(prompts)} samples_per_prompt={args.samples_per_prompt} "
+        f"expected_videos={len(prompts) * args.samples_per_prompt} "
+        f"anchor={args.anchor_width}x{args.anchor_height}"
         f"@{args.anchor_time_id_width}x{args.anchor_time_id_height} "
         f"video={args.video_width}x{args.video_height}x{args.num_frames}",
         flush=True,
@@ -276,21 +354,33 @@ def main() -> None:
     anchor_summary = generate_anchors(args, prompts, device, dtype)
     video_summary = generate_videos(args, prompts, device, dtype)
     missing_anchors = [
-        prompt
-        for index, prompt in enumerate(prompts)
+        {"prompt": prompt, "sample_index": sample_index}
+        for index, prompt, sample_index in sample_items(prompts, args.samples_per_prompt)
         if not valid_image(
-            anchor_path(Path(args.anchor_dir), index, prompt),
+            anchor_path(
+                Path(args.anchor_dir),
+                index,
+                prompt,
+                sample_index,
+                args.samples_per_prompt,
+            ),
             (args.anchor_width, args.anchor_height),
         )
     ]
     missing_videos = [
-        prompt
-        for prompt in prompts
-        if not valid_video(video_path(Path(args.video_dir), prompt), args.num_frames)
+        {"prompt": prompt, "sample_index": sample_index}
+        for _, prompt, sample_index in sample_items(prompts, args.samples_per_prompt)
+        if not valid_video(
+            video_path(Path(args.video_dir), prompt, sample_index),
+            args.num_frames,
+        )
     ]
     summary = {
         "status": "ok" if not missing_anchors and not missing_videos else "incomplete",
         "unique_prompts": len(prompts),
+        "samples_per_prompt": args.samples_per_prompt,
+        "expected_anchors": len(prompts) * args.samples_per_prompt,
+        "expected_videos": len(prompts) * args.samples_per_prompt,
         "image_checkpoint": str(Path(args.image_bridge_checkpoint).resolve()),
         "video_checkpoint": str(Path(args.video_bridge_checkpoint).resolve()),
         "anchor": {
