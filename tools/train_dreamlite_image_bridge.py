@@ -20,7 +20,7 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from new_mobile_ov.bridge import MobileOVDreamLiteImageBridge
+from new_mobile_ov.bridge import DreamLiteCondition, MobileOVDreamLiteImageBridge
 from new_mobile_ov.config import load_config
 from new_mobile_ov.training.distributed import (
     barrier,
@@ -41,74 +41,12 @@ from new_mobile_ov.training.dreamlite_distillation import (
     parse_dreamlite_resolution_buckets,
 )
 from new_mobile_ov.training.neodragon_objectives import linear_ramp
-
-
-def clean_text(value: object) -> str:
-    if value is None:
-        return ""
-    try:
-        if pd.isna(value):
-            return ""
-    except Exception:
-        pass
-    return " ".join(str(value).strip().split())
-
-
-class CaptionDataset(Dataset):
-    def __init__(
-        self,
-        path: str | Path,
-        *,
-        variant_columns: list[str],
-        variant_weights: list[float],
-        fallback_column: str,
-        max_samples: int,
-    ) -> None:
-        path = Path(path)
-        sep = "\t" if path.suffix.lower() == ".tsv" else ","
-        frame = pd.read_csv(path, sep=sep, low_memory=False)
-        fallback = fallback_column if fallback_column in frame.columns else None
-        if fallback is None:
-            fallback = next(
-                (
-                    name
-                    for name in ("caption", "prompt", "text")
-                    if name in frame.columns
-                ),
-                None,
-            )
-        available_variants = [name for name in variant_columns if name in frame.columns]
-        if fallback is None and not available_variants:
-            raise ValueError(f"{path} has no caption, prompt, or text column.")
-        self.items: list[list[tuple[str, float]]] = []
-        for _, row in frame.iterrows():
-            choices = []
-            for name, weight in zip(variant_columns, variant_weights):
-                if name in frame.columns:
-                    value = clean_text(row.get(name))
-                    if value:
-                        choices.append((value, weight))
-            if not choices and fallback is not None:
-                value = clean_text(row.get(fallback))
-                if value:
-                    choices.append((value, 1.0))
-            if choices:
-                self.items.append(choices)
-        if max_samples > 0:
-            self.items = self.items[:max_samples]
-        if not self.items:
-            raise ValueError(f"No valid generation prompts found in {path}.")
-
-    def __len__(self) -> int:
-        return len(self.items)
-
-    def __getitem__(self, index: int) -> str:
-        choices = self.items[index]
-        return random.choices(
-            [value for value, _ in choices],
-            weights=[weight for _, weight in choices],
-            k=1,
-        )[0]
+from new_mobile_ov.training.prompt_curriculum import (
+    CaptionManifestDataset,
+    MixedPromptDataset,
+    clean_text,
+    prompt_example_collate,
+)
 
 
 class CompositionalPromptDataset(Dataset):
@@ -129,6 +67,10 @@ class CompositionalPromptDataset(Dataset):
     OBJECTS = (
         ("astronaut", "astronauts"),
         ("red panda", "red pandas"),
+        ("elephant", "elephants"),
+        ("rhinoceros", "rhinoceroses"),
+        ("golden retriever", "golden retrievers"),
+        ("tabby cat", "tabby cats"),
         ("ceramic teapot", "ceramic teapots"),
         ("kingfisher", "kingfishers"),
         ("robot", "robots"),
@@ -139,6 +81,12 @@ class CompositionalPromptDataset(Dataset):
         ("vintage camera", "vintage cameras"),
         ("origami crane", "origami cranes"),
         ("steam locomotive", "steam locomotives"),
+        ("grand piano", "grand pianos"),
+        ("fire engine", "fire engines"),
+        ("wooden chair", "wooden chairs"),
+        ("glass bottle", "glass bottles"),
+        ("sunflower", "sunflowers"),
+        ("lighthouse", "lighthouses"),
     )
     ACTIONS = (
         "standing beside a quiet lake",
@@ -149,6 +97,32 @@ class CompositionalPromptDataset(Dataset):
         "surrounded by wildflowers",
         "under dramatic studio lighting",
         "reflected in a rain-covered window",
+        "running across a sandy beach",
+        "cooking beside a kitchen counter",
+        "reading near a tall bookshelf",
+        "waiting on a crowded train platform",
+    )
+    SCENES = (
+        "a bright home kitchen",
+        "a quiet library reading room",
+        "an underwater aquarium tunnel",
+        "a busy airport terminal",
+        "a crowded train station platform",
+        "a hospital corridor",
+        "a science laboratory",
+        "a grocery store aisle",
+        "a children's classroom",
+        "an amusement park at dusk",
+        "a snowy mountain village",
+        "a tropical coral reef",
+        "a city street after rain",
+        "a spacious art museum",
+        "a small neighborhood cafe",
+        "a professional football stadium",
+        "a greenhouse full of plants",
+        "a rocky desert canyon",
+        "a modern office meeting room",
+        "a traditional wooden workshop",
     )
     STYLES = (
         "cinematic photograph",
@@ -178,7 +152,7 @@ class CompositionalPromptDataset(Dataset):
 
     def __getitem__(self, index: int) -> str:
         rng = random.Random(self.seed + 1000003 * int(index))
-        kind = rng.randrange(5)
+        kind = rng.randrange(8)
         color = rng.choice(self.COLORS)
         singular, plural = rng.choice(self.OBJECTS)
         action = rng.choice(self.ACTIONS)
@@ -202,9 +176,21 @@ class CompositionalPromptDataset(Dataset):
         if kind == 3:
             material = rng.choice(("glass", "wooden", "metal", "porcelain", "paper"))
             return f"A highly detailed {material} {singular} {action}, centered in a {style}."
+        if kind == 4:
+            return (
+                f"Wide composition: a small {color} {singular} {action}; keep the full subject "
+                f"visible with generous background space, {style}."
+            )
+        scene = rng.choice(self.SCENES)
+        if kind == 5:
+            return f"A {color} {singular} inside {scene}, with the complete scene clearly visible, {style}."
+        if kind == 6:
+            return f"A wide establishing view of {scene}, realistic layout and recognizable background details."
+        other_color = rng.choice([value for value in self.COLORS if value != color])
+        other, _ = rng.choice([value for value in self.OBJECTS if value[0] != singular])
         return (
-            f"Wide composition: a small {color} {singular} {action}; keep the full subject "
-            f"visible with generous background space, {style}."
+            f"Inside {scene}, a {color} {singular} is {rng.choice(self.RELATIONS)} "
+            f"a {other_color} {other}; both objects are fully visible."
         )
 
 
@@ -289,6 +275,51 @@ def dtype_from_name(value: str) -> torch.dtype:
 
 def split_csv(value: str) -> list[str]:
     return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def split_paths(value: str) -> list[str]:
+    return [item.strip() for item in str(value).split(";") if item.strip()]
+
+
+def select_condition(
+    condition: DreamLiteCondition,
+    indices: list[int],
+) -> DreamLiteCondition:
+    index = torch.as_tensor(
+        indices,
+        device=condition.prompt_embeds.device,
+        dtype=torch.long,
+    )
+    return DreamLiteCondition(
+        condition.prompt_embeds.index_select(0, index),
+        condition.attention_mask.index_select(0, index),
+    )
+
+
+def load_grounding_images(
+    image_paths: list[str],
+    source_names: list[str],
+    *,
+    allowed_sources: set[str],
+    max_images: int,
+) -> tuple[list[Image.Image], list[int]]:
+    images: list[Image.Image] = []
+    indices: list[int] = []
+    for index, (path_text, source) in enumerate(zip(image_paths, source_names)):
+        if allowed_sources and source not in allowed_sources:
+            continue
+        path = Path(path_text).expanduser() if path_text else None
+        if path is None or not path.is_file():
+            continue
+        try:
+            with Image.open(path) as image:
+                images.append(image.convert("RGB").copy())
+        except (OSError, ValueError):
+            continue
+        indices.append(index)
+        if len(images) >= max_images:
+            break
+    return images, indices
 
 
 def unwrap(model):
@@ -376,7 +407,31 @@ def parse_args() -> argparse.Namespace:
         description="Distill Qwen3-VL into the Mobile-OV DreamLite bridge."
     )
     parser.add_argument("--config", default="configs/mobile_ov_dreamlite.yaml")
-    parser.add_argument("--generation-prompts", required=True)
+    parser.add_argument(
+        "--generation-prompts",
+        default="",
+        help="Legacy single prompt manifest. Ignored when --generation-prompt-manifests is set.",
+    )
+    parser.add_argument(
+        "--generation-prompt-manifests",
+        default="",
+        help="Semicolon-separated caption manifests for weighted prompt mixing.",
+    )
+    parser.add_argument(
+        "--generation-source-weights",
+        default="",
+        help="Comma-separated source-level sampling weights.",
+    )
+    parser.add_argument(
+        "--generation-source-names",
+        default="",
+        help="Comma-separated stable source labels used by logs and grounding filters.",
+    )
+    parser.add_argument(
+        "--generation-image-columns",
+        default="image_path,media_path,video_path",
+        help="Candidate raw-image columns, in priority order.",
+    )
     parser.add_argument("--edit-manifest", default=None)
     parser.add_argument("--edit-image-column", default="source_image")
     parser.add_argument("--edit-instruction-column", default="instruction")
@@ -451,6 +506,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--functional-ramp-steps", type=int, default=5000)
     parser.add_argument("--functional-batch-size", type=int, default=1)
     parser.add_argument("--functional-call-weights", default="1,1,1,1")
+    parser.add_argument("--grounded-functional-probability", type=float, default=0.0)
+    parser.add_argument("--grounded-functional-weight", type=float, default=1.0)
+    parser.add_argument("--grounded-functional-start-step", type=int, default=-1)
+    parser.add_argument(
+        "--grounded-source-names",
+        default="",
+        help="Comma-separated prompt sources whose raw images may define functional states.",
+    )
     parser.add_argument("--transition-weight", type=float, default=0.0)
     parser.add_argument("--transition-cos-weight", type=float, default=0.0)
     parser.add_argument("--student-state-probability", type=float, default=0.0)
@@ -500,13 +563,82 @@ def main() -> None:
         raise ValueError(
             "caption variant columns and weights must have the same length"
         )
-    generation_data = CaptionDataset(
-        args.generation_prompts,
-        variant_columns=columns,
-        variant_weights=weights,
-        fallback_column=args.caption_fallback_column,
-        max_samples=args.max_samples,
+    manifest_paths = split_paths(args.generation_prompt_manifests)
+    if not manifest_paths and args.generation_prompts:
+        manifest_paths = [args.generation_prompts]
+    if not manifest_paths:
+        raise ValueError(
+            "Set --generation-prompts or --generation-prompt-manifests."
+        )
+    source_weights = [
+        float(value) for value in split_csv(args.generation_source_weights)
+    ]
+    if not source_weights:
+        source_weights = [1.0] * len(manifest_paths)
+    source_names = split_csv(args.generation_source_names)
+    if not source_names:
+        source_names = [Path(path).stem for path in manifest_paths]
+    if len(source_weights) != len(manifest_paths):
+        raise ValueError(
+            "generation source weights must match generation prompt manifests"
+        )
+    if len(source_names) != len(manifest_paths):
+        raise ValueError(
+            "generation source names must match generation prompt manifests"
+        )
+    if len(set(source_names)) != len(source_names):
+        raise ValueError("generation source names must be unique")
+    image_columns = split_csv(args.generation_image_columns)
+    generation_sources = [
+        CaptionManifestDataset(
+            path,
+            source_name=name,
+            variant_columns=columns,
+            variant_weights=weights,
+            fallback_column=args.caption_fallback_column,
+            image_columns=image_columns,
+            max_samples=args.max_samples,
+        )
+        for path, name in zip(manifest_paths, source_names)
+    ]
+    generation_data = MixedPromptDataset(
+        generation_sources,
+        source_weights,
+        seed=args.seed + 43,
     )
+    if not 0.0 <= args.semantic_prompt_probability <= 1.0:
+        raise ValueError("semantic prompt probability must be in [0, 1]")
+    if not 0.0 <= args.student_state_probability <= 1.0:
+        raise ValueError("student state probability must be in [0, 1]")
+    if not 0.0 <= args.grounded_functional_probability <= 1.0:
+        raise ValueError("grounded functional probability must be in [0, 1]")
+    if args.grounded_functional_weight < 0:
+        raise ValueError("grounded functional weight must be non-negative")
+    grounded_start_step = (
+        args.functional_start_step
+        if args.grounded_functional_start_step < 0
+        else args.grounded_functional_start_step
+    )
+    grounded_source_names = set(split_csv(args.grounded_source_names))
+    unknown_grounded_sources = grounded_source_names - set(source_names)
+    if unknown_grounded_sources:
+        raise ValueError(
+            "grounded source names are not generation sources: "
+            + ", ".join(sorted(unknown_grounded_sources))
+        )
+    eligible_grounded_sources = [
+        source
+        for source in generation_sources
+        if (
+            not grounded_source_names or source.source_name in grounded_source_names
+        )
+        and source.image_candidate_rows > 0
+    ]
+    if args.grounded_functional_probability > 0 and not eligible_grounded_sources:
+        raise ValueError(
+            "Grounded functional loss is enabled, but its selected manifests "
+            "contain no image paths with a supported extension."
+        )
     generation_sampler = (
         DistributedSampler(
             generation_data,
@@ -525,6 +657,7 @@ def main() -> None:
         shuffle=generation_sampler is None,
         num_workers=0,
         drop_last=True,
+        collate_fn=prompt_example_collate,
     )
     semantic_data = CompositionalPromptDataset(
         len(generation_data),
@@ -600,10 +733,6 @@ def main() -> None:
         device=context.device,
         dtype=inference_dtype,
     )
-    if not 0.0 <= args.semantic_prompt_probability <= 1.0:
-        raise ValueError("semantic prompt probability must be in [0, 1]")
-    if not 0.0 <= args.student_state_probability <= 1.0:
-        raise ValueError("student state probability must be in [0, 1]")
     functional_call_weights = [
         float(value) for value in split_csv(args.functional_call_weights)
     ]
@@ -649,6 +778,16 @@ def main() -> None:
         f"trainable_params={trainable_count:,} generation_rows={len(generation_data)} "
         f"semantic_rows={len(semantic_data)} semantic_probability={args.semantic_prompt_probability:g} "
         f"edit_rows={len(edit_loader.dataset) if edit_loader else 0} target_step={args.target_step}",
+    )
+    rank0_print(
+        context,
+        "Prompt sources: " + json.dumps(generation_data.source_summary),
+    )
+    rank0_print(
+        context,
+        f"Grounded functional: probability={args.grounded_functional_probability:g} "
+        f"weight={args.grounded_functional_weight:g} start_step={grounded_start_step} "
+        f"sources={sorted(grounded_source_names) or ['all-image-sources']}",
     )
     rank0_print(
         context,
@@ -748,18 +887,49 @@ def main() -> None:
             )
             if use_edit:
                 image_paths, prompts = next_edit()
-                images = [Image.open(path).convert("RGB") for path in image_paths]
+                images = []
+                for path in image_paths:
+                    with Image.open(path) as image:
+                        images.append(image.convert("RGB").copy())
                 mode = "edit"
+                prompt_source = "edit"
+                generation_image_paths: list[str] = []
+                generation_source_names: list[str] = []
+                use_semantic_prompts = False
             else:
                 use_semantic_prompts = (
                     mode_rng.random() < args.semantic_prompt_probability
                 )
-                prompts = list(
-                    next_semantic() if use_semantic_prompts else next_generation()
-                )
+                if use_semantic_prompts:
+                    prompts = list(next_semantic())
+                    generation_image_paths = [""] * len(prompts)
+                    generation_source_names = ["semantic"] * len(prompts)
+                else:
+                    (
+                        prompts,
+                        generation_image_paths,
+                        generation_source_names,
+                    ) = next_generation()
                 images = None
                 mode = "generate"
-                prompt_source = "semantic" if use_semantic_prompts else "openvid"
+                prompt_source = "+".join(sorted(set(generation_source_names)))
+            grounded_images: list[Image.Image] = []
+            grounded_indices: list[int] = []
+            attempt_grounded = (
+                mode == "generate"
+                and not use_semantic_prompts
+                and current_step
+                >= max(grounded_start_step, args.functional_start_step)
+                and args.grounded_functional_probability > 0
+                and functional_rng.random() < args.grounded_functional_probability
+            )
+            if attempt_grounded:
+                grounded_images, grounded_indices = load_grounding_images(
+                    generation_image_paths,
+                    generation_source_names,
+                    allowed_sources=grounded_source_names,
+                    max_images=args.functional_batch_size,
+                )
             optimizer.zero_grad(set_to_none=True)
             autocast_enabled = (
                 context.device.type == "cuda" and inference_dtype != torch.float32
@@ -772,7 +942,8 @@ def main() -> None:
                 student = bridge(prompts, mode=mode, images=images)
                 teacher_condition = teacher.encode(prompts, mode=mode, images=images)
                 use_content_alignment = (
-                    args.training_version.lower() in {"v5", "v6"} and mode == "generate"
+                    args.training_version.lower() in {"v5", "v6", "v7"}
+                    and mode == "generate"
                 )
                 use_direct_alignment = (
                     args.representation_mode == "direct" and mode == "generate"
@@ -857,6 +1028,7 @@ def main() -> None:
                     terminal_relative_mse=repr_value.new_zeros(()),
                     calls=0,
                 )
+                functional_loss_multiplier = 1.0
                 functional_scale = linear_ramp(
                     current_step,
                     start_step=args.functional_start_step,
@@ -885,23 +1057,38 @@ def main() -> None:
                         batch_size=args.closed_loop_batch_size,
                     )
                 elif current_step >= args.functional_start_step:
-                    phase = "functional"
-                    functional = controller.functional_loss(
-                        student,
-                        teacher_condition,
-                        source_images=images,
-                        height=resolution.height,
-                        width=resolution.width,
-                        time_id_height=resolution.time_id_height,
-                        time_id_width=resolution.time_id_width,
-                        batch_size=args.functional_batch_size,
-                        call_index=functional_call_index,
-                        state_source=functional_state_source,
-                    )
+                    if grounded_images:
+                        phase = "grounded_functional"
+                        functional_loss_multiplier = args.grounded_functional_weight
+                        functional = controller.grounded_functional_loss(
+                            select_condition(student, grounded_indices),
+                            select_condition(teacher_condition, grounded_indices),
+                            target_images=grounded_images,
+                            height=resolution.height,
+                            width=resolution.width,
+                            time_id_height=resolution.time_id_height,
+                            time_id_width=resolution.time_id_width,
+                            batch_size=len(grounded_images),
+                            call_index=functional_call_index,
+                        )
+                    else:
+                        phase = "functional"
+                        functional = controller.functional_loss(
+                            student,
+                            teacher_condition,
+                            source_images=images,
+                            height=resolution.height,
+                            width=resolution.width,
+                            time_id_height=resolution.time_id_height,
+                            time_id_width=resolution.time_id_width,
+                            batch_size=args.functional_batch_size,
+                            call_index=functional_call_index,
+                            state_source=functional_state_source,
+                        )
                 else:
                     phase = "representation"
                 loss = repr_scale * repr_value
-                loss = loss + functional_scale * (
+                loss = loss + functional_scale * functional_loss_multiplier * (
                     args.functional_weight * functional.relative_mse
                     + args.functional_cos_weight * functional.cosine
                     + args.transition_weight * functional.transition_relative_mse
@@ -1014,6 +1201,7 @@ def main() -> None:
                     ),
                     "functional_call_index": functional.call_index,
                     "functional_state_source": functional.state_source,
+                    "grounded_images": len(grounded_images),
                     "functional_transition_relative_mse": scalar_mean(
                         functional.transition_relative_mse.detach(),
                         context,
@@ -1043,7 +1231,7 @@ def main() -> None:
                         "func": f"{item['functional_relative_mse']:.4f}",
                         "res": resolution.label,
                     }
-                    if args.training_version.lower() in {"v5", "v6"}:
+                    if args.training_version.lower() in {"v5", "v6", "v7"}:
                         postfix["trans"] = (
                             f"{item['functional_transition_relative_mse']:.4f}"
                         )
@@ -1074,7 +1262,9 @@ def main() -> None:
                         "optimizer": optimizer.state_dict(),
                         "config": vars(args),
                         "architecture": (
-                            "MobileOVDreamLiteCompactBridgeV6"
+                            "MobileOVDreamLiteCompactBridgeV7"
+                            if args.training_version.lower() == "v7"
+                            else "MobileOVDreamLiteCompactBridgeV6"
                             if args.training_version.lower() == "v6"
                             else "MobileOVDreamLiteCompactBridgeV5"
                             if args.training_version.lower() == "v5"
@@ -1085,8 +1275,12 @@ def main() -> None:
                             else "MobileOVDreamLiteImageBridge"
                         ),
                         "teacher": "Qwen3-VL BF16 from DreamLite-mobile",
+                        "prompt_sources": generation_data.source_summary,
                         "functional_teacher": (
                             "frozen DreamLite-mobile UNet, native 4-call schedule, "
+                            "mixed generated and real-image-derived same-state response distillation"
+                            if args.training_version.lower() == "v7"
+                            else "frozen DreamLite-mobile UNet, native 4-call schedule, "
                             "mixed teacher/student-prefix same-state prediction and transition distillation"
                             if args.training_version.lower() in {"v5", "v6"}
                             else "same-state teacher-forced prefixes"

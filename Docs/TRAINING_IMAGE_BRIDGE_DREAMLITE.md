@@ -464,3 +464,58 @@ The job saves `dreamlite_image_bridge_latest.pt` every 5K steps and an archived
 `dreamlite_image_bridge_stepXXXXXX.pt` every 10K steps. It uses all three
 OpenVid caption granularities with equal probability and automatically resumes
 from the latest checkpoint in the same output directory.
+
+## V7: Mobile-O Prompt Mixing and Image-Grounded Functional Distillation
+
+V7 keeps the V6 compact bridge unchanged at approximately 5.73M trainable
+parameters. Qwen3-VL, SmolVLM2, the DreamLite UNet, and the DreamLite Tiny VAE
+remain frozen. The change is entirely in the data curriculum and loss states.
+
+The default source-level distribution is:
+
+- 45% OpenVid short/medium/long captions;
+- 36% merged Mobile-O JourneyDB + Short-Caption rows;
+- 9% Mobile-O-SFT rows when that manifest is available;
+- 10% synthetic semantic/compositional prompts.
+
+Weights are applied at the manifest level rather than in proportion to raw row
+counts. This prevents the one-million-row OpenVid manifest from suppressing the
+smaller short-caption and SFT sources. The synthetic curriculum now includes a
+larger object vocabulary and explicit scene categories such as kitchens,
+libraries, laboratories, stations, aquariums, classrooms, and shops. It does
+not contain the VBench prompt list.
+
+Mobile-O rows retain their raw image path. On 25% of eligible functional
+batches containing Mobile-O data, up to one raw image per GPU is encoded with
+DreamLite's own Tiny VAE. A valid scheduler sigma constructs a noisy state from
+this clean latent, and the frozen DreamLite UNet is evaluated twice on the same
+state:
+
+```text
+raw Mobile-O image -> frozen DreamLite Tiny VAE -> clean target latent
+clean target latent + noise + native sigma -> shared state x_k
+
+frozen UNet(x_k, native Qwen condition)  -> teacher response
+frozen UNet(x_k, Mobile-OV condition)    -> student response
+```
+
+The response and one-step transition losses are matched exactly as in regular
+functional distillation. The raw image is not passed through the edit channel,
+so an image-caption pair is never misrepresented as an editing example. Old
+WanVAE latent pickles are intentionally ignored because they are not in
+DreamLite's latent space.
+
+Grounded functional supervision is scaled by 0.5 and shares the existing
+functional ramp. All other functional steps retain the V6 generated-state
+objective. Closed-loop training remains disabled.
+
+Berzelius submission:
+
+```bash
+sbatch scripts/train_dreamlite_compact_v7_mobileo_1node8gpu.sbatch
+```
+
+The launcher expects the old Mobile-OV data under
+`../Mobile-OV_Alpha/data` by default. Override `MOBILEO_ROOT`,
+`MOBILEO_PROMPTS`, or `MOBILEO_SFT_PROMPTS` when needed. Its output is written
+to `output/dreamlite_compact_v7_mobileo/<SLURM_JOB_ID>/`.

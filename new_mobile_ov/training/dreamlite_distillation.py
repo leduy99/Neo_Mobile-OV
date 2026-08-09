@@ -595,6 +595,125 @@ class DreamLiteFrozenController:
         )
         return DreamLiteCondition(projected, condition.attention_mask)
 
+    def grounded_functional_loss(
+        self,
+        student: DreamLiteCondition,
+        teacher: DreamLiteCondition,
+        *,
+        target_images: Sequence[Image.Image],
+        height: int,
+        width: int,
+        time_id_height: int | None = None,
+        time_id_width: int | None = None,
+        batch_size: int,
+        call_index: int | None = None,
+    ) -> DreamLiteFunctionalResult:
+        """Match frozen-DreamLite responses at real-image-derived latent states.
+
+        The target image only defines the denoising state. It is deliberately
+        not passed through DreamLite's edit/source-image channel.
+        """
+        effect_batch = min(
+            batch_size,
+            student.prompt_embeds.shape[0],
+            teacher.prompt_embeds.shape[0],
+            len(target_images),
+        )
+        if effect_batch < 1:
+            raise ValueError("Grounded functional loss requires at least one image.")
+        student = DreamLiteCondition(
+            student.prompt_embeds[:effect_batch],
+            student.attention_mask[:effect_batch],
+        )
+        teacher = DreamLiteCondition(
+            teacher.prompt_embeds[:effect_batch],
+            teacher.attention_mask[:effect_batch],
+        )
+        clean = self.backend.encode_source_images(
+            list(target_images[:effect_batch]),
+            height=height,
+            width=width,
+        )
+        noise = self.backend.random_latents(effect_batch, height, width)
+        if clean.shape != noise.shape:
+            raise RuntimeError(
+                "DreamLite target-image latent shape does not match generation latent: "
+                f"{tuple(clean.shape)} vs {tuple(noise.shape)}"
+            )
+        teacher_scheduler = self.backend.make_scheduler()
+        student_scheduler = self.backend.make_scheduler()
+        teacher_timesteps = self.backend.prepare_schedule(
+            teacher_scheduler,
+            noise,
+            num_steps=self.num_steps,
+        )
+        student_timesteps = self.backend.prepare_schedule(
+            student_scheduler,
+            noise,
+            num_steps=self.num_steps,
+        )
+        if call_index is None:
+            call_index = int(
+                torch.randint(
+                    len(teacher_timesteps), (1,), device=noise.device
+                ).item()
+            )
+        if not 0 <= call_index < len(teacher_timesteps):
+            raise ValueError(
+                f"call_index={call_index} is outside the "
+                f"{len(teacher_timesteps)}-call schedule"
+            )
+        sigma = torch.as_tensor(
+            teacher_scheduler.sigmas[call_index],
+            device=clean.device,
+            dtype=clean.dtype,
+        )
+        shared_state = ((1.0 - sigma) * clean + sigma * noise).detach()
+        source = torch.zeros_like(shared_state)
+        teacher_timestep = teacher_timesteps[call_index]
+        student_timestep = student_timesteps[call_index]
+        with torch.no_grad():
+            teacher_prediction = self.backend.predict(
+                shared_state,
+                teacher_timestep,
+                teacher,
+                source_latents=source,
+                height=height,
+                width=width,
+                time_id_height=time_id_height,
+                time_id_width=time_id_width,
+            )
+            teacher_next = teacher_scheduler.step(
+                teacher_prediction,
+                teacher_timestep,
+                shared_state,
+                return_dict=False,
+            )[0]
+        student_prediction = self.backend.predict(
+            shared_state,
+            student_timestep,
+            student,
+            source_latents=source,
+            height=height,
+            width=width,
+            time_id_height=time_id_height,
+            time_id_width=time_id_width,
+        )
+        student_next = student_scheduler.step(
+            student_prediction,
+            student_timestep,
+            shared_state,
+            return_dict=False,
+        )[0]
+        return DreamLiteFunctionalResult(
+            relative_mse=relative_mse(student_prediction, teacher_prediction),
+            cosine=flat_cosine_distance(student_prediction, teacher_prediction),
+            transition_relative_mse=relative_mse(student_next, teacher_next),
+            transition_cosine=flat_cosine_distance(student_next, teacher_next),
+            call_index=call_index,
+            state_source="image",
+        )
+
     def functional_loss(
         self,
         student: DreamLiteCondition,

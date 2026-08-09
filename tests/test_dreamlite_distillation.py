@@ -246,6 +246,9 @@ def test_resolution_bucket_parser_keeps_actual_and_logical_sizes_separate() -> N
 
 
 class FakeScheduler:
+    def __init__(self) -> None:
+        self.sigmas = torch.tensor([0.75, 0.5, 0.25, 0.0])
+
     def step(self, prediction, timestep, latents, return_dict):
         del timestep
         assert return_dict is False
@@ -258,6 +261,9 @@ class FakeDreamLiteBackend:
 
     def random_latents(self, batch_size, height, width):
         return torch.zeros(batch_size, 1, height // 8, width // 8)
+
+    def encode_source_images(self, images, *, height, width):
+        return torch.ones(len(images), 1, height // 8, width // 8)
 
     def make_scheduler(self):
         return FakeScheduler()
@@ -358,3 +364,36 @@ def test_functional_loss_can_use_detached_student_prefix_without_state_mismatch(
     assert torch.equal(calls[-2]["latents"], calls[-1]["latents"])
     assert result.state_source == "student"
     assert student_tokens.grad is not None
+
+
+def test_grounded_functional_loss_uses_real_image_state_not_edit_condition() -> None:
+    controller = DreamLiteFrozenController.__new__(DreamLiteFrozenController)
+    controller.backend = FakeDreamLiteBackend()
+    controller.num_steps = 4
+    student_tokens = torch.full((1, 5, 8), 0.75, requires_grad=True)
+    teacher_tokens = torch.full((1, 5, 8), 0.5)
+    mask = torch.ones(1, 5, dtype=torch.long)
+
+    result = controller.grounded_functional_loss(
+        DreamLiteCondition(student_tokens, mask),
+        DreamLiteCondition(teacher_tokens, mask),
+        target_images=[object()],
+        height=64,
+        width=96,
+        time_id_height=800,
+        time_id_width=1280,
+        batch_size=1,
+        call_index=1,
+    )
+    (result.relative_mse + result.transition_relative_mse).backward()
+
+    calls = controller.backend.calls
+    assert len(calls) == 2
+    assert torch.equal(calls[0]["latents"], calls[1]["latents"])
+    assert torch.allclose(calls[0]["latents"], torch.full_like(calls[0]["latents"], 0.5))
+    assert calls[0]["time_id_height"] == 800
+    assert calls[0]["time_id_width"] == 1280
+    assert result.state_source == "image"
+    assert result.call_index == 1
+    assert student_tokens.grad is not None
+    assert torch.isfinite(student_tokens.grad).all()
