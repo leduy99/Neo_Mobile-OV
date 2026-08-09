@@ -444,6 +444,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=4e-5)
     parser.add_argument("--lr-warmup-steps", type=int, default=1000)
     parser.add_argument("--lr-final-scale", type=float, default=0.1)
+    parser.add_argument(
+        "--lr-decay-end-step",
+        type=int,
+        default=-1,
+        help=(
+            "Step where cosine decay reaches --lr-final-scale. Negative uses "
+            "--target-step; later steps keep the final learning rate."
+        ),
+    )
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--clip-grad-norm", type=float, default=1.0)
@@ -614,6 +623,11 @@ def main() -> None:
         raise ValueError("grounded functional probability must be in [0, 1]")
     if args.grounded_functional_weight < 0:
         raise ValueError("grounded functional weight must be non-negative")
+    lr_decay_end_step = (
+        args.target_step if args.lr_decay_end_step < 0 else args.lr_decay_end_step
+    )
+    if lr_decay_end_step < args.lr_warmup_steps:
+        raise ValueError("lr decay end step must not precede lr warmup")
     grounded_start_step = (
         args.functional_start_step
         if args.grounded_functional_start_step < 0
@@ -781,6 +795,11 @@ def main() -> None:
     )
     rank0_print(
         context,
+        f"LR schedule: base={args.lr:g} warmup={args.lr_warmup_steps} "
+        f"decay_end={lr_decay_end_step} final={args.lr * args.lr_final_scale:g}",
+    )
+    rank0_print(
+        context,
         "Prompt sources: " + json.dumps(generation_data.source_summary),
     )
     rank0_print(
@@ -849,7 +868,7 @@ def main() -> None:
             current_step += 1
             scale = lr_scale(
                 current_step,
-                total_steps=args.target_step,
+                total_steps=lr_decay_end_step,
                 warmup_steps=args.lr_warmup_steps,
                 final_scale=args.lr_final_scale,
             )
@@ -942,7 +961,7 @@ def main() -> None:
                 student = bridge(prompts, mode=mode, images=images)
                 teacher_condition = teacher.encode(prompts, mode=mode, images=images)
                 use_content_alignment = (
-                    args.training_version.lower() in {"v5", "v6", "v7"}
+                    args.training_version.lower() in {"v5", "v6", "v7", "v8"}
                     and mode == "generate"
                 )
                 use_direct_alignment = (
@@ -1231,7 +1250,7 @@ def main() -> None:
                         "func": f"{item['functional_relative_mse']:.4f}",
                         "res": resolution.label,
                     }
-                    if args.training_version.lower() in {"v5", "v6", "v7"}:
+                    if args.training_version.lower() in {"v5", "v6", "v7", "v8"}:
                         postfix["trans"] = (
                             f"{item['functional_transition_relative_mse']:.4f}"
                         )
@@ -1263,7 +1282,7 @@ def main() -> None:
                         "config": vars(args),
                         "architecture": (
                             "MobileOVDreamLiteCompactBridgeV7"
-                            if args.training_version.lower() == "v7"
+                            if args.training_version.lower() in {"v7", "v8"}
                             else "MobileOVDreamLiteCompactBridgeV6"
                             if args.training_version.lower() == "v6"
                             else "MobileOVDreamLiteCompactBridgeV5"
@@ -1279,7 +1298,7 @@ def main() -> None:
                         "functional_teacher": (
                             "frozen DreamLite-mobile UNet, native 4-call schedule, "
                             "mixed generated and real-image-derived same-state response distillation"
-                            if args.training_version.lower() == "v7"
+                            if args.training_version.lower() in {"v7", "v8"}
                             else "frozen DreamLite-mobile UNet, native 4-call schedule, "
                             "mixed teacher/student-prefix same-state prediction and transition distillation"
                             if args.training_version.lower() in {"v5", "v6"}
