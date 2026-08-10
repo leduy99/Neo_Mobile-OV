@@ -814,12 +814,28 @@ class SanaPromptBridge(nn.Module):
             return hidden_states, attention_mask, all_hidden_states
         return hidden_states, None, all_hidden_states
 
-    def forward(self, prompts: List[str], return_mask: bool = False, return_aux: bool = False):
-        need_all = self.projector_type in ("mcp_tiny", "mcp_full", "mcp_lexical_gated", "mcp_lexical_bottleneck")
-        hidden_states, attention_mask, all_hidden_states = self.encode_prompts(
-            prompts,
-            return_mask=return_mask,
-            return_all_hidden_states=need_all,
+    def project_features(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        all_hidden_states: Optional[List[torch.Tensor]] = None,
+        *,
+        return_mask: bool = False,
+        return_aux: bool = False,
+    ):
+        """Apply this bridge head to already-computed SmolVLM2 features.
+
+        This boundary makes it possible for multiple generation heads to reuse a
+        single frozen SmolVLM2 forward without changing the learned projector.
+        ``hidden_states`` and ``all_hidden_states`` must already use the same
+        strict token selection as :meth:`encode_prompts`.
+        """
+
+        need_all = self.projector_type in (
+            "mcp_tiny",
+            "mcp_full",
+            "mcp_lexical_gated",
+            "mcp_lexical_bottleneck",
         )
         aux: Dict[str, Any] = {}
 
@@ -883,3 +899,23 @@ class SanaPromptBridge(nn.Module):
         if return_aux:
             return prompt_embeds, aux
         return prompt_embeds
+
+    def forward(self, prompts: List[str], return_mask: bool = False, return_aux: bool = False):
+        need_all = self.projector_type in (
+            "mcp_tiny",
+            "mcp_full",
+            "mcp_lexical_gated",
+            "mcp_lexical_bottleneck",
+        )
+        hidden_states, attention_mask, all_hidden_states = self.encode_prompts(
+            prompts,
+            return_mask=return_mask,
+            return_all_hidden_states=need_all,
+        )
+        return self.project_features(
+            hidden_states,
+            attention_mask,
+            all_hidden_states,
+            return_mask=return_mask,
+            return_aux=return_aux,
+        )

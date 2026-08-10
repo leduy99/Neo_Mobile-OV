@@ -228,6 +228,8 @@ class MobileOVDreamLiteImageBridge(nn.Module):
         *,
         device: torch.device | None = None,
         dtype: torch.dtype = torch.bfloat16,
+        load_feature_provider: bool = True,
+        external_feature_dim: int | None = None,
     ) -> None:
         super().__init__()
         device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -239,13 +241,21 @@ class MobileOVDreamLiteImageBridge(nn.Module):
         self.native_tokenizer_path = str(dreamlite_cfg.native_tokenizer_path)
         self.native_generation_prefix_tokens = int(dreamlite_cfg.native_generation_prefix_tokens)
         self._native_tokenizer = None
-        self.feature_provider = SmolVLM2MultimodalFeatureProvider(
-            bridge_cfg,
-            dreamlite_cfg,
-            device=device,
-            dtype=dtype,
-        )
-        source_dim = int(self.feature_provider.hidden_size)
+        self.feature_provider: SmolVLM2MultimodalFeatureProvider | None = None
+        if load_feature_provider:
+            self.feature_provider = SmolVLM2MultimodalFeatureProvider(
+                bridge_cfg,
+                dreamlite_cfg,
+                device=device,
+                dtype=dtype,
+            )
+            source_dim = int(self.feature_provider.hidden_size)
+        elif external_feature_dim is not None and int(external_feature_dim) > 0:
+            source_dim = int(external_feature_dim)
+        else:
+            raise ValueError(
+                "external_feature_dim is required when load_feature_provider=False."
+            )
         attention_dim = int(dreamlite_cfg.attention_dim)
         self.num_fuse_layers = int(dreamlite_cfg.num_fuse_layers)
         if self.num_fuse_layers < 1:
@@ -311,7 +321,8 @@ class MobileOVDreamLiteImageBridge(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        self.feature_provider.smolvlm2_model.eval()
+        if self.feature_provider is not None:
+            self.feature_provider.smolvlm2_model.eval()
         return self
 
     def promote_trainable_parameters_to_fp32(self) -> None:
@@ -354,18 +365,22 @@ class MobileOVDreamLiteImageBridge(nn.Module):
         lexical_gate = torch.sigmoid(self.lexical_gate_logit).to(dtype=semantic.dtype)
         return self.source_output_norm(semantic + lexical_gate * lexical)
 
-    def forward(
+    def forward_from_smolvlm2_features(
         self,
         prompts: List[str],
         *,
+        hidden_layers: list[torch.Tensor],
+        source_mask: torch.Tensor,
         mode: DreamLiteMode = "generate",
-        images: Sequence[Image.Image] | None = None,
     ) -> DreamLiteCondition:
-        hidden_layers, source_mask = self.feature_provider(
-            prompts,
-            mode=mode,
-            images=images,
-        )
+        """Project externally computed, canonical SmolVLM2 features to DreamLite.
+
+        The external encoder must provide hidden layers and a mask from the same
+        prompt tokenization.  This is intentionally separate from ``forward``:
+        a legacy image checkpoint trained with the ``[Generate]:`` template
+        needs re-distillation before this shared path is quality-valid.
+        """
+
         source = self._fuse_source(hidden_layers)
         mode_index = 0 if mode == "generate" else 1
         mode_value = self.mode_embedding.weight[mode_index].to(dtype=source.dtype)
@@ -388,3 +403,41 @@ class MobileOVDreamLiteImageBridge(nn.Module):
         prompt_embeds = prompt_embeds * query_mask.to(dtype=prompt_embeds.dtype).unsqueeze(-1)
         attention_mask = query_mask.to(dtype=torch.long)
         return DreamLiteCondition(prompt_embeds=prompt_embeds, attention_mask=attention_mask)
+
+    def forward(
+        self,
+        prompts: List[str],
+        *,
+        mode: DreamLiteMode = "generate",
+        images: Sequence[Image.Image] | None = None,
+        shared_hidden_layers: list[torch.Tensor] | None = None,
+        shared_source_mask: torch.Tensor | None = None,
+    ) -> DreamLiteCondition:
+        if (shared_hidden_layers is None) != (shared_source_mask is None):
+            raise ValueError(
+                "shared_hidden_layers and shared_source_mask must be provided together."
+            )
+        if shared_hidden_layers is not None:
+            if images is not None:
+                raise ValueError("Shared text features do not support image-edit conditioning.")
+            return self.forward_from_smolvlm2_features(
+                prompts,
+                hidden_layers=shared_hidden_layers,
+                source_mask=shared_source_mask,
+                mode=mode,
+            )
+        if self.feature_provider is None:
+            raise RuntimeError(
+                "This image bridge has no local SmolVLM2 provider. Supply shared features."
+            )
+        hidden_layers, source_mask = self.feature_provider(
+            prompts,
+            mode=mode,
+            images=images,
+        )
+        return self.forward_from_smolvlm2_features(
+            prompts,
+            hidden_layers=hidden_layers,
+            source_mask=source_mask,
+            mode=mode,
+        )

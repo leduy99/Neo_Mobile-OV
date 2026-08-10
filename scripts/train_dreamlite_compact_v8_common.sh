@@ -27,6 +27,7 @@ SHORT_PROMPTS="${SHORT_PROMPTS:-${MOBILEO_ROOT}/short_caption_pretrain/manifests
 OUT="${OUT:-output/dreamlite_compact_v8_${V8_VARIANT}}"
 TARGET_STEP="${TARGET_STEP:-160000}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+TRAINING_VERSION="${TRAINING_VERSION:-v8}"
 RESOLUTION_BUCKETS="${RESOLUTION_BUCKETS:-512x512@1024x1024:15,768x768@1024x1024:10,1024x1024@1024x1024:15,640x400@1280x800:15,1024x640@1280x800:20,400x640@800x1280:10,640x1024@800x1280:15}"
 STOP_FILE="${TMPDIR%/}/dreamlite_v8_${V8_VARIANT}_setup_${SLURM_JOB_ID:-local}.stop"
 
@@ -135,7 +136,8 @@ trap - EXIT INT TERM
   --student-state-start-step "${STUDENT_STATE_START_STEP:-30001}" \
   --student-state-ramp-steps "${STUDENT_STATE_RAMP_STEPS:-20000}" \
   --closed-loop-weight 0 \
-  --training-version v8 \
+  --training-version "${TRAINING_VERSION}" \
+  --shared-prompt-suffix "${SHARED_PROMPT_SUFFIX:-}" \
   --log-every "${LOG_EVERY:-20}" \
   --save-latest-every "${SAVE_LATEST_EVERY:-5000}" \
   --save-archive-every "${SAVE_ARCHIVE_EVERY:-10000}" \

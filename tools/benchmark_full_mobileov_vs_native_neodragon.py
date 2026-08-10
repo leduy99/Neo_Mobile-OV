@@ -24,7 +24,11 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from new_mobile_ov.bridge import MobileOVDreamLiteImageBridge, MobileOVNeodragonTextBridge
+from new_mobile_ov.bridge import (
+    MobileOVDreamLiteImageBridge,
+    MobileOVNeodragonTextBridge,
+    SharedMobileOVGenerationConditioner,
+)
 from new_mobile_ov.config import load_config
 from new_mobile_ov.generation import build_generation_backend
 from new_mobile_ov.generation.backends import DreamLiteMobileBackend
@@ -131,9 +135,10 @@ def native_hybrid_once(backend, prompt: str, *, height: int, width: int, frames:
 def mobile_once(
     *,
     prompt: str,
-    image_bridge: MobileOVDreamLiteImageBridge,
+    image_bridge: MobileOVDreamLiteImageBridge | None,
     image_backend: DreamLiteMobileBackend,
-    video_bridge: MobileOVNeodragonTextBridge,
+    video_bridge: MobileOVNeodragonTextBridge | None,
+    shared_conditioner: SharedMobileOVGenerationConditioner | None,
     video_backend,
     anchor_height: int,
     anchor_width: int,
@@ -149,7 +154,32 @@ def mobile_once(
     from neodragon.utils.generation_utils import DEFAULT_PROMPT_MODIFIER
 
     with torch.autocast("cuda", dtype=video_backend.dtype):
-        condition, image_bridge_seconds = timed(device, lambda: image_bridge([prompt], mode="generate"))
+        if shared_conditioner is None:
+            if image_bridge is None or video_bridge is None:
+                raise RuntimeError("Legacy Mobile-OV timing needs both bridge modules.")
+            condition, image_bridge_seconds = timed(
+                device,
+                lambda: image_bridge([prompt], mode="generate"),
+            )
+            bridge_outputs, video_bridge_seconds = timed(
+                device,
+                lambda: video_bridge.encode([str(prompt) + DEFAULT_PROMPT_MODIFIER]),
+            )
+            shared_condition_seconds = 0.0
+        else:
+            shared, shared_condition_seconds = timed(
+                device,
+                lambda: shared_conditioner.encode_generation([prompt]),
+            )
+            condition = shared.image
+            bridge_outputs = (
+                shared.video_prompt_embeds,
+                shared.video_prompt_mask,
+                shared.video_pooled,
+            )
+            # One encoder call serves both heads, so per-head timing is not meaningful.
+            image_bridge_seconds = 0.0
+            video_bridge_seconds = 0.0
         first_frame, dreamlite_seconds = timed(
             device,
             lambda: image_backend.generate_images(
@@ -161,10 +191,6 @@ def mobile_once(
                 num_steps=image_steps,
                 seed=seed,
             )[0].convert("RGB"),
-        )
-        bridge_outputs, video_bridge_seconds = timed(
-            device,
-            lambda: video_bridge.encode([str(prompt) + DEFAULT_PROMPT_MODIFIER]),
         )
         prompt_embeds, prompt_mask, pooled = bridge_outputs
         video, video_seconds = timed(
@@ -184,6 +210,7 @@ def mobile_once(
         "image_bridge_seconds": image_bridge_seconds,
         "dreamlite_first_frame_seconds": dreamlite_seconds,
         "video_bridge_seconds": video_bridge_seconds,
+        "shared_condition_seconds": shared_condition_seconds,
         "video_seconds": video_seconds,
     }
 
@@ -230,6 +257,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-config", default="configs/mobile_ov_neodragon.yaml")
     parser.add_argument("--image-bridge-ckpt", required=True)
     parser.add_argument("--video-bridge-ckpt", required=True)
+    parser.add_argument(
+        "--shared-smolvlm2",
+        action="store_true",
+        help=(
+            "Use a re-distilled shared image head with one Exp1 SmolVLM2 forward. "
+            "The image checkpoint must declare shared_smolvlm2.enabled=true."
+        ),
+    )
     parser.add_argument("--prompt", action="append", default=[])
     parser.add_argument("--height", type=int, default=320)
     parser.add_argument("--width", type=int, default=512)
@@ -263,7 +298,18 @@ def main() -> None:
     image_cfg = load_config(args.image_config)
     video_cfg = load_config(args.video_config)
     dtype = dtype_from_name(video_cfg.backend.dtype)
-    image_state, image_step = load_state(args.image_bridge_ckpt)
+    image_payload = torch.load(args.image_bridge_ckpt, map_location="cpu", weights_only=False)
+    image_state = image_payload.get("bridge", image_payload)
+    image_step = int(image_payload.get("step", -1))
+    if not isinstance(image_state, dict):
+        raise TypeError(f"Checkpoint {args.image_bridge_ckpt} does not contain an image bridge state.")
+    shared_metadata = image_payload.get("shared_smolvlm2", {})
+    if args.shared_smolvlm2 and not bool(shared_metadata.get("enabled", False)):
+        raise ValueError(
+            "--shared-smolvlm2 requires an image checkpoint trained with "
+            "--shared-video-bridge-ckpt; V1-V7 image heads have a different "
+            "SmolVLM2 prompt contract."
+        )
     video_state, video_step = load_state(args.video_bridge_ckpt)
 
     started = time.perf_counter()
@@ -317,19 +363,45 @@ def main() -> None:
 
     prune_native_only_components(video_backend)
     started = time.perf_counter()
-    image_bridge = MobileOVDreamLiteImageBridge(
-        image_cfg.bridge,
-        image_cfg.dreamlite_bridge,
-        device=device,
-        dtype=dtype,
-    ).eval()
-    image_bridge.load_trainable_state_dict(image_state)
-    image_backend = DreamLiteMobileBackend(image_cfg.dreamlite, device=device, dtype=dtype, load_vae=True)
     video_bridge = MobileOVNeodragonTextBridge(video_cfg.bridge, device=device, dtype=dtype).eval()
     missing, unexpected = video_bridge.load_state_dict(video_state, strict=False)
     if missing or unexpected:
         raise RuntimeError(f"Video bridge checkpoint mismatch: missing={missing}, unexpected={unexpected}")
-    del image_state, video_state
+    shared_conditioner = None
+    if args.shared_smolvlm2:
+        source_dim = int(video_bridge.token_bridge.smolvlm2_model.config.text_config.hidden_size)
+        image_bridge = MobileOVDreamLiteImageBridge(
+            image_cfg.bridge,
+            image_cfg.dreamlite_bridge,
+            device=device,
+            dtype=dtype,
+            load_feature_provider=False,
+            external_feature_dim=source_dim,
+        ).eval()
+        image_bridge.load_trainable_state_dict(image_state)
+        shared_conditioner = SharedMobileOVGenerationConditioner(
+            image_bridge=image_bridge,
+            video_bridge=video_bridge,
+            prompt_suffix=str(shared_metadata.get("prompt_suffix", "")),
+        ).eval()
+        # The conditioner owns both heads. Do not retain duplicate references.
+        image_bridge = None
+        video_bridge = None
+    else:
+        image_bridge = MobileOVDreamLiteImageBridge(
+            image_cfg.bridge,
+            image_cfg.dreamlite_bridge,
+            device=device,
+            dtype=dtype,
+        ).eval()
+        image_bridge.load_trainable_state_dict(image_state)
+    image_backend = DreamLiteMobileBackend(
+        image_cfg.dreamlite,
+        device=device,
+        dtype=dtype,
+        load_vae=True,
+    )
+    del image_state, image_payload, video_state
     synchronize(device)
     mobile_extra_load_seconds = time.perf_counter() - started
     print(f"Loaded Mobile-OV conditioning modules in {mobile_extra_load_seconds:.2f}s", flush=True)
@@ -344,6 +416,7 @@ def main() -> None:
             image_bridge=image_bridge,
             image_backend=image_backend,
             video_bridge=video_bridge,
+            shared_conditioner=shared_conditioner,
             video_backend=video_backend,
             anchor_height=args.anchor_height,
             anchor_width=args.anchor_width,
@@ -376,6 +449,7 @@ def main() -> None:
         "image_bridge_seconds",
         "dreamlite_first_frame_seconds",
         "video_bridge_seconds",
+        "shared_condition_seconds",
         "video_seconds",
         "qsr_upload_seconds",
         "qsr_forward_seconds",
@@ -392,6 +466,7 @@ def main() -> None:
             "num_frames": args.num_frames,
             "hybrid_schedule": "1-1-1",
             "image_steps": args.image_steps,
+            "shared_smolvlm2": bool(args.shared_smolvlm2),
             "warmup": args.warmup,
             "runs": args.runs,
             "quicksr": {
@@ -406,6 +481,7 @@ def main() -> None:
         "checkpoints": {
             "image_bridge": str(Path(args.image_bridge_ckpt).resolve()),
             "image_bridge_step": image_step,
+            "shared_smolvlm2": shared_metadata if args.shared_smolvlm2 else None,
             "video_bridge": str(Path(args.video_bridge_ckpt).resolve()),
             "video_bridge_step": video_step,
         },

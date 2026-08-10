@@ -92,7 +92,48 @@ class MobileOVNeodragonTextBridge(nn.Module):
         self,
         prompts: List[str],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        prompt_embeds, prompt_mask = self.token_bridge(prompts, return_mask=True)
+        hidden_states, prompt_mask, all_hidden_states = self.encode_smolvlm2_features(prompts)
+        return self.encode_from_smolvlm2_features(
+            hidden_states,
+            prompt_mask,
+            all_hidden_states,
+        )
+
+    def encode_smolvlm2_features(
+        self,
+        prompts: List[str],
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor] | None]:
+        """Run the frozen SmolVLM2 backbone once using the Exp1 token contract."""
+
+        need_all = self.token_bridge.projector_type in (
+            "mcp_tiny",
+            "mcp_full",
+            "mcp_lexical_gated",
+            "mcp_lexical_bottleneck",
+        )
+        hidden_states, prompt_mask, all_hidden_states = self.token_bridge.encode_prompts(
+            prompts,
+            return_mask=True,
+            return_all_hidden_states=need_all,
+        )
+        if prompt_mask is None:
+            raise RuntimeError("SmolVLM2 feature encoding did not return an attention mask.")
+        return hidden_states, prompt_mask, all_hidden_states
+
+    def encode_from_smolvlm2_features(
+        self,
+        hidden_states: torch.Tensor,
+        prompt_mask: torch.Tensor,
+        all_hidden_states: List[torch.Tensor] | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project precomputed Exp1-compatible SmolVLM2 features to NeoDragon."""
+
+        prompt_embeds, prompt_mask = self.token_bridge.project_features(
+            hidden_states,
+            prompt_mask,
+            all_hidden_states,
+            return_mask=True,
+        )
         prompt_embeds = prompt_embeds.to(device=self.device, dtype=self.dtype)
         prompt_mask = prompt_mask.to(device=self.device)
         pooled_source = pool_prompt_tokens(prompt_embeds, prompt_mask)

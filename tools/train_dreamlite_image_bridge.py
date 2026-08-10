@@ -20,7 +20,11 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from new_mobile_ov.bridge import DreamLiteCondition, MobileOVDreamLiteImageBridge
+from new_mobile_ov.bridge import (
+    DreamLiteCondition,
+    MobileOVDreamLiteImageBridge,
+    MobileOVNeodragonTextBridge,
+)
 from new_mobile_ov.config import load_config
 from new_mobile_ov.training.distributed import (
     barrier,
@@ -436,6 +440,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--edit-image-column", default="source_image")
     parser.add_argument("--edit-instruction-column", default="instruction")
     parser.add_argument("--edit-probability", type=float, default=0.25)
+    parser.add_argument(
+        "--shared-video-bridge-ckpt",
+        default="",
+        help=(
+            "Exp1 NeoDragon bridge checkpoint. When set, run SmolVLM2 once on "
+            "the Exp1 token contract and train the DreamLite image head from those "
+            "shared features. Generation-only; image editing remains a separate "
+            "multimodal conditioning path."
+        ),
+    )
+    parser.add_argument(
+        "--shared-video-config",
+        default="configs/mobile_ov_neodragon.yaml",
+        help=(
+            "NeoDragon bridge config that defines the canonical shared SmolVLM2 "
+            "token contract. Must match --shared-video-bridge-ckpt."
+        ),
+    )
+    parser.add_argument(
+        "--shared-prompt-suffix",
+        default="",
+        help=(
+            "Suffix appended once before the shared Exp1 SmolVLM2 forward. "
+            "The DreamLite Qwen teacher continues to receive the original prompt."
+        ),
+    )
     parser.add_argument("--output-dir", default="output/dreamlite_image_bridge")
     parser.add_argument("--target-step", type=int, default=100000)
     parser.add_argument("--resume", default="auto")
@@ -553,6 +583,11 @@ def main() -> None:
     inference_dtype = dtype_from_name(args.dtype)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    shared_video_bridge_ckpt = str(args.shared_video_bridge_ckpt).strip()
+    if shared_video_bridge_ckpt and args.edit_manifest:
+        raise ValueError(
+            "Shared SmolVLM2 image training is generation-only. Do not set --edit-manifest."
+        )
     if args.resolution_buckets:
         resolution_buckets = parse_dreamlite_resolution_buckets(args.resolution_buckets)
     else:
@@ -726,16 +761,55 @@ def main() -> None:
             collate_fn=edit_collate,
         )
 
-    rank0_print(
-        context,
-        "Loading frozen SmolVLM2, Qwen3-VL teacher, and DreamLite controller...",
-    )
-    bridge = MobileOVDreamLiteImageBridge(
-        config.bridge,
-        config.dreamlite_bridge,
-        device=context.device,
-        dtype=inference_dtype,
-    )
+    rank0_print(context, "Loading Qwen3-VL teacher and DreamLite controller...")
+    shared_video_bridge = None
+    if shared_video_bridge_ckpt:
+        checkpoint_path = Path(shared_video_bridge_ckpt)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Missing shared video bridge checkpoint: {checkpoint_path}")
+        shared_video_config_path = Path(args.shared_video_config)
+        if not shared_video_config_path.is_file():
+            raise FileNotFoundError(
+                f"Missing shared video bridge config: {shared_video_config_path}"
+            )
+        rank0_print(
+            context,
+            "Loading frozen Exp1 video bridge as the shared SmolVLM2 encoder...",
+        )
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        state = payload.get("bridge", payload)
+        shared_video_config = load_config(shared_video_config_path)
+        shared_video_bridge = MobileOVNeodragonTextBridge(
+            shared_video_config.bridge,
+            device=context.device,
+            dtype=inference_dtype,
+        ).eval()
+        missing, unexpected = shared_video_bridge.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                "Shared video bridge checkpoint mismatch: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        shared_video_bridge.requires_grad_(False)
+        source_dim = int(
+            shared_video_bridge.token_bridge.smolvlm2_model.config.text_config.hidden_size
+        )
+        bridge = MobileOVDreamLiteImageBridge(
+            config.bridge,
+            config.dreamlite_bridge,
+            device=context.device,
+            dtype=inference_dtype,
+            load_feature_provider=False,
+            external_feature_dim=source_dim,
+        )
+    else:
+        rank0_print(context, "Loading frozen local SmolVLM2 image encoder...")
+        bridge = MobileOVDreamLiteImageBridge(
+            config.bridge,
+            config.dreamlite_bridge,
+            device=context.device,
+            dtype=inference_dtype,
+        )
     bridge.promote_trainable_parameters_to_fp32()
     teacher = DreamLiteFrozenQwenTeacher(
         config.dreamlite,
@@ -791,7 +865,8 @@ def main() -> None:
         f"batch_per_gpu={args.batch_size} global_batch={args.batch_size * context.world_size} "
         f"trainable_params={trainable_count:,} generation_rows={len(generation_data)} "
         f"semantic_rows={len(semantic_data)} semantic_probability={args.semantic_prompt_probability:g} "
-        f"edit_rows={len(edit_loader.dataset) if edit_loader else 0} target_step={args.target_step}",
+        f"edit_rows={len(edit_loader.dataset) if edit_loader else 0} target_step={args.target_step} "
+        f"shared_smolvlm2={bool(shared_video_bridge)}",
     )
     rank0_print(
         context,
@@ -958,10 +1033,28 @@ def main() -> None:
                 dtype=inference_dtype,
                 enabled=autocast_enabled,
             ):
-                student = bridge(prompts, mode=mode, images=images)
+                if shared_video_bridge is not None:
+                    if mode != "generate":
+                        raise RuntimeError("Shared SmolVLM2 training only supports generation mode.")
+                    shared_prompts = [
+                        str(prompt) + args.shared_prompt_suffix for prompt in prompts
+                    ]
+                    _, shared_source_mask, shared_hidden_layers = (
+                        shared_video_bridge.encode_smolvlm2_features(shared_prompts)
+                    )
+                    if shared_hidden_layers is None:
+                        raise RuntimeError("Shared NeoDragon bridge did not return hidden layers.")
+                    student = bridge(
+                        prompts,
+                        mode="generate",
+                        shared_hidden_layers=shared_hidden_layers,
+                        shared_source_mask=shared_source_mask,
+                    )
+                else:
+                    student = bridge(prompts, mode=mode, images=images)
                 teacher_condition = teacher.encode(prompts, mode=mode, images=images)
                 use_content_alignment = (
-                    args.training_version.lower() in {"v5", "v6", "v7", "v8"}
+                    args.training_version.lower() in {"v5", "v6", "v7", "v8", "shared_v1"}
                     and mode == "generate"
                 )
                 use_direct_alignment = (
@@ -1250,7 +1343,7 @@ def main() -> None:
                         "func": f"{item['functional_relative_mse']:.4f}",
                         "res": resolution.label,
                     }
-                    if args.training_version.lower() in {"v5", "v6", "v7", "v8"}:
+                    if args.training_version.lower() in {"v5", "v6", "v7", "v8", "shared_v1"}:
                         postfix["trans"] = (
                             f"{item['functional_transition_relative_mse']:.4f}"
                         )
@@ -1281,8 +1374,11 @@ def main() -> None:
                         "optimizer": optimizer.state_dict(),
                         "config": vars(args),
                         "architecture": (
+                            "MobileOVDreamLiteSharedSmolVLM2ImageBridgeV1"
+                            if shared_video_bridge is not None
+                            else
                             "MobileOVDreamLiteCompactBridgeV7"
-                            if args.training_version.lower() in {"v7", "v8"}
+                            if args.training_version.lower() in {"v7", "v8", "shared_v1"}
                             else "MobileOVDreamLiteCompactBridgeV6"
                             if args.training_version.lower() == "v6"
                             else "MobileOVDreamLiteCompactBridgeV5"
@@ -1294,11 +1390,31 @@ def main() -> None:
                             else "MobileOVDreamLiteImageBridge"
                         ),
                         "teacher": "Qwen3-VL BF16 from DreamLite-mobile",
+                        "shared_smolvlm2": {
+                            "enabled": shared_video_bridge is not None,
+                            "video_bridge_checkpoint": shared_video_bridge_ckpt or None,
+                            "video_bridge_config": (
+                                args.shared_video_config
+                                if shared_video_bridge is not None
+                                else None
+                            ),
+                            "contract": (
+                                "Exp1 prompt plus shared suffix, 512-token window, "
+                                "strict 128-token selection"
+                                if shared_video_bridge is not None
+                                else None
+                            ),
+                            "prompt_suffix": (
+                                args.shared_prompt_suffix
+                                if shared_video_bridge is not None
+                                else None
+                            ),
+                        },
                         "prompt_sources": generation_data.source_summary,
                         "functional_teacher": (
                             "frozen DreamLite-mobile UNet, native 4-call schedule, "
                             "mixed generated and real-image-derived same-state response distillation"
-                            if args.training_version.lower() in {"v7", "v8"}
+                            if args.training_version.lower() in {"v7", "v8", "shared_v1"}
                             else "frozen DreamLite-mobile UNet, native 4-call schedule, "
                             "mixed teacher/student-prefix same-state prediction and transition distillation"
                             if args.training_version.lower() in {"v5", "v6"}

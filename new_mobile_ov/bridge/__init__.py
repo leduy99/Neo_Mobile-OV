@@ -7,6 +7,10 @@ from new_mobile_ov.bridge.ssd1b_image_bridge import (
     MobileOVSSD1BImageBridge,
     SSD1BImageCondition,
 )
+from new_mobile_ov.bridge.shared_generation_conditioner import (
+    SharedGenerationConditions,
+    SharedMobileOVGenerationConditioner,
+)
 from new_mobile_ov.bridge.text_bridge import MobileOVTextBridge, pool_prompt_tokens
 
 __all__ = [
@@ -16,5 +20,7 @@ __all__ = [
     "DreamLiteCondition",
     "MobileOVSSD1BImageBridge",
     "SSD1BImageCondition",
+    "SharedGenerationConditions",
+    "SharedMobileOVGenerationConditioner",
     "pool_prompt_tokens",
 ]
