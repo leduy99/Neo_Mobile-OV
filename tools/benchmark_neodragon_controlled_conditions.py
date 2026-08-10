@@ -49,6 +49,29 @@ def summary(values: list[float]) -> dict[str, float]:
     }
 
 
+class CudaModuleTimer:
+    """Collect CUDA-event timings without synchronizing each model call."""
+
+    def __init__(self) -> None:
+        self.records: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
+
+    def measure(self, name: str, fn):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        result = fn()
+        end.record()
+        self.records.setdefault(name, []).append((start, end))
+        return result
+
+    def seconds_by_name(self) -> dict[str, float]:
+        synchronize(torch.device("cuda"))
+        return {
+            name: sum(start.elapsed_time(end) for start, end in events) / 1000.0
+            for name, events in self.records.items()
+        }
+
+
 def load_state(path: str | Path) -> dict[str, torch.Tensor]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     state = payload.get("bridge", payload)
@@ -80,6 +103,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-frames", type=int, default=49)
     parser.add_argument("--warmup-pairs", type=int, default=2)
     parser.add_argument("--pairs", type=int, default=20)
+    parser.add_argument(
+        "--block-noise",
+        choices=("released", "cpu", "cuda"),
+        default="released",
+        help="Use released sampler or the validated Mobile-OV CPU/CUDA sampler.",
+    )
+    parser.add_argument(
+        "--breakdown-runs",
+        type=int,
+        default=0,
+        help="Additional Mobile-condition rollouts for a DiT/VAE CUDA-event breakdown.",
+    )
     parser.add_argument("--seed", type=int, default=20260811)
     parser.add_argument(
         "--output",
@@ -99,6 +134,14 @@ def main() -> None:
     device = torch.device("cuda")
     dtype = torch.bfloat16
     backend = build_generation_backend(cfg.backend, device=device)
+    if args.block_noise != "released":
+        from new_mobile_ov.generation.neodragon_compat import (
+            install_neodragon_generation_patches,
+        )
+
+        install_neodragon_generation_patches(
+            device=device if args.block_noise == "cuda" else None
+        )
 
     canonical_prompt = str(args.prompt) + str(args.prompt_suffix)
     bridge = MobileOVNeodragonTextBridge(cfg.bridge, device=device, dtype=dtype).eval()
@@ -157,6 +200,7 @@ def main() -> None:
 
     native_condition = (native_prompt_embeds, native_mask, native_pooled)
     mobile_condition = (mobile_prompt_embeds, mobile_mask, mobile_pooled)
+    breakdown_runs: list[dict[str, float]] = []
     with torch.inference_mode(), torch.autocast("cuda", dtype=dtype):
         for index in range(args.warmup_pairs):
             timed(device, lambda index=index: rollout(native_condition, args.seed + index))
@@ -182,6 +226,62 @@ def main() -> None:
             )
             print(json.dumps(pairs[-1]), flush=True)
 
+        if args.breakdown_runs:
+            import neodragon.utils.generation_utils as generation_utils
+
+            original_dit_forward = backend.pipeline.dit.forward
+            original_vae_encode = backend.pipeline.vae.encode
+            original_vae_decode = backend.pipeline.vae.decode
+            original_block_noise = generation_utils._sample_block_noise
+            try:
+                for index in range(args.breakdown_runs):
+                    module_timer = CudaModuleTimer()
+                    block_noise_seconds: list[float] = []
+
+                    def timed_dit(*call_args, **call_kwargs):
+                        return module_timer.measure(
+                            "dit", lambda: original_dit_forward(*call_args, **call_kwargs)
+                        )
+
+                    def timed_vae_encode(*call_args, **call_kwargs):
+                        return module_timer.measure(
+                            "vae_encode", lambda: original_vae_encode(*call_args, **call_kwargs)
+                        )
+
+                    def timed_vae_decode(*call_args, **call_kwargs):
+                        return module_timer.measure(
+                            "vae_decode", lambda: original_vae_decode(*call_args, **call_kwargs)
+                        )
+
+                    def timed_block_noise(*call_args, **call_kwargs):
+                        started = time.perf_counter()
+                        result = original_block_noise(*call_args, **call_kwargs)
+                        block_noise_seconds.append(time.perf_counter() - started)
+                        return result
+
+                    backend.pipeline.dit.forward = timed_dit
+                    backend.pipeline.vae.encode = timed_vae_encode
+                    backend.pipeline.vae.decode = timed_vae_decode
+                    generation_utils._sample_block_noise = timed_block_noise
+                    total_seconds = timed(
+                        device,
+                        lambda index=index: rollout(mobile_condition, args.seed + 3000 + index),
+                    )
+                    components = module_timer.seconds_by_name()
+                    measured_seconds = sum(components.values())
+                    components["other"] = total_seconds - measured_seconds
+                    components["total"] = total_seconds
+                    components["dit_calls"] = float(len(module_timer.records.get("dit", [])))
+                    components["block_noise_cpu"] = sum(block_noise_seconds)
+                    components["block_noise_calls"] = float(len(block_noise_seconds))
+                    breakdown_runs.append(components)
+                    print(json.dumps({"breakdown": components}), flush=True)
+            finally:
+                backend.pipeline.dit.forward = original_dit_forward
+                backend.pipeline.vae.encode = original_vae_encode
+                backend.pipeline.vae.decode = original_vae_decode
+                generation_utils._sample_block_noise = original_block_noise
+
     native_seconds = [row["native_seconds"] for row in pairs]
     mobile_seconds = [row["mobile_seconds"] for row in pairs]
     deltas = [row["mobile_minus_native_seconds"] for row in pairs]
@@ -192,6 +292,7 @@ def main() -> None:
             "video_backend": "same released NeoDragon Hybrid DiT, VAE, scheduler, resolution, and frame count",
             "conditions": "precomputed native ContextAdapter output versus precomputed Exp1 Mobile-OV MCP output",
             "order": "alternated per pair",
+            "block_noise": args.block_noise,
             "mp4_encoding": "excluded",
         },
         "prompt": args.prompt,
@@ -202,6 +303,11 @@ def main() -> None:
         "paired_delta_mobile_minus_native_seconds": summary(deltas),
         "pairs": pairs,
     }
+    if breakdown_runs:
+        payload["mobile_rollout_breakdown_seconds"] = {
+            name: summary([row.get(name, 0.0) for row in breakdown_runs])
+            for name in sorted({key for row in breakdown_runs for key in row})
+        }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, indent=2), encoding="utf-8")

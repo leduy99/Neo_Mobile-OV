@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import math
+from typing import Union
 
 import torch
 from einops import rearrange
 
 
-def stable_block_noise(
+def _stable_block_noise(
     gamma: float,
     batch_size: int,
     channels: int,
     temporal: int,
     height: int,
     width: int,
+    *,
+    device: torch.device | None,
 ) -> torch.Tensor:
     """Sample NeoDragon's 2x2 corrective noise without a Cholesky factor.
 
@@ -44,7 +47,7 @@ def stable_block_noise(
         * (height // 2)
         * (width // 2)
     )
-    iid = torch.randn(block_count, 4, dtype=torch.float32)
+    iid = torch.randn(block_count, 4, dtype=torch.float32, device=device)
     parallel = iid.mean(dim=-1, keepdim=True)
     perpendicular = iid - parallel
     samples = (
@@ -64,11 +67,64 @@ def stable_block_noise(
     )
 
 
-def install_neodragon_generation_patches() -> None:
-    """Install runtime fixes without modifying the downloaded NeoDragon clone."""
+def stable_block_noise(
+    gamma: float,
+    batch_size: int,
+    channels: int,
+    temporal: int,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    """CPU reference sampler matching NeoDragon's 2x2 noise covariance."""
+    return _stable_block_noise(
+        gamma,
+        batch_size,
+        channels,
+        temporal,
+        height,
+        width,
+        device=None,
+    )
+
+
+def install_neodragon_generation_patches(
+    *,
+    device: Union[str, torch.device, None] = None,
+) -> None:
+    """Install the valid 2x2 noise sampler without editing the upstream clone.
+
+    Passing a CUDA device generates the corrective noise directly on that device.
+    The original code samples thousands of tiny CPU tensors in Python and then
+    copies them to CUDA for every pyramid transition. The CUDA path keeps the
+    identical Gaussian covariance while removing that host-side bottleneck.
+    """
     from neodragon.utils import generation_utils
 
-    if getattr(generation_utils, "_mobile_ov_block_noise_patch", False):
+    runtime_device = None if device is None else torch.device(device)
+    patch_key = "cpu" if runtime_device is None else str(runtime_device)
+    if getattr(generation_utils, "_mobile_ov_block_noise_patch", None) == patch_key:
         return
-    generation_utils._sample_block_noise = stable_block_noise
-    generation_utils._mobile_ov_block_noise_patch = True
+
+    if runtime_device is None:
+        sampler = stable_block_noise
+    else:
+        def sampler(
+            gamma: float,
+            batch_size: int,
+            channels: int,
+            temporal: int,
+            height: int,
+            width: int,
+        ) -> torch.Tensor:
+            return _stable_block_noise(
+                gamma,
+                batch_size,
+                channels,
+                temporal,
+                height,
+                width,
+                device=runtime_device,
+            )
+
+    generation_utils._sample_block_noise = sampler
+    generation_utils._mobile_ov_block_noise_patch = patch_key
