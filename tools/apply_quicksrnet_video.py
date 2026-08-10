@@ -246,7 +246,18 @@ def main() -> None:
         }
         destination = output_dir / "quicksrnet_gpu_benchmark.json"
         destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        print(json.dumps(payload, indent=2), flush=True)
+        print(
+            json.dumps(
+                {
+                    "mode": payload["mode"],
+                    "input_shape": payload["input_shape"],
+                    "summary": payload["summary"],
+                    "full_report": str(destination),
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
         print(f"Saved benchmark: {destination}", flush=True)
         return
 
