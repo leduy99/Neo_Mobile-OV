@@ -86,12 +86,13 @@ def upscale_frames(
     dtype: torch.dtype,
     batch_frames: int,
     return_frames: bool = True,
+    reset_peak_memory: bool = True,
 ) -> tuple[np.ndarray | None, dict[str, float]]:
     outputs: list[np.ndarray] = []
     upload_seconds = 0.0
     forward_seconds = 0.0
     download_seconds = 0.0
-    if device.type == "cuda":
+    if device.type == "cuda" and reset_peak_memory:
         torch.cuda.reset_peak_memory_stats(device)
 
     for offset in range(0, len(frames), batch_frames):
