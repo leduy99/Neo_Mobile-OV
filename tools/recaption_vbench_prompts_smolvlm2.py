@@ -98,8 +98,15 @@ def write_output(path: Path, *, source: Path, records: dict[str, str], prompts: 
             "do_sample": False,
             "max_new_tokens": int(args.max_new_tokens),
         },
+        "expected_records": len(prompts),
+        "completed_records": len(records),
         "records": [
-            {"prompt": prompt, "recaption": records[prompt]} for prompt in prompts
+            # This writer is also a progress checkpoint. Do not require records
+            # that have not been generated yet, otherwise the first batch cannot
+            # be persisted or resumed after an interruption.
+            {"prompt": prompt, "recaption": records[prompt]}
+            for prompt in prompts
+            if prompt in records
         ],
     }
     path.parent.mkdir(parents=True, exist_ok=True)
