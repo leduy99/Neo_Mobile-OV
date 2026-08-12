@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import hashlib
 import json
 import os
 import re
@@ -53,6 +54,14 @@ class PromptItem:
     prompt: str
 
 
+@dataclass(frozen=True)
+class VBenchReuse:
+    """Validated source assets for the overlapping V8 + Exp1 ablation cell."""
+
+    root: Path
+    generation_summary: dict[str, object]
+
+
 def safe_stem(value: str, max_length: int = 72) -> str:
     normalized = re.sub(r"[^A-Za-z0-9._ -]+", "_", value).strip().replace(" ", "_")
     return (normalized[:max_length] or "prompt").strip("_")
@@ -75,6 +84,33 @@ def load_prompts(path: Path, max_prompts: int) -> list[PromptItem]:
         prompts = prompts[:max_prompts]
     if not prompts:
         raise ValueError(f"No valid prompts read from {path}")
+    return prompts
+
+
+def normalize_prompt(value: str) -> str:
+    return " ".join(str(value).strip().split())
+
+
+def load_vbench_prompts(path: Path, max_prompts: int) -> list[PromptItem]:
+    """Load the exact unique prompt ordering used by VBench generation."""
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError(f"Expected a VBench info JSON list: {path}")
+    prompts: list[PromptItem] = []
+    seen: set[str] = set()
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        prompt = normalize_prompt(row.get("prompt_en", ""))
+        if not prompt or prompt in seen:
+            continue
+        seen.add(prompt)
+        prompts.append(PromptItem(name=f"vbench_{len(prompts) + 1:03d}_{safe_stem(prompt, 44)}", prompt=prompt))
+        if max_prompts > 0 and len(prompts) >= max_prompts:
+            break
+    if not prompts:
+        raise ValueError(f"No valid VBench prompts read from {path}")
     return prompts
 
 
@@ -137,6 +173,86 @@ def valid_video(path: Path, expected_frames: int) -> bool:
         return False
 
 
+def vbench_anchor_path(root: Path, index: int, prompt: str) -> Path:
+    digest = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:12]
+    return root / "anchors" / f"{index:04d}_{digest}.png"
+
+
+def vbench_video_path(root: Path, prompt: str) -> Path:
+    return root / "videos" / f"{prompt}-0.mp4"
+
+
+def link_reused_asset(source: Path, destination: Path, validator, label: str) -> bool:
+    """Link a validated source asset without copying large generated files."""
+
+    if not validator(source):
+        raise RuntimeError(f"Cannot reuse invalid {label}: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_symlink():
+        if destination.resolve() == source.resolve() and validator(destination):
+            return True
+        destination.unlink()
+    elif destination.exists():
+        if validator(destination):
+            return False
+        destination.unlink()
+    destination.symlink_to(source.resolve())
+    if not validator(destination):
+        raise RuntimeError(f"Symlinked {label} is invalid: {destination}")
+    return True
+
+
+def resolve_vbench_reuse(args, prompts: list[PromptItem]) -> VBenchReuse | None:
+    if args.reuse_vbench_root is None:
+        return None
+    root = args.reuse_vbench_root.resolve()
+    expected_seed_dir = f"seed_{args.seed}"
+    if root.name != expected_seed_dir:
+        raise ValueError(
+            f"Reuse root must be the exact VBench seed directory {expected_seed_dir!r}, got {root}"
+        )
+    summary_path = root / "generation_summary.json"
+    if not summary_path.is_file():
+        raise FileNotFoundError(f"Missing VBench generation summary: {summary_path}")
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError(f"Invalid VBench generation summary: {summary_path}")
+    if int(payload.get("samples_per_prompt", -1)) != 1:
+        raise ValueError("Reusable VBench assets must have exactly one sample per prompt.")
+    if payload.get("conditioning_prompts_differ", 0) != 0:
+        raise ValueError("Reusable VBench assets must use the raw VBench prompt, not recaptioning.")
+    anchor = payload.get("anchor", {})
+    video = payload.get("video", {})
+    expected_anchor = {
+        "width": args.anchor_width,
+        "height": args.anchor_height,
+        "time_id_width": args.anchor_time_id_width,
+        "time_id_height": args.anchor_time_id_height,
+    }
+    expected_video = {
+        "width": args.video_width,
+        "height": args.video_height,
+        "frames": args.num_frames,
+        "fps": args.fps,
+    }
+    for name, expected in expected_anchor.items():
+        if anchor.get(name) != expected:
+            raise ValueError(f"Reusable anchor setting mismatch for {name}: {anchor.get(name)} != {expected}")
+    # Historical generation summaries did not serialize image_steps. The source
+    # VBench script used its default of four DreamLite steps, so reject any
+    # incompatible ablation request rather than silently reusing it.
+    if args.image_steps != 4:
+        raise ValueError("Reusable VBench anchors were generated with image_steps=4.")
+    for name, expected in expected_video.items():
+        if video.get(name) != expected:
+            raise ValueError(f"Reusable video setting mismatch for {name}: {video.get(name)} != {expected}")
+    if int(payload.get("unique_prompts", -1)) < len(prompts):
+        raise ValueError(
+            f"Reuse run has only {payload.get('unique_prompts')} prompts but ablation needs {len(prompts)}."
+        )
+    return VBenchReuse(root=root, generation_summary=payload)
+
+
 def load_checkpoint_state(path: Path, key: str) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     state = payload.get(key, payload)
@@ -149,6 +265,41 @@ def load_checkpoint_state(path: Path, key: str) -> tuple[dict[str, torch.Tensor]
         "architecture": payload.get("architecture"),
     }
     return state, metadata
+
+
+def prompt_payload(prompts: list[PromptItem]) -> list[dict[str, str]]:
+    return [{"name": item.name, "prompt": item.prompt} for item in prompts]
+
+
+def prompts_from_payload(payload: list[dict[str, str]]) -> list[PromptItem]:
+    return [PromptItem(name=str(item["name"]), prompt=str(item["prompt"])) for item in payload]
+
+
+def condition_payload(condition: DreamLiteCondition) -> dict[str, torch.Tensor]:
+    return {
+        "prompt_embeds": condition.prompt_embeds.detach().float().cpu(),
+        "attention_mask": condition.attention_mask.detach().cpu(),
+    }
+
+
+def condition_from_payload(payload: dict[str, torch.Tensor]) -> DreamLiteCondition:
+    return DreamLiteCondition(payload["prompt_embeds"], payload["attention_mask"])
+
+
+def write_torch_payload(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+
+
+def load_torch_payload(path: Path) -> dict[str, object]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing staged ablation artifact: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise TypeError(f"Invalid staged ablation artifact: {path}")
+    return payload
 
 
 def scalar_metrics(student: DreamLiteCondition, teacher: DreamLiteCondition) -> dict[str, float]:
@@ -234,15 +385,27 @@ def generate_anchors(
     image_steps: int,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[dict[str, list[Image.Image]], dict[str, list[float]]]:
+    reuse: VBenchReuse | None,
+) -> tuple[dict[str, list[Image.Image]], dict[str, list[float]], dict[str, int]]:
     backend = DreamLiteMobileBackend(image_cfg.dreamlite, device=device, dtype=dtype, load_vae=True)
     anchors: dict[str, list[Image.Image]] = {name: [] for name in conditions}
     timings: dict[str, list[float]] = {name: [] for name in conditions}
+    reuse_counts = {name: 0 for name in conditions}
     expected_size = (width, height)
     for index, item in enumerate(prompts):
         for condition_name, values in conditions.items():
             destination = image_path(output_dir, condition_name, index + 1, item)
             destination.parent.mkdir(parents=True, exist_ok=True)
+            source = None
+            if reuse is not None and condition_name == "v8_imageonly":
+                source = vbench_anchor_path(reuse.root, index, item.prompt)
+                if link_reused_asset(
+                    source,
+                    destination,
+                    lambda path: valid_image(path, expected_size),
+                    "VBench V8 image anchor",
+                ):
+                    reuse_counts[condition_name] += 1
             if valid_image(destination, expected_size):
                 image = Image.open(destination).convert("RGB")
                 elapsed = 0.0
@@ -270,7 +433,7 @@ def generate_anchors(
         )
     del backend
     release()
-    return anchors, timings
+    return anchors, timings, reuse_counts
 
 
 @torch.inference_mode()
@@ -285,13 +448,39 @@ def make_video_conditions(
     dtype: torch.dtype,
 ) -> tuple[dict[str, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]], dict[str, object]]:
     prompt_texts = [item.prompt + modifier for item in prompts]
+    native_conditions = make_native_video_conditions(backend, prompt_texts)
+    student_conditions, metadata = make_exp1_video_conditions(
+        video_cfg,
+        prompt_texts,
+        checkpoint=checkpoint,
+        device=device,
+        dtype=dtype,
+    )
+    return {"native_neodragon": native_conditions, "exp1_64k": student_conditions}, metadata
+
+
+@torch.inference_mode()
+def make_native_video_conditions(
+    backend,
+    prompt_texts: list[str],
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     # The regular VBench generator encodes one prompt per call. Retaining that
     # behaviour makes this control robust to any tokenizer padding differences.
-    native_conditions = [
+    return [
         tuple(value.detach().cpu() for value in backend.encode_neodragon_context([prompt]))
         for prompt in prompt_texts
     ]
 
+
+@torch.inference_mode()
+def make_exp1_video_conditions(
+    video_cfg,
+    prompt_texts: list[str],
+    *,
+    checkpoint: Path,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]], dict[str, object]]:
     state, metadata = load_checkpoint_state(checkpoint, "bridge")
     bridge = MobileOVNeodragonTextBridge(video_cfg.bridge, device=device, dtype=dtype).eval()
     missing, unexpected = bridge.load_state_dict(state, strict=False)
@@ -306,7 +495,7 @@ def make_video_conditions(
     ]
     del bridge, state
     release()
-    return {"native_neodragon": native_conditions, "exp1_64k": student_conditions}, metadata
+    return student_conditions, metadata
 
 
 def to_video_device(
@@ -334,15 +523,27 @@ def generate_videos(
     fps: int,
     device: torch.device,
     dtype: torch.dtype,
-) -> dict[str, list[float]]:
+    reuse: VBenchReuse | None,
+) -> tuple[dict[str, list[float]], dict[str, int]]:
     timings: dict[str, list[float]] = {}
+    reuse_counts: dict[str, int] = {}
     for image_name, image_values in anchors.items():
         for text_name, text_values in video_conditions.items():
             branch = f"image_{image_name}__text_{text_name}"
             timings[branch] = []
+            reuse_counts[branch] = 0
             for index, item in enumerate(prompts):
                 destination = video_path(output_dir, image_name, text_name, index + 1, item)
                 destination.parent.mkdir(parents=True, exist_ok=True)
+                if reuse is not None and branch == "image_v8_imageonly__text_exp1_64k":
+                    source = vbench_video_path(reuse.root, item.prompt)
+                    if link_reused_asset(
+                        source,
+                        destination,
+                        lambda path: valid_video(path, num_frames),
+                        "VBench V8 + Exp1 video",
+                    ):
+                        reuse_counts[branch] += 1
                 if valid_video(destination, num_frames):
                     elapsed = 0.0
                 else:
@@ -371,7 +572,122 @@ def generate_videos(
                     f"Videos {branch} {index + 1}/{len(prompts)} prompt={item.name} elapsed={elapsed:.2f}s",
                     flush=True,
                 )
-    return timings
+    return timings, reuse_counts
+
+
+def image_conditions_path(output_dir: Path) -> Path:
+    return output_dir / "staged_image_conditions.pt"
+
+
+def video_conditions_path(output_dir: Path) -> Path:
+    return output_dir / "staged_video_conditions.pt"
+
+
+def anchor_timings_path(output_dir: Path) -> Path:
+    return output_dir / "anchor_timings.json"
+
+
+def video_timings_path(output_dir: Path) -> Path:
+    return output_dir / "video_timings.json"
+
+
+def save_image_conditions(
+    output_dir: Path,
+    prompts: list[PromptItem],
+    conditions: dict[str, list[DreamLiteCondition]],
+    metrics: list[dict[str, float]],
+    metadata: dict[str, object],
+) -> None:
+    write_torch_payload(
+        image_conditions_path(output_dir),
+        {
+            "prompts": prompt_payload(prompts),
+            "conditions": {
+                name: [condition_payload(value) for value in values]
+                for name, values in conditions.items()
+            },
+            "metrics": metrics,
+            "metadata": metadata,
+        },
+    )
+
+
+def load_image_conditions(
+    output_dir: Path,
+    expected_prompts: list[PromptItem],
+) -> tuple[dict[str, list[DreamLiteCondition]], list[dict[str, float]], dict[str, object]]:
+    payload = load_torch_payload(image_conditions_path(output_dir))
+    stored_prompts = prompts_from_payload(payload["prompts"])
+    if stored_prompts != expected_prompts:
+        raise RuntimeError("Staged image conditions do not match the requested prompt list.")
+    raw_conditions = payload["conditions"]
+    if not isinstance(raw_conditions, dict):
+        raise TypeError("Staged image conditions are malformed.")
+    conditions = {
+        name: [condition_from_payload(value) for value in values]
+        for name, values in raw_conditions.items()
+    }
+    metrics = payload["metrics"]
+    metadata = payload["metadata"]
+    if not isinstance(metrics, list) or not isinstance(metadata, dict):
+        raise TypeError("Staged image condition metadata is malformed.")
+    return conditions, metrics, metadata
+
+
+def save_video_conditions(
+    output_dir: Path,
+    prompts: list[PromptItem],
+    conditions: dict[str, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]],
+    metadata: dict[str, object],
+) -> None:
+    write_torch_payload(
+        video_conditions_path(output_dir),
+        {
+            "prompts": prompt_payload(prompts),
+            "conditions": {
+                name: [tuple(value.detach().cpu() for value in row) for row in values]
+                for name, values in conditions.items()
+            },
+            "metadata": metadata,
+        },
+    )
+
+
+def load_video_conditions(
+    output_dir: Path,
+    expected_prompts: list[PromptItem],
+) -> tuple[dict[str, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]], dict[str, object]]:
+    payload = load_torch_payload(video_conditions_path(output_dir))
+    stored_prompts = prompts_from_payload(payload["prompts"])
+    if stored_prompts != expected_prompts:
+        raise RuntimeError("Staged video conditions do not match the requested prompt list.")
+    conditions = payload["conditions"]
+    metadata = payload["metadata"]
+    if not isinstance(conditions, dict) or not isinstance(metadata, dict):
+        raise TypeError("Staged video conditions are malformed.")
+    return conditions, metadata
+
+
+def load_anchors(
+    output_dir: Path,
+    prompts: list[PromptItem],
+    *,
+    expected_size: tuple[int, int],
+) -> dict[str, list[Image.Image]]:
+    anchors: dict[str, list[Image.Image]] = {"native_qwen": [], "v8_imageonly": []}
+    for index, item in enumerate(prompts):
+        for name, values in anchors.items():
+            path = image_path(output_dir, name, index + 1, item)
+            if not valid_image(path, expected_size):
+                raise RuntimeError(f"Missing or invalid staged anchor: {path}")
+            with Image.open(path) as image:
+                values.append(image.convert("RGB"))
+    return anchors
+
+
+def write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def mean(values: list[float]) -> float:
@@ -381,12 +697,29 @@ def mean(values: list[float]) -> float:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prompts", type=Path, default="configs/prompts/dreamlite_v8_native_video_control_20.csv")
+    parser.add_argument(
+        "--vbench-info",
+        type=Path,
+        help=(
+            "Use the unique prompt order from this VBench info JSON. Required when reusing "
+            "VBench assets so filenames and seeds map exactly."
+        ),
+    )
     parser.add_argument("--max-prompts", type=int, default=0)
     parser.add_argument("--image-config", default="configs/mobile_ov_dreamlite_compact_v8.yaml")
     parser.add_argument("--video-config", default="configs/mobile_ov_neodragon.yaml")
     parser.add_argument("--image-bridge-checkpoint", required=True, type=Path)
     parser.add_argument("--video-bridge-checkpoint", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--reuse-vbench-root",
+        type=Path,
+        help=(
+            "Exact VBench variant seed directory, for example "
+            "output/vbench_v7_v8_stratified100x3/v8_imageonly/seed_20260812. "
+            "The overlapping V8-image-only + Exp1-64K anchor/video cell is symlinked from it."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=20260812)
     parser.add_argument("--anchor-width", type=int, default=1024)
     parser.add_argument("--anchor-height", type=int, default=640)
@@ -397,46 +730,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-height", type=int, default=320)
     parser.add_argument("--num-frames", type=int, default=49)
     parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument(
+        "--stage",
+        choices=("all", "image_conditions", "anchors", "video_conditions", "videos", "summary"),
+        default="all",
+        help=(
+            "Run one isolated phase. Separate processes avoid retaining Qwen, SmolVLM2, "
+            "DreamLite, and NeoDragon together on shared local GPUs."
+        ),
+    )
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    if not torch.cuda.is_available():
-        raise RuntimeError("This controlled ablation requires one CUDA GPU.")
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    prompts = load_prompts(args.prompts, args.max_prompts)
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
-    image_cfg = load_config(args.image_config)
-    video_cfg = load_config(args.video_config)
-    output_dir = args.output.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    image_conditions, condition_metrics, image_checkpoint = make_image_conditions(
-        image_cfg,
-        prompts,
-        checkpoint=args.image_bridge_checkpoint,
-        device=device,
-        dtype=dtype,
-    )
-    anchors, anchor_seconds = generate_anchors(
-        image_cfg,
-        image_conditions,
-        prompts,
-        output_dir=output_dir,
-        seed=args.seed,
-        width=args.anchor_width,
-        height=args.anchor_height,
-        time_id_width=args.anchor_time_id_width,
-        time_id_height=args.anchor_time_id_height,
-        image_steps=args.image_steps,
-        device=device,
-        dtype=dtype,
-    )
-    del image_conditions
-    release()
-
+def prepare_neodragon_modifier(video_cfg) -> str:
     repo_path, _, _ = ensure_neodragon_assets(
         repo_path=video_cfg.backend.extra.get("repo_path"),
         cache_dir=video_cfg.backend.extra.get("cache_dir"),
@@ -449,20 +755,112 @@ def main() -> None:
     install_neodragon_generation_patches()
     from neodragon.utils.generation_utils import DEFAULT_PROMPT_MODIFIER
 
-    backend = build_generation_backend(video_cfg.backend, device=device)
-    video_conditions, video_checkpoint = make_video_conditions(
-        video_cfg,
+    return DEFAULT_PROMPT_MODIFIER
+
+
+def run_image_conditions(
+    args,
+    prompts: list[PromptItem],
+    output_dir: Path,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    image_cfg = load_config(args.image_config)
+    conditions, metrics, metadata = make_image_conditions(
+        image_cfg,
         prompts,
-        checkpoint=args.video_bridge_checkpoint,
-        backend=backend,
-        modifier=DEFAULT_PROMPT_MODIFIER,
+        checkpoint=args.image_bridge_checkpoint,
         device=device,
         dtype=dtype,
     )
-    video_seconds = generate_videos(
+    save_image_conditions(output_dir, prompts, conditions, metrics, metadata)
+    del conditions
+    release()
+    print(f"Saved staged image conditions: {image_conditions_path(output_dir)}", flush=True)
+
+
+def run_anchors(
+    args,
+    prompts: list[PromptItem],
+    output_dir: Path,
+    device: torch.device,
+    dtype: torch.dtype,
+    reuse: VBenchReuse | None,
+) -> None:
+    image_cfg = load_config(args.image_config)
+    conditions, _, _ = load_image_conditions(output_dir, prompts)
+    _, timings, reuse_counts = generate_anchors(
+        image_cfg,
+        conditions,
+        prompts,
+        output_dir=output_dir,
+        seed=args.seed,
+        width=args.anchor_width,
+        height=args.anchor_height,
+        time_id_width=args.anchor_time_id_width,
+        time_id_height=args.anchor_time_id_height,
+        image_steps=args.image_steps,
+        device=device,
+        dtype=dtype,
+        reuse=reuse,
+    )
+    write_json(anchor_timings_path(output_dir), {"timings": timings, "reused": reuse_counts})
+    print(f"Saved anchor timings: {anchor_timings_path(output_dir)}", flush=True)
+
+
+def run_video_conditions(
+    args,
+    prompts: list[PromptItem],
+    output_dir: Path,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    video_cfg = load_config(args.video_config)
+    modifier = prepare_neodragon_modifier(video_cfg)
+    prompt_texts = [item.prompt + modifier for item in prompts]
+
+    backend = build_generation_backend(video_cfg.backend, device=device)
+    native_conditions = make_native_video_conditions(backend, prompt_texts)
+    del backend
+    release()
+
+    student_conditions, metadata = make_exp1_video_conditions(
+        video_cfg,
+        prompt_texts,
+        checkpoint=args.video_bridge_checkpoint,
+        device=device,
+        dtype=dtype,
+    )
+    save_video_conditions(
+        output_dir,
+        prompts,
+        {"native_neodragon": native_conditions, "exp1_64k": student_conditions},
+        metadata,
+    )
+    print(f"Saved staged video conditions: {video_conditions_path(output_dir)}", flush=True)
+
+
+def run_videos(
+    args,
+    prompts: list[PromptItem],
+    output_dir: Path,
+    device: torch.device,
+    dtype: torch.dtype,
+    reuse: VBenchReuse | None,
+) -> None:
+    video_cfg = load_config(args.video_config)
+    anchors = load_anchors(
+        output_dir,
+        prompts,
+        expected_size=(args.anchor_width, args.anchor_height),
+    )
+    conditions, _ = load_video_conditions(output_dir, prompts)
+    prepare_neodragon_modifier(video_cfg)
+    backend = build_generation_backend(video_cfg.backend, device=device)
+    timings, reuse_counts = generate_videos(
         backend,
         anchors,
-        video_conditions,
+        conditions,
         prompts,
         output_dir=output_dir,
         seed=args.seed,
@@ -472,11 +870,27 @@ def main() -> None:
         fps=args.fps,
         device=device,
         dtype=dtype,
+        reuse=reuse,
     )
-    del backend, video_conditions, anchors
+    write_json(video_timings_path(output_dir), {"timings": timings, "reused": reuse_counts})
+    del backend, conditions, anchors
     release()
+    print(f"Saved video timings: {video_timings_path(output_dir)}", flush=True)
 
-    summary = {
+
+def build_summary(
+    args,
+    prompts: list[PromptItem],
+    output_dir: Path,
+    reuse: VBenchReuse | None,
+) -> dict[str, object]:
+    _, condition_metrics, image_checkpoint = load_image_conditions(output_dir, prompts)
+    _, video_checkpoint = load_video_conditions(output_dir, prompts)
+    anchor_payload = json.loads(anchor_timings_path(output_dir).read_text(encoding="utf-8"))
+    video_payload = json.loads(video_timings_path(output_dir).read_text(encoding="utf-8"))
+    anchor_seconds = anchor_payload["timings"]
+    video_seconds = video_payload["timings"]
+    return {
         "status": "ok",
         "protocol": {
             "image_conditions": ["native_qwen", "v8_imageonly"],
@@ -497,6 +911,15 @@ def main() -> None:
                 "native_neodragon_vs_exp1_64k": "NeoDragon video text-condition effect with an identical anchor.",
                 "full_pipeline": "V8 image bridge plus Exp1-64K video bridge under fixed released generators.",
             },
+            "reused_control": (
+                None
+                if reuse is None
+                else {
+                    "source": str(reuse.root),
+                    "cell": "image_v8_imageonly__text_exp1_64k",
+                    "reason": "Same VBench prompt order, seed, render settings, V8 checkpoint, and Exp1-64K checkpoint.",
+                }
+            ),
         },
         "image_checkpoint": image_checkpoint,
         "video_checkpoint": video_checkpoint,
@@ -521,6 +944,8 @@ def main() -> None:
         },
         "mean_anchor_seconds": {name: mean(values) for name, values in anchor_seconds.items()},
         "mean_video_seconds": {name: mean(values) for name, values in video_seconds.items()},
+        "reused_anchors": anchor_payload.get("reused", {}),
+        "reused_videos": video_payload.get("reused", {}),
         "prompts": [
             {
                 "index": index + 1,
@@ -543,8 +968,40 @@ def main() -> None:
             for index, item in enumerate(prompts)
         ],
     }
-    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(summary, indent=2), flush=True)
+
+
+def main() -> None:
+    args = parse_args()
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    if args.reuse_vbench_root is not None and args.vbench_info is None:
+        raise ValueError("--reuse-vbench-root requires --vbench-info for an exact prompt-to-asset mapping.")
+    prompts = (
+        load_vbench_prompts(args.vbench_info, args.max_prompts)
+        if args.vbench_info is not None
+        else load_prompts(args.prompts, args.max_prompts)
+    )
+    reuse = resolve_vbench_reuse(args, prompts)
+    output_dir = args.output.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    gpu_stages = {"all", "image_conditions", "anchors", "video_conditions", "videos"}
+    if args.stage in gpu_stages and not torch.cuda.is_available():
+        raise RuntimeError("This controlled ablation requires one CUDA GPU.")
+    device = torch.device("cuda") if args.stage in gpu_stages else None
+    dtype = torch.bfloat16
+
+    if args.stage in {"all", "image_conditions"}:
+        run_image_conditions(args, prompts, output_dir, device, dtype)
+    if args.stage in {"all", "anchors"}:
+        run_anchors(args, prompts, output_dir, device, dtype, reuse)
+    if args.stage in {"all", "video_conditions"}:
+        run_video_conditions(args, prompts, output_dir, device, dtype)
+    if args.stage in {"all", "videos"}:
+        run_videos(args, prompts, output_dir, device, dtype, reuse)
+    if args.stage in {"all", "summary"}:
+        summary = build_summary(args, prompts, output_dir, reuse)
+        write_json(output_dir / "summary.json", summary)
+        print(json.dumps(summary, indent=2), flush=True)
 
 
 if __name__ == "__main__":

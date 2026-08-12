@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Controlled 20-prompt matrix: native Qwen vs V8 DreamLite condition crossed
-# with native NeoDragon vs Exp1-64K video condition.
+# with native NeoDragon vs Exp1-64K video condition. The already-generated
+# V8-image-only + Exp1-64K VBench cell is reused through symlinks, so this job
+# renders only the three missing control cells.
 # Submit: sbatch scripts/ablate_dreamlite_v8_native_video_20prompt_1node1gpu.sbatch
 # Smoke:  MAX_PROMPTS=1 sbatch scripts/ablate_dreamlite_v8_native_video_20prompt_1node1gpu.sbatch
 #SBATCH --job-name=mov-v8ablate
@@ -33,7 +35,10 @@ PYTHON_BIN="${CONDA_ENV}/bin/python"
 HF_REPO="${HF_REPO:-Amshaker/Mobile-OV}"
 RUN_NAME="${RUN_NAME:-dreamlite_v8_native_video_control20}"
 OUT="${OUT:-output/${RUN_NAME}/${SLURM_JOB_ID:-local}}"
-MAX_PROMPTS="${MAX_PROMPTS:-0}"
+MAX_PROMPTS="${MAX_PROMPTS:-20}"
+SEED="${SEED:-20260812}"
+VBENCH_INFO="${VBENCH_INFO:-output/vbench_v7_v8_stratified100x3/vbench_stratified_100_info.json}"
+REUSE_VBENCH_ROOT="${REUSE_VBENCH_ROOT:-output/vbench_v7_v8_stratified100x3/v8_imageonly/seed_${SEED}}"
 STOP_FILE="${TMPDIR%/}/mov_v8_ablate_${SLURM_JOB_ID:-local}.stop"
 
 IMAGE_CONFIG="${IMAGE_CONFIG:-configs/mobile_ov_dreamlite_compact_v8.yaml}"
@@ -44,6 +49,9 @@ VIDEO_HF_FILE="${VIDEO_HF_FILE:-neo_exp1_bridge_functional/17108893/neodragon_te
 
 mkdir -p logs "${OUT}"
 test -x "${PYTHON_BIN}"
+cd "${ROOT}"
+test -f "${VBENCH_INFO}"
+test -f "${REUSE_VBENCH_ROOT}/generation_summary.json"
 
 rm -f "${STOP_FILE}"
 "${PYTHON_BIN}" tools/utils/gpu_heartbeat.py \
@@ -95,17 +103,30 @@ PY
 download_checkpoint "${IMAGE_CKPT}" "${IMAGE_HF_FILE}" 160000
 download_checkpoint "${VIDEO_CKPT}" "${VIDEO_HF_FILE}" 64000
 
-echo "OUT=${OUT} MAX_PROMPTS=${MAX_PROMPTS}"
+echo "OUT=${OUT} MAX_PROMPTS=${MAX_PROMPTS} SEED=${SEED}"
+echo "VBENCH_INFO=${VBENCH_INFO}"
+echo "REUSE_VBENCH_ROOT=${REUSE_VBENCH_ROOT}"
 echo "IMAGE_CKPT=${IMAGE_CKPT}"
 echo "VIDEO_CKPT=${VIDEO_CKPT}"
 nvidia-smi || true
 
-"${PYTHON_BIN}" tools/ablate_dreamlite_v8_native_video.py \
+COMMON_ARGS=(
   --image-config "${IMAGE_CONFIG}" \
   --image-bridge-checkpoint "${IMAGE_CKPT}" \
   --video-bridge-checkpoint "${VIDEO_CKPT}" \
   --output "${OUT}" \
+  --vbench-info "${VBENCH_INFO}" \
+  --reuse-vbench-root "${REUSE_VBENCH_ROOT}" \
+  --seed "${SEED}" \
   --max-prompts "${MAX_PROMPTS}"
+)
+
+# Separate processes release Qwen, SmolVLM2, DreamLite, and NeoDragon between phases.
+"${PYTHON_BIN}" -u tools/ablate_dreamlite_v8_native_video.py "${COMMON_ARGS[@]}" --stage image_conditions
+"${PYTHON_BIN}" -u tools/ablate_dreamlite_v8_native_video.py "${COMMON_ARGS[@]}" --stage anchors
+"${PYTHON_BIN}" -u tools/ablate_dreamlite_v8_native_video.py "${COMMON_ARGS[@]}" --stage video_conditions
+"${PYTHON_BIN}" -u tools/ablate_dreamlite_v8_native_video.py "${COMMON_ARGS[@]}" --stage videos
+"${PYTHON_BIN}" -u tools/ablate_dreamlite_v8_native_video.py "${COMMON_ARGS[@]}" --stage summary
 
 cleanup_heartbeat
 trap - EXIT INT TERM
