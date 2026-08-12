@@ -32,6 +32,17 @@ SYSTEM_INSTRUCTION = (
     "Output only one caption sentence."
 )
 CODE_MARKERS = ("```", "def ", "import ", "class ", "print(", "return ", "#")
+DEFINITION_MARKERS = (
+    " is a ",
+    " is an ",
+    " refers to ",
+    " is used to ",
+    " traffic control device",
+    " video-generated caption",
+    " video-generating caption",
+    " captures the essence",
+    " central focus",
+)
 NON_CONTENT_WORDS = {
     "a", "an", "and", "as", "at", "be", "by", "for", "from", "in", "into", "is",
     "it", "of", "on", "or", "the", "to", "with", "video", "frame", "still", "frozen",
@@ -113,6 +124,7 @@ def sanitize_recaption(prompt: str, generated: str) -> tuple[str, bool]:
         not candidate
         or len(candidate.split()) < 3
         or any(marker in candidate.lower() for marker in CODE_MARKERS)
+        or any(marker in candidate.lower() for marker in DEFINITION_MARKERS)
         or not coverage
     )
     if invalid:

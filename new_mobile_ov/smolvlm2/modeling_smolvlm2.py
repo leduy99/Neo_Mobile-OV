@@ -18,6 +18,23 @@ from .config_smolvlm2 import SmolVLMConfig
 logger = logging.getLogger(__name__)
 
 
+def _load_checkpoint_cpu(ckpt_path: str):
+    """Load converted checkpoints without materializing both model copies on CUDA.
+
+    Converted Mobile-OV checkpoints retain a full model object and a state dict.
+    Mapping every tensor to CUDA during ``torch.load`` temporarily doubles device
+    memory. Keep the serialized tensors on CPU (memory-mapped where supported),
+    then move only the selected model to the requested device below.
+    """
+
+    load_kwargs = {"map_location": "cpu", "weights_only": False}
+    try:
+        return torch.load(ckpt_path, mmap=True, **load_kwargs)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        logger.warning("Memory-mapped checkpoint loading unavailable (%s); falling back.", exc)
+        return torch.load(ckpt_path, **load_kwargs)
+
+
 def _ensure_transformers_gelutanh_compat() -> None:
     """Back-compat for checkpoints serialized with older transformers classes."""
     try:
@@ -114,7 +131,7 @@ class SmolVLMModel(nn.Module):
         
         # Load checkpoint
         _ensure_transformers_gelutanh_compat()
-        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+        checkpoint = _load_checkpoint_cpu(ckpt_path)
 
         # Prefer loading pre-serialized full model object when available.
         # This avoids fragile architecture reconstruction with mismatched
@@ -438,7 +455,7 @@ class SmolVLMForConditionalGeneration(SmolVLMModel):
         
         # Load checkpoint
         _ensure_transformers_gelutanh_compat()
-        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+        checkpoint = _load_checkpoint_cpu(ckpt_path)
 
         if isinstance(checkpoint, dict) and checkpoint.get("model", None) is not None:
             self._model = checkpoint["model"]
