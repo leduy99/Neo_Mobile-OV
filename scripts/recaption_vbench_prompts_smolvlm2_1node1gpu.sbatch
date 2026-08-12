@@ -25,7 +25,14 @@ export PYTHONNOUSERSITE=1
 CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
 PYTHON_BIN="${CONDA_ENV}/bin/python"
 VBENCH_REPO="${VBENCH_REPO:-$(pwd -P)/checkpoints/vbench_repo}"
-OUT="${OUT:-output/vbench_smolvlm2_recaptions/vbench_full_smolvlm2_recap.json}"
+MAX_PROMPTS="${MAX_PROMPTS:-0}"
+if [[ -n "${OUT:-}" ]]; then
+  OUT="${OUT}"
+elif [[ "${MAX_PROMPTS}" -gt 0 ]]; then
+  OUT="output/vbench_smolvlm2_recaptions/vbench_smoke${MAX_PROMPTS}_smolvlm2_recap.json"
+else
+  OUT="output/vbench_smolvlm2_recaptions/vbench_full_smolvlm2_recap.json"
+fi
 STOP_FILE="${TMPDIR%/}/mov_vbench_recap_${SLURM_JOB_ID:-local}.stop"
 
 test -x "${PYTHON_BIN}"
@@ -51,6 +58,7 @@ trap cleanup EXIT INT TERM
 
 echo "VBENCH_INFO=${VBENCH_INFO}"
 echo "OUT=${OUT}"
+echo "MAX_PROMPTS=${MAX_PROMPTS}"
 nvidia-smi || true
 
 "${PYTHON_BIN}" tools/recaption_vbench_prompts_smolvlm2.py \
@@ -58,6 +66,8 @@ nvidia-smi || true
   --output "${OUT}" \
   --batch-size "${BATCH_SIZE:-4}" \
   --max-new-tokens "${MAX_NEW_TOKENS:-96}" \
+  --max-prompts "${MAX_PROMPTS}" \
+  --min-valid-fraction "${MIN_VALID_FRACTION:-0.90}" \
   ${EXTRA_ARGS:-}
 
 "${PYTHON_BIN}" - "${OUT}" <<'PY'
