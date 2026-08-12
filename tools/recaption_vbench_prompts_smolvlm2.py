@@ -17,7 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from new_mobile_ov.checkpoints import ensure_smolvlm2_checkpoint  # noqa: E402
-from new_mobile_ov.smolvlm2 import SmolVLMModel, load_smolvlm2_from_ckpt  # noqa: E402
+from new_mobile_ov.smolvlm2 import (  # noqa: E402
+    SmolVLMForConditionalGeneration,
+    load_smolvlm2_from_ckpt,
+)
 
 
 SYSTEM_INSTRUCTION = (
@@ -143,7 +146,13 @@ def main() -> None:
 
     device = torch.device("cuda")
     checkpoint = ensure_smolvlm2_checkpoint(args.smolvlm2_checkpoint)
-    model = load_smolvlm2_from_ckpt(checkpoint, device=device, model_class=SmolVLMModel)
+    # The feature-only wrapper deliberately has no ``generate`` method. Reuse
+    # the same converted checkpoint through its causal-LM wrapper instead.
+    model = load_smolvlm2_from_ckpt(
+        checkpoint,
+        device=device,
+        model_class=SmolVLMForConditionalGeneration,
+    )
     model.eval().requires_grad_(False)
     model.to(device=device, dtype=torch.bfloat16)
     tokenizer = model.get_tokenizer()
