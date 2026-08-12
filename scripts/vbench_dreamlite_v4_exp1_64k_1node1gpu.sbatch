@@ -47,6 +47,7 @@ IMAGE_EXPECTED_STEP="${IMAGE_EXPECTED_STEP:-}"
 HF_REPO="${HF_REPO:-Amshaker/Mobile-OV}"
 MAX_PROMPTS="${MAX_PROMPTS:-0}"
 SAMPLES_PER_PROMPT="${SAMPLES_PER_PROMPT:-1}"
+RECAPTION_FILE="${RECAPTION_FILE:-}"
 STOP_FILE="${TMPDIR%/}/mov_vbench_setup_${SLURM_JOB_ID:-local}.stop"
 
 mkdir -p logs "${ANCHOR_DIR}" "${VIDEO_DIR}" "${SCORE_DIR}"
@@ -124,13 +125,21 @@ fi
 test -f "${VBENCH_INFO}"
 
 echo "RUN_ROOT=${RUN_ROOT} MAX_PROMPTS=${MAX_PROMPTS} SAMPLES_PER_PROMPT=${SAMPLES_PER_PROMPT}"
+echo "RECAPTION_FILE=${RECAPTION_FILE:-<raw VBench prompts>}"
 echo "IMAGE_CONFIG=${IMAGE_CONFIG}"
 echo "IMAGE_CKPT=${IMAGE_CKPT}"
 echo "VIDEO_CKPT=${VIDEO_CKPT}"
 nvidia-smi || true
 
+RECAPTION_ARGS=()
+if [[ -n "${RECAPTION_FILE}" ]]; then
+  test -f "${RECAPTION_FILE}"
+  RECAPTION_ARGS=(--recaption-file "${RECAPTION_FILE}")
+fi
+
 "${PYTHON_BIN}" tools/generate_vbench_dreamlite_exp1.py \
   --vbench-info "${VBENCH_INFO}" \
+  "${RECAPTION_ARGS[@]}" \
   --image-config "${IMAGE_CONFIG}" \
   --image-bridge-checkpoint "${IMAGE_CKPT}" \
   --video-bridge-checkpoint "${VIDEO_CKPT}" \

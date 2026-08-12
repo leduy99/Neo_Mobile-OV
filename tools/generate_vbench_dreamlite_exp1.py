@@ -28,12 +28,16 @@ from new_mobile_ov.generation import build_generation_backend  # noqa: E402
 from new_mobile_ov.generation.backends import DreamLiteMobileBackend  # noqa: E402
 
 
+def normalize_prompt(value: str) -> str:
+    return " ".join(str(value).strip().split())
+
+
 def load_prompts(info_path: Path, max_prompts: int) -> list[str]:
     rows = json.loads(info_path.read_text(encoding="utf-8"))
     prompts: list[str] = []
     seen: set[str] = set()
     for row in rows:
-        prompt = " ".join(str(row["prompt_en"]).strip().split())
+        prompt = normalize_prompt(row["prompt_en"])
         if prompt and prompt not in seen:
             prompts.append(prompt)
             seen.add(prompt)
@@ -42,6 +46,32 @@ def load_prompts(info_path: Path, max_prompts: int) -> list[str]:
     if not prompts:
         raise RuntimeError(f"No prompts found in {info_path}")
     return prompts
+
+
+def load_conditioning_prompts(recaption_file: Path | None, prompts: list[str]) -> list[str]:
+    """Return bridge inputs while retaining raw VBench prompts for filenames/scoring."""
+
+    if recaption_file is None:
+        return list(prompts)
+    payload = json.loads(recaption_file.read_text(encoding="utf-8"))
+    rows = payload.get("records", payload) if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        raise RuntimeError(f"Invalid VBench recaption file: {recaption_file}")
+    mapping: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw = normalize_prompt(row.get("prompt", ""))
+        recaption = normalize_prompt(row.get("recaption", ""))
+        if raw and recaption:
+            mapping[raw] = recaption
+    missing = [prompt for prompt in prompts if prompt not in mapping]
+    if missing:
+        raise RuntimeError(
+            f"Recaption file {recaption_file} is missing {len(missing)} VBench prompt(s); "
+            f"first={missing[0]!r}"
+        )
+    return [mapping[prompt] for prompt in prompts]
 
 
 def anchor_path(
@@ -114,7 +144,13 @@ def release(*objects) -> None:
 
 
 @torch.inference_mode()
-def generate_anchors(args, prompts: list[str], device: torch.device, dtype: torch.dtype) -> dict:
+def generate_anchors(
+    args,
+    prompts: list[str],
+    conditioning_prompts: list[str],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict:
     anchor_dir = Path(args.anchor_dir)
     anchor_dir.mkdir(parents=True, exist_ok=True)
     expected_size = (args.anchor_width, args.anchor_height)
@@ -155,7 +191,7 @@ def generate_anchors(args, prompts: list[str], device: torch.device, dtype: torc
     started = time.perf_counter()
     with torch.autocast("cuda", dtype=dtype):
         for prompt_index, prompt, sample_index in missing:
-            condition = bridge([prompt], mode="generate")
+            condition = bridge([conditioning_prompts[prompt_index]], mode="generate")
             image = backend.generate_images(
                 condition,
                 height=args.anchor_height,
@@ -198,7 +234,13 @@ def generate_anchors(args, prompts: list[str], device: torch.device, dtype: torc
 
 
 @torch.inference_mode()
-def generate_videos(args, prompts: list[str], device: torch.device, dtype: torch.dtype) -> dict:
+def generate_videos(
+    args,
+    prompts: list[str],
+    conditioning_prompts: list[str],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict:
     anchor_dir = Path(args.anchor_dir)
     video_dir = Path(args.video_dir)
     video_dir.mkdir(parents=True, exist_ok=True)
@@ -248,7 +290,7 @@ def generate_videos(args, prompts: list[str], device: torch.device, dtype: torch
     generated = 0
     started = time.perf_counter()
     for prompt_index, prompt, sample_index in missing:
-        conditioned_prompt = prompt + DEFAULT_PROMPT_MODIFIER
+        conditioned_prompt = conditioning_prompts[prompt_index] + DEFAULT_PROMPT_MODIFIER
         prompt_embeds, prompt_mask, pooled = bridge.encode([conditioned_prompt])
         first_frame = Image.open(
             anchor_path(
@@ -304,6 +346,11 @@ def parse_args() -> argparse.Namespace:
         description="Resume-safe VBench generation with DreamLite anchors and Exp1-64K video conditioning."
     )
     parser.add_argument("--vbench-info", required=True)
+    parser.add_argument(
+        "--recaption-file",
+        type=Path,
+        help="Optional JSON produced by recaption_vbench_prompts_smolvlm2.py. Raw VBench prompts remain video filenames.",
+    )
     parser.add_argument("--image-config", default="configs/mobile_ov_dreamlite_compact_v4.yaml")
     parser.add_argument("--video-config", default="configs/mobile_ov_neodragon.yaml")
     parser.add_argument("--image-bridge-checkpoint", required=True)
@@ -342,17 +389,19 @@ def main() -> None:
     device = torch.device("cuda")
     dtype = torch.bfloat16
     prompts = load_prompts(Path(args.vbench_info), args.max_prompts)
+    conditioning_prompts = load_conditioning_prompts(args.recaption_file, prompts)
     print(
         f"VBench generation prompts={len(prompts)} samples_per_prompt={args.samples_per_prompt} "
         f"expected_videos={len(prompts) * args.samples_per_prompt} "
         f"anchor={args.anchor_width}x{args.anchor_height}"
         f"@{args.anchor_time_id_width}x{args.anchor_time_id_height} "
-        f"video={args.video_width}x{args.video_height}x{args.num_frames}",
+        f"video={args.video_width}x{args.video_height}x{args.num_frames} "
+        f"conditioning={'smolvlm2_recaption' if args.recaption_file else 'raw_vbench'}",
         flush=True,
     )
     started = time.perf_counter()
-    anchor_summary = generate_anchors(args, prompts, device, dtype)
-    video_summary = generate_videos(args, prompts, device, dtype)
+    anchor_summary = generate_anchors(args, prompts, conditioning_prompts, device, dtype)
+    video_summary = generate_videos(args, prompts, conditioning_prompts, device, dtype)
     missing_anchors = [
         {"prompt": prompt, "sample_index": sample_index}
         for index, prompt, sample_index in sample_items(prompts, args.samples_per_prompt)
@@ -383,6 +432,12 @@ def main() -> None:
         "expected_videos": len(prompts) * args.samples_per_prompt,
         "image_checkpoint": str(Path(args.image_bridge_checkpoint).resolve()),
         "video_checkpoint": str(Path(args.video_bridge_checkpoint).resolve()),
+        "recaption_file": (
+            None if args.recaption_file is None else str(args.recaption_file.resolve())
+        ),
+        "conditioning_prompts_differ": sum(
+            raw != conditioned for raw, conditioned in zip(prompts, conditioning_prompts)
+        ),
         "anchor": {
             "width": args.anchor_width,
             "height": args.anchor_height,
