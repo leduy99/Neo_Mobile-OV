@@ -108,6 +108,8 @@ SUBSET_INFO="${RUN_ROOT}/vbench_stratified_${PROMPT_COUNT}_info.json"
   --output "${SUBSET_INFO}" \
   --count "${PROMPT_COUNT}" \
   --seed "${SUBSET_SEED}"
+# VBench scoring runs from its own checkout, so keep the subset manifest absolute.
+SUBSET_INFO="$(realpath "${SUBSET_INFO}")"
 
 variant_setting() {
   case "$1" in
