@@ -647,6 +647,13 @@ def main() -> None:
         )
     if len(set(source_names)) != len(source_names):
         raise ValueError("generation source names must be unique")
+    grounded_source_names = set(split_csv(args.grounded_source_names))
+    unknown_grounded_sources = grounded_source_names - set(source_names)
+    if unknown_grounded_sources:
+        raise ValueError(
+            "grounded source names are not generation sources: "
+            + ", ".join(sorted(unknown_grounded_sources))
+        )
     image_columns = split_csv(args.generation_image_columns)
     image_path_roots = split_paths(args.image_path_roots)
     generation_sources = [
@@ -658,6 +665,7 @@ def main() -> None:
             fallback_column=args.caption_fallback_column,
             image_columns=image_columns,
             max_samples=args.max_samples,
+            require_existing_image=name in grounded_source_names,
             image_path_roots=image_path_roots,
         )
         for path, name in zip(manifest_paths, source_names)
@@ -695,13 +703,6 @@ def main() -> None:
         if args.grounded_functional_start_step < 0
         else args.grounded_functional_start_step
     )
-    grounded_source_names = set(split_csv(args.grounded_source_names))
-    unknown_grounded_sources = grounded_source_names - set(source_names)
-    if unknown_grounded_sources:
-        raise ValueError(
-            "grounded source names are not generation sources: "
-            + ", ".join(sorted(unknown_grounded_sources))
-        )
     eligible_grounded_sources = [
         source
         for source in generation_sources
@@ -725,23 +726,18 @@ def main() -> None:
     if args.grounded_batch_probability > 0:
         source_weight_by_name = dict(zip(source_names, source_weights))
         grounded_sources = [
-            CaptionManifestDataset(
-                source.path,
-                source_name=source.source_name,
-                variant_columns=columns,
-                variant_weights=weights,
-                fallback_column=args.caption_fallback_column,
-                image_columns=image_columns,
-                max_samples=args.max_samples,
-                require_existing_image=True,
-                image_path_roots=image_path_roots,
-            )
+            source
             for source in generation_sources
             if source.source_name in grounded_source_names
         ]
         grounded_weights = [
             source_weight_by_name[source.source_name] for source in grounded_sources
         ]
+        # A verified grounded-only source may intentionally have zero main
+        # sampling weight so it cannot alter the caption distribution. In that
+        # case draw uniformly among the selected grounded sources instead.
+        if not any(grounded_weights):
+            grounded_weights = [1.0] * len(grounded_sources)
         grounded_data = MixedPromptDataset(
             grounded_sources,
             grounded_weights,

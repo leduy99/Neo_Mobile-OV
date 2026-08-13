@@ -5,6 +5,7 @@ import csv
 from PIL import Image
 
 from new_mobile_ov.training.grounded_manifest import filter_grounded_manifest
+from new_mobile_ov.training.prompt_curriculum import CaptionManifestDataset
 
 
 def test_filter_grounded_manifest_keeps_only_verified_images(tmp_path) -> None:
@@ -47,3 +48,14 @@ def test_filter_grounded_manifest_keeps_only_verified_images(tmp_path) -> None:
             "source_name": "shortcaption",
         }
     ]
+    dataset = CaptionManifestDataset(
+        output,
+        source_name="shortcaption_verified",
+        variant_columns=[],
+        variant_weights=[],
+        fallback_column="caption",
+        image_columns=["image_path"],
+        max_samples=-1,
+        require_existing_image=True,
+    )
+    assert dataset[0].image_path == str(image_path)

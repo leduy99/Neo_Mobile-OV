@@ -17,10 +17,17 @@ PYTHON_BIN="${CONDA_ENV}/bin/python"
 TORCHRUN_BIN="${CONDA_ENV}/bin/torchrun"
 OUT="${OUT:-output/dreamlite_compact_v9_2gpu_smoke/${SLURM_JOB_ID:-local}}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
-PROMPT_MANIFEST="${OUT}/openvid_smoke.csv"
+IMAGE_PATH="${PWD}/Docs/assets/training_image_bridge_dreamlite/native_resolution_factors.jpg"
+JOURNEYDB_MANIFEST="${OUT}/journeydb_smoke.csv"
+SHORT_MANIFEST="${OUT}/short_caption_smoke.csv"
+VERIFIED_MANIFEST="${OUT}/short_caption_verified_smoke.csv"
 
 mkdir -p logs "${OUT}"
-printf 'caption\nA red panda reads a book beside a window.\n' > "${PROMPT_MANIFEST}"
+test -f "${IMAGE_PATH}"
+printf 'caption\nA red panda reads a book beside a window.\n' > "${JOURNEYDB_MANIFEST}"
+printf 'caption\nAn astronaut walks across a red desert.\n' > "${SHORT_MANIFEST}"
+printf 'caption,image_path\nA red panda reads a book beside a window.,%s\n' \
+  "${IMAGE_PATH}" > "${VERIFIED_MANIFEST}"
 
 export PATH="${CONDA_ENV}/bin:${PATH}"
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
@@ -34,9 +41,10 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 "${TORCHRUN_BIN}" --standalone --nproc_per_node="${NPROC_PER_NODE}" \
   tools/train_dreamlite_image_bridge.py \
   --config configs/mobile_ov_dreamlite_compact_v9.yaml \
-  --generation-prompt-manifests "${PROMPT_MANIFEST}" \
-  --generation-source-weights 1.0 \
-  --generation-source-names openvid \
+  --generation-prompt-manifests "${JOURNEYDB_MANIFEST};${SHORT_MANIFEST};${VERIFIED_MANIFEST}" \
+  --generation-source-weights 0.7142857143,0.2857142857,0.0 \
+  --generation-source-names journeydb,shortcaption,shortcaption_verified \
+  --grounded-source-names shortcaption_verified \
   --output-dir "${OUT}" \
   --target-step 3 \
   --resume none \
@@ -65,7 +73,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   --functional-batch-size 1 \
   --functional-call-weights 0,0,1,0 \
   --grounded-functional-probability 0 \
-  --grounded-batch-probability 0 \
+  --grounded-batch-probability 1.0 \
+  --grounded-functional-weight 0.5 \
   --transition-weight 1.0 \
   --transition-cos-weight 0.05 \
   --student-state-probability 0 \
@@ -77,7 +86,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 test -s "${OUT}/dreamlite_image_bridge_latest.pt"
 test -s "${OUT}/history.jsonl"
-grep -q '"phase": "functional"' "${OUT}/history.jsonl"
+grep -q '"phase": "grounded_functional"' "${OUT}/history.jsonl"
+grep -q '"dedicated_grounded_batch": true' "${OUT}/history.jsonl"
 "${PYTHON_BIN}" - "${OUT}/dreamlite_image_bridge_latest.pt" <<'PY'
 import sys
 import torch
@@ -85,7 +95,7 @@ import torch
 payload = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
 assert payload["architecture"] == "MobileOVDreamLiteCompactBridgeV7"
 assert payload["config"]["training_version"] == "v9"
-assert payload["config"]["grounded_batch_probability"] == 0.0
+assert payload["config"]["grounded_batch_probability"] == 1.0
 print("V9 checkpoint metadata: OK")
 PY
 

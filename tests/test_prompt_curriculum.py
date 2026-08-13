@@ -69,6 +69,14 @@ def test_mixed_prompt_dataset_uses_source_weights_not_source_sizes(tmp_path) -> 
     assert mixed.source_summary[0]["image_candidate_rows"] == 0
 
 
+def test_mixed_prompt_dataset_allows_grounded_only_zero_weight_source(tmp_path) -> None:
+    main = manifest_dataset(tmp_path, "main", [{"caption": "main"}])
+    grounded = manifest_dataset(tmp_path, "grounded", [{"caption": "grounded"}])
+    mixed = MixedPromptDataset([main, grounded], [1.0, 0.0], seed=29)
+
+    assert {mixed[index].source for index in range(100)} == {"main"}
+
+
 def test_prompt_collate_keeps_optional_images_aligned(tmp_path) -> None:
     dataset = manifest_dataset(
         tmp_path,
