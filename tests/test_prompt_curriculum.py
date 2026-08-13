@@ -8,6 +8,7 @@ from PIL import Image
 from new_mobile_ov.training.prompt_curriculum import (
     CaptionManifestDataset,
     MixedPromptDataset,
+    existing_manifest_image_path,
     prompt_example_collate,
 )
 
@@ -127,3 +128,18 @@ def test_manifest_dataset_rebases_a_relocated_absolute_image_path(tmp_path) -> N
     )
 
     assert dataset[0].image_path == str(image_path)
+
+
+def test_existing_image_resolver_supports_short_caption_data_root(tmp_path) -> None:
+    data_root = tmp_path / "data"
+    image_path = data_root / "short_caption_pretrain" / "raw" / "images" / "sample.jpg"
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), "purple").save(image_path)
+
+    resolved = existing_manifest_image_path(
+        "/old/project/data/short_caption_pretrain/raw/images/sample.jpg",
+        manifest_path=tmp_path / "manifests" / "short.csv",
+        image_path_roots=[data_root],
+    )
+
+    assert resolved == str(image_path)

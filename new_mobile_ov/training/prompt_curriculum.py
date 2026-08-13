@@ -10,6 +10,13 @@ from torch.utils.data import Dataset
 
 
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".webp"}
+IMAGE_PATH_MARKERS = (
+    "data",
+    "journeydb_pretrain",
+    "short_caption_pretrain",
+    "mobile_o_sft_full",
+    "full_mobile-o",
+)
 
 
 def clean_text(value: object) -> str:
@@ -21,6 +28,54 @@ def clean_text(value: object) -> str:
     except Exception:
         pass
     return " ".join(str(value).strip().split())
+
+
+def existing_manifest_image_path(
+    value: object,
+    *,
+    manifest_path: str | Path,
+    image_path_roots: Sequence[str | Path] = (),
+) -> str:
+    """Resolve a manifest image path and return it only when it exists."""
+    raw_value = clean_text(value)
+    if not raw_value:
+        return ""
+    raw_path = Path(raw_value).expanduser()
+    if raw_path.suffix.lower() not in IMAGE_EXTENSIONS:
+        return ""
+
+    manifest = Path(manifest_path).expanduser()
+    candidates: list[Path] = [raw_path]
+    relative_paths: list[Path] = []
+    if not raw_path.is_absolute():
+        relative_paths.append(raw_path)
+    else:
+        parts = raw_path.parts
+        for marker in IMAGE_PATH_MARKERS:
+            if marker in parts:
+                relative_paths.append(Path(*parts[parts.index(marker) :]))
+
+    roots = (
+        Path.cwd(),
+        manifest.parent,
+        manifest.parent.parent,
+        *(Path(root).expanduser() for root in image_path_roots if str(root).strip()),
+    )
+    for relative_path in relative_paths:
+        for root in roots:
+            candidates.append(root / relative_path)
+            # A caller may pass either the data root or its parent project root.
+            if relative_path.parts and relative_path.parts[0] == root.name:
+                candidates.append(root.parent / relative_path)
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_file():
+            return str(candidate)
+    return ""
 
 
 @dataclass(frozen=True)
@@ -132,31 +187,13 @@ class CaptionManifestDataset(Dataset):
             raw_path = Path(value).expanduser()
             if raw_path.suffix.lower() not in IMAGE_EXTENSIONS:
                 continue
-            if raw_path.is_file():
-                return str(raw_path)
-
-            # Mobile-O manifests may move between project roots. Resolve a
-            # relative suffix under both manifest-local and caller-supplied roots.
-            relative_paths: list[Path] = []
-            if not raw_path.is_absolute():
-                relative_paths.append(raw_path)
-            else:
-                parts = raw_path.parts
-                for marker in ("data", "journeydb_pretrain", "mobile_o_sft_full"):
-                    if marker in parts:
-                        relative_paths.append(Path(*parts[parts.index(marker) :]))
-
-            roots = (
-                Path.cwd(),
-                self.path.parent,
-                self.path.parent.parent,
-                *self.image_path_roots,
+            resolved = existing_manifest_image_path(
+                value,
+                manifest_path=self.path,
+                image_path_roots=self.image_path_roots,
             )
-            for relative_path in relative_paths:
-                for root in roots:
-                    candidate = root / relative_path
-                    if candidate.is_file():
-                        return str(candidate)
+            if resolved:
+                return resolved
             return str(raw_path)
         return ""
 
