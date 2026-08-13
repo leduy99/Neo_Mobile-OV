@@ -98,6 +98,15 @@ def load_teacher(cfg, *, device: torch.device, dtype: torch.dtype):
     if str(repo_path) not in sys.path:
         sys.path.insert(0, str(repo_path))
 
+    # The released sampler builds a positive-semidefinite 2x2 covariance at
+    # gamma=1/3. Newer PyTorch rejects it in MultivariateNormal, so install the
+    # exact covariance-preserving sampler used by all Mobile-OV inference jobs.
+    from new_mobile_ov.generation.neodragon_compat import (
+        install_neodragon_generation_patches,
+    )
+
+    install_neodragon_generation_patches(device=device)
+
     from neodragon import MULTISTEP_CONTEXT_ADAPTER_ID, MULTISTEP_DIT_ID, VAE_ID
     from neodragon.asymmetric_causal_video_vae import AsymmetricCausalVideoVAE
     from neodragon.context_adapter import ContextAdapter
