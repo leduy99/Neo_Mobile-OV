@@ -32,6 +32,9 @@ test -f "${SHORT_PROMPTS}"
 PROMPT_MANIFESTS="${JOURNEYDB_PROMPTS};${SHORT_PROMPTS}"
 PROMPT_WEIGHTS="${PROMPT_WEIGHTS:-0.80,0.20}"
 PROMPT_NAMES="journeydb,shortcaption"
+# JourneyDB is caption-only on Berzelius. Grounded loss must draw only from the
+# short-caption source, whose raw images are present on the shared filesystem.
+GROUNDED_SOURCE_NAMES="${GROUNDED_SOURCE_NAMES:-shortcaption}"
 
 mkdir -p logs "${OUT}"
 export PATH="${CONDA_ENV}/bin:${PATH}"
@@ -45,6 +48,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 echo "Mobile-OV DreamLite V9 grounded functional distillation from scratch"
 echo "PROMPT_MANIFESTS=${PROMPT_MANIFESTS}"
 echo "PROMPT_WEIGHTS=${PROMPT_WEIGHTS} PROMPT_NAMES=${PROMPT_NAMES}"
+echo "GROUNDED_SOURCE_NAMES=${GROUNDED_SOURCE_NAMES} GROUNDED_BATCH_PROBABILITY=${GROUNDED_BATCH_PROBABILITY:-0.20}"
 echo "OUT=${OUT} TARGET_STEP=${TARGET_STEP}"
 echo "RESOLUTION_BUCKETS=${RESOLUTION_BUCKETS}"
 nvidia-smi || true
@@ -78,7 +82,7 @@ trap - EXIT INT TERM
   --generation-source-weights "${PROMPT_WEIGHTS}" \
   --generation-source-names "${PROMPT_NAMES}" \
   --image-path-roots "${MOBILEO_ROOT}" \
-  --grounded-source-names journeydb \
+  --grounded-source-names "${GROUNDED_SOURCE_NAMES}" \
   --output-dir "${OUT}" \
   --target-step "${TARGET_STEP}" \
   --resume none \
@@ -115,7 +119,7 @@ trap - EXIT INT TERM
   --functional-batch-size "${FUNCTIONAL_BATCH_SIZE:-2}" \
   --functional-call-weights "${FUNCTIONAL_CALL_WEIGHTS:-1,1,1,1}" \
   --grounded-functional-probability 0 \
-  --grounded-batch-probability "${GROUNDED_BATCH_PROBABILITY:-0.50}" \
+  --grounded-batch-probability "${GROUNDED_BATCH_PROBABILITY:-0.20}" \
   --grounded-functional-weight "${GROUNDED_FUNCTIONAL_WEIGHT:-1.0}" \
   --grounded-functional-start-step "${GROUNDED_FUNCTIONAL_START_STEP:-10001}" \
   --transition-weight "${TRANSITION_WEIGHT:-1.0}" \
