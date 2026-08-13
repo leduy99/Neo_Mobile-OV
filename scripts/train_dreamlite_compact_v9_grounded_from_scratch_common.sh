@@ -15,9 +15,7 @@ CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
 PYTHON_BIN="${CONDA_ENV}/bin/python"
 TORCHRUN_BIN="${CONDA_ENV}/bin/torchrun"
 CONFIG="${CONFIG:-configs/mobile_ov_dreamlite_compact_v9.yaml}"
-MOBILEO_ROOT="${MOBILEO_ROOT:-../Mobile-OV_Alpha/data}"
-JOURNEYDB_PROMPTS="${JOURNEYDB_PROMPTS:-${MOBILEO_ROOT}/journeydb_pretrain/manifests/journeydb_pretrain_train_ready.csv}"
-SHORT_PROMPTS="${SHORT_PROMPTS:-${MOBILEO_ROOT}/short_caption_pretrain/manifests/short_caption_pretrain_source.csv}"
+OPENVID_PROMPTS="${OPENVID_PROMPTS:-download_data/data/openvid/manifests/openvid_all_recaptions_merged.csv}"
 OUT="${OUT:-output/dreamlite_compact_v9_grounded_from_scratch/${SLURM_JOB_ID:-local}}"
 TARGET_STEP="${TARGET_STEP:-160000}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
@@ -26,15 +24,11 @@ STOP_FILE="${TMPDIR%/}/dreamlite_v9_setup_${SLURM_JOB_ID:-local}.stop"
 
 test -x "${PYTHON_BIN}"
 test -x "${TORCHRUN_BIN}"
-test -f "${JOURNEYDB_PROMPTS}"
-test -f "${SHORT_PROMPTS}"
+test -f "${OPENVID_PROMPTS}"
 
-PROMPT_MANIFESTS="${JOURNEYDB_PROMPTS};${SHORT_PROMPTS}"
-PROMPT_WEIGHTS="${PROMPT_WEIGHTS:-0.80,0.20}"
-PROMPT_NAMES="journeydb,shortcaption"
-# JourneyDB is caption-only on Berzelius. Grounded loss must draw only from the
-# short-caption source, whose raw images are present on the shared filesystem.
-GROUNDED_SOURCE_NAMES="${GROUNDED_SOURCE_NAMES:-shortcaption}"
+PROMPT_MANIFESTS="${OPENVID_PROMPTS}"
+PROMPT_WEIGHTS="1.0"
+PROMPT_NAMES="openvid"
 
 mkdir -p logs "${OUT}"
 export PATH="${CONDA_ENV}/bin:${PATH}"
@@ -45,10 +39,10 @@ export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export TORCH_DIST_TIMEOUT_MINUTES="${TORCH_DIST_TIMEOUT_MINUTES:-60}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-echo "Mobile-OV DreamLite V9 grounded functional distillation from scratch"
+echo "Mobile-OV DreamLite V9 caption-only functional distillation from scratch"
 echo "PROMPT_MANIFESTS=${PROMPT_MANIFESTS}"
 echo "PROMPT_WEIGHTS=${PROMPT_WEIGHTS} PROMPT_NAMES=${PROMPT_NAMES}"
-echo "GROUNDED_SOURCE_NAMES=${GROUNDED_SOURCE_NAMES} GROUNDED_BATCH_PROBABILITY=${GROUNDED_BATCH_PROBABILITY:-0.20}"
+echo "Grounded image batches are disabled; V9 uses only caption-conditioned distillation."
 echo "OUT=${OUT} TARGET_STEP=${TARGET_STEP}"
 echo "RESOLUTION_BUCKETS=${RESOLUTION_BUCKETS}"
 nvidia-smi || true
@@ -81,8 +75,6 @@ trap - EXIT INT TERM
   --generation-prompt-manifests "${PROMPT_MANIFESTS}" \
   --generation-source-weights "${PROMPT_WEIGHTS}" \
   --generation-source-names "${PROMPT_NAMES}" \
-  --image-path-roots "${MOBILEO_ROOT}" \
-  --grounded-source-names "${GROUNDED_SOURCE_NAMES}" \
   --output-dir "${OUT}" \
   --target-step "${TARGET_STEP}" \
   --resume none \
@@ -119,9 +111,7 @@ trap - EXIT INT TERM
   --functional-batch-size "${FUNCTIONAL_BATCH_SIZE:-2}" \
   --functional-call-weights "${FUNCTIONAL_CALL_WEIGHTS:-1,1,1,1}" \
   --grounded-functional-probability 0 \
-  --grounded-batch-probability "${GROUNDED_BATCH_PROBABILITY:-0.20}" \
-  --grounded-functional-weight "${GROUNDED_FUNCTIONAL_WEIGHT:-1.0}" \
-  --grounded-functional-start-step "${GROUNDED_FUNCTIONAL_START_STEP:-10001}" \
+  --grounded-batch-probability 0 \
   --transition-weight "${TRANSITION_WEIGHT:-1.0}" \
   --transition-cos-weight "${TRANSITION_COS_WEIGHT:-0.05}" \
   --student-state-probability "${STUDENT_STATE_PROBABILITY:-0.25}" \
