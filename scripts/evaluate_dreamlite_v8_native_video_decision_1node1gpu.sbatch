@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Final evaluation-only factorial ablation. It reuses the two completed 20-prompt
-# runs, scores six fixed branches, and writes contact sheets plus paired effects.
+# runs, scores four fixed video branches, and writes contact sheets plus paired effects.
 # Submit: sbatch scripts/evaluate_dreamlite_v8_native_video_decision_1node1gpu.sbatch
 # No image/video generation occurs in this job.
 #SBATCH --job-name=mov-v8decision
@@ -76,13 +76,26 @@ echo "RUN_ROOTS=${RUN_ROOTS_CSV}"
 nvidia-smi || true
 "${PYTHON_BIN}" -u tools/prepare_dreamlite_v8_decision_ablation.py "${PREPARE_ARGS[@]}"
 
-SUBSET_INFO="$(realpath "${OUT}/vbench_control20_info.json")"
 SEEDS=$("${PYTHON_BIN}" - "${OUT}/prepared.json" <<'PY'
 import json, sys
 print(','.join(str(value) for value in json.load(open(sys.argv[1]))['seeds']))
 PY
 )
 IFS=',' read -r -a SEED_LIST <<< "${SEEDS}"
+mapfile -t DIMENSION_SPECS < <("${PYTHON_BIN}" - "${OUT}/prepared.json" <<'PY'
+import json, sys
+payload = json.load(open(sys.argv[1]))
+all_dimensions = [
+    'subject_consistency', 'background_consistency', 'motion_smoothness', 'dynamic_degree',
+    'aesthetic_quality', 'imaging_quality', 'temporal_flickering', 'object_class',
+    'multiple_objects', 'color', 'spatial_relationship', 'scene', 'temporal_style',
+    'overall_consistency', 'human_action', 'appearance_style',
+]
+for dimension in payload['active_dimensions']:
+    print(f"{all_dimensions.index(dimension)}:{dimension}")
+PY
+)
+(( ${#DIMENSION_SPECS[@]} > 0 ))
 
 VIDEO_CELLS=(
   image_native_qwen__text_native_neodragon
@@ -90,29 +103,23 @@ VIDEO_CELLS=(
   image_v8_imageonly__text_native_neodragon
   image_v8_imageonly__text_exp1_64k
 )
-ANCHOR_CELLS=(anchor_native_qwen anchor_v8_imageonly)
 for seed in "${SEED_LIST[@]}"; do
-  for cell in "${ANCHOR_CELLS[@]}"; do
-    echo "Scoring static anchor seed=${seed} cell=${cell}"
-    (
-      cd "${VBENCH_REPO}"
-      "${VBENCH_ENV}/bin/python" "${ROOT}/tools/evaluate_vbench_resume.py" \
-        --videos "${OUT}/inputs/seed_${seed}/branches/${cell}/videos" \
-        --full-info "${SUBSET_INFO}" \
-        --output "${OUT}/scores/seed_${seed}/${cell}" \
-        --start 7 --end 12 --expected-samples-per-prompt 1
-    )
-  done
   for cell in "${VIDEO_CELLS[@]}"; do
     echo "Scoring generated video seed=${seed} cell=${cell}"
-    (
-      cd "${VBENCH_REPO}"
-      "${VBENCH_ENV}/bin/python" "${ROOT}/tools/evaluate_vbench_resume.py" \
-        --videos "${OUT}/inputs/seed_${seed}/branches/${cell}/videos" \
-        --full-info "${SUBSET_INFO}" \
-        --output "${OUT}/scores/seed_${seed}/${cell}" \
-        --expected-samples-per-prompt 1
-    )
+    for dimension_spec in "${DIMENSION_SPECS[@]}"; do
+      dimension_index="${dimension_spec%%:*}"
+      dimension="${dimension_spec#*:}"
+      echo "Scoring dimension=${dimension} seed=${seed} cell=${cell}"
+      (
+        cd "${VBENCH_REPO}"
+        "${VBENCH_ENV}/bin/python" "${ROOT}/tools/evaluate_vbench_resume.py" \
+          --videos "${OUT}/inputs/seed_${seed}/branches/${cell}/videos" \
+          --full-info "${OUT}/vbench_dimension_info/${dimension}.json" \
+          --output "${OUT}/scores/seed_${seed}/${cell}" \
+          --start "${dimension_index}" --end "$((dimension_index + 1))" \
+          --expected-samples-per-prompt 1
+      )
+    done
   done
 done
 

@@ -2,8 +2,8 @@
 """Prepare a reusable factorial DreamLite/NeoDragon ablation for VBench scoring.
 
 The source runs already contain four controlled cells per prompt and seed. This
-tool only creates VBench-compatible symlinks, static-anchor controls, and
-contact sheets; it never regenerates an image or video.
+tool only creates VBench-compatible symlinks and contact sheets; it never
+regenerates an image or video.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import subprocess
 from pathlib import Path
 
 from decord import VideoReader
@@ -24,7 +23,24 @@ VIDEO_CELLS = (
     "image_v8_imageonly__text_native_neodragon",
     "image_v8_imageonly__text_exp1_64k",
 )
-ANCHOR_CELLS = ("anchor_native_qwen", "anchor_v8_imageonly")
+DIMENSIONS = (
+    "subject_consistency",
+    "background_consistency",
+    "motion_smoothness",
+    "dynamic_degree",
+    "aesthetic_quality",
+    "imaging_quality",
+    "temporal_flickering",
+    "object_class",
+    "multiple_objects",
+    "color",
+    "spatial_relationship",
+    "scene",
+    "temporal_style",
+    "overall_consistency",
+    "human_action",
+    "appearance_style",
+)
 
 
 def normalize_prompt(value: object) -> str:
@@ -94,6 +110,30 @@ def ordered_vbench_subset(info_path: Path, prompts: list[str]) -> list[dict]:
     return [row for row in rows if normalize_prompt(row.get("prompt_en", "")) in requested]
 
 
+def dimensions_for(row: dict) -> list[str]:
+    value = row.get("dimension", [])
+    if isinstance(value, str):
+        return [value]
+    return value if isinstance(value, list) else []
+
+
+def write_dimension_subsets(rows: list[dict], directory: Path) -> list[str]:
+    directory.mkdir(parents=True, exist_ok=True)
+    active: list[str] = []
+    for dimension in DIMENSIONS:
+        matching = [row for row in rows if dimension in dimensions_for(row)]
+        if not matching:
+            continue
+        (directory / f"{dimension}.json").write_text(
+            json.dumps(matching, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        active.append(dimension)
+    if not active:
+        raise RuntimeError("The selected VBench prompts do not cover any VBench dimension.")
+    return active
+
+
 def thumbnail(image: Image.Image, width: int, height: int) -> Image.Image:
     result = image.convert("RGB")
     result.thumbnail((width, height))
@@ -120,6 +160,9 @@ def create_contact_sheet(
 ) -> None:
     anchors = prompt_record["anchors"]
     videos = prompt_record["videos"]
+    for path in anchors.values():
+        if not valid_image(Path(path)):
+            raise RuntimeError(f"Cannot create contact sheet from invalid anchor: {path}")
     frame_width, frame_height = 144, 90
     card_width = frame_width * 3
     row_height = frame_height + 26
@@ -159,37 +202,6 @@ def create_contact_sheet(
     canvas.save(output, quality=92)
 
 
-def static_video(source: Path, destination: Path, *, frames: int, fps: int) -> None:
-    if valid_video(destination, frames):
-        return
-    if not valid_image(source):
-        raise RuntimeError(f"Missing or invalid source anchor: {source}")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    # ffmpeg avoids importing the full training stack solely to repeat a static frame.
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-loglevel",
-            "error",
-            "-loop",
-            "1",
-            "-i",
-            str(source),
-            "-frames:v",
-            str(frames),
-            "-r",
-            str(fps),
-            "-pix_fmt",
-            "yuv420p",
-            str(destination),
-        ],
-        check=True,
-    )
-    if not valid_video(destination, frames):
-        raise RuntimeError(f"Invalid static anchor video: {destination}")
-
-
 def vbench_video_name(prompt: str) -> str:
     return f"{prompt}-0.mp4"
 
@@ -221,6 +233,7 @@ def main() -> None:
     subset = ordered_vbench_subset(args.vbench_info, canonical_prompts)
     subset_path = output / "vbench_control20_info.json"
     subset_path.write_text(json.dumps(subset, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    active_dimensions = write_dimension_subsets(subset, output / "vbench_dimension_info")
 
     prepared_sources: list[dict] = []
     for source in sources:
@@ -234,18 +247,6 @@ def main() -> None:
                     seed_root / "branches" / cell / "videos" / vbench_video_name(prompt),
                     expected_frames=args.num_frames,
                 )
-            static_video(
-                Path(record["anchors"]["native_qwen"]),
-                seed_root / "branches" / "anchor_native_qwen" / "videos" / vbench_video_name(prompt),
-                frames=args.num_frames,
-                fps=args.fps,
-            )
-            static_video(
-                Path(record["anchors"]["v8_imageonly"]),
-                seed_root / "branches" / "anchor_v8_imageonly" / "videos" / vbench_video_name(prompt),
-                frames=args.num_frames,
-                fps=args.fps,
-            )
             stem = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:10]
             create_contact_sheet(
                 record,
@@ -258,6 +259,7 @@ def main() -> None:
                 "source_root": str(source["root"]),
                 "source_summary": str(source["root"] / "summary.json"),
                 "prompt_count": len(prompt_records),
+                "mean_condition_metrics": source["summary"].get("mean_condition_metrics", {}),
             }
         )
 
@@ -265,14 +267,15 @@ def main() -> None:
         "status": "ok",
         "protocol": (
             "Evaluation-only 2x2 factorial ablation. Existing videos are linked exactly as generated; "
-            "static anchor controls repeat the corresponding DreamLite first frame for semantic scoring."
+            "the original per-seed image-condition distances are retained for bridge-alignment reporting."
         ),
         "vbench_info": str(args.vbench_info.resolve()),
         "subset_info": str(subset_path),
+        "dimension_info_dir": str(output / "vbench_dimension_info"),
+        "active_dimensions": active_dimensions,
         "prompt_count": len(canonical_prompts),
         "seeds": seeds,
         "video_cells": list(VIDEO_CELLS),
-        "anchor_cells": list(ANCHOR_CELLS),
         "sources": prepared_sources,
     }
     (output / "prepared.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
