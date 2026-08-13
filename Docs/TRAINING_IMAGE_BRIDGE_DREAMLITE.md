@@ -1,5 +1,10 @@
 # Training Image Bridge DreamLite
 
+> **Later versions.** This report records the analysis that led through V7.
+> The continuation, including the V8 controlled VBench ablations and V9
+> from-scratch recipe, is maintained in
+> [DreamLite Image Bridge: V7 to V9](DREAMLITE_IMAGE_BRIDGE_V7_TO_V9.md).
+
 **Date:** 2026-08-04
 
 ## Executive Summary

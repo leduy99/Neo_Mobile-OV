@@ -1,5 +1,10 @@
 # DreamLite Image Bridge: From V1 to V6
 
+> **Continuation.** The V7-V9 data, ablation, and training-design record is in
+> [DreamLite Image Bridge: V7 to V9](DREAMLITE_IMAGE_BRIDGE_V7_TO_V9.md).
+> This document intentionally preserves the original V1-V6 history rather than
+> renaming old checkpoints or retroactively changing their experiment labels.
+
 ## Purpose
 
 This document records why the Mobile-OV DreamLite image bridge changed from
