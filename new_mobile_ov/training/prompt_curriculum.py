@@ -44,6 +44,7 @@ class CaptionManifestDataset(Dataset):
         image_columns: Sequence[str],
         max_samples: int,
         require_existing_image: bool = False,
+        image_path_roots: Sequence[str | Path] = (),
     ) -> None:
         self.path = Path(path).expanduser()
         sep = "\t" if self.path.suffix.lower() == ".tsv" else ","
@@ -89,6 +90,9 @@ class CaptionManifestDataset(Dataset):
         self.fallback = fallback
         self.image_columns = available_image_columns
         self.require_existing_image = bool(require_existing_image)
+        self.image_path_roots = tuple(
+            Path(root).expanduser() for root in image_path_roots if str(root).strip()
+        )
         caption_columns = sorted(
             {name for name, _ in self.variants}
             | ({fallback} if fallback is not None else set())
@@ -125,28 +129,35 @@ class CaptionManifestDataset(Dataset):
             value = clean_text(row.get(column))
             if not value:
                 continue
-            path = Path(value).expanduser()
-            if path.suffix.lower() not in IMAGE_EXTENSIONS:
+            raw_path = Path(value).expanduser()
+            if raw_path.suffix.lower() not in IMAGE_EXTENSIONS:
                 continue
-            if not path.is_absolute():
-                # Source manifests normally store absolute paths. These fallbacks
-                # cover repo-relative and output-root-relative manifests.
-                repo_relative = Path.cwd() / path
-                manifest_relative = self.path.parent / path
-                output_relative = self.path.parent.parent / path
-                path = next(
-                    (
-                        candidate
-                        for candidate in (
-                            repo_relative,
-                            manifest_relative,
-                            output_relative,
-                        )
-                        if candidate.is_file()
-                    ),
-                    repo_relative,
-                )
-            return str(path)
+            if raw_path.is_file():
+                return str(raw_path)
+
+            # Mobile-O manifests may move between project roots. Resolve a
+            # relative suffix under both manifest-local and caller-supplied roots.
+            relative_paths: list[Path] = []
+            if not raw_path.is_absolute():
+                relative_paths.append(raw_path)
+            else:
+                parts = raw_path.parts
+                for marker in ("data", "journeydb_pretrain", "mobile_o_sft_full"):
+                    if marker in parts:
+                        relative_paths.append(Path(*parts[parts.index(marker) :]))
+
+            roots = (
+                Path.cwd(),
+                self.path.parent,
+                self.path.parent.parent,
+                *self.image_path_roots,
+            )
+            for relative_path in relative_paths:
+                for root in roots:
+                    candidate = root / relative_path
+                    if candidate.is_file():
+                        return str(candidate)
+            return str(raw_path)
         return ""
 
     def __len__(self) -> int:

@@ -436,6 +436,11 @@ def parse_args() -> argparse.Namespace:
         default="image_path,media_path,video_path",
         help="Candidate raw-image columns, in priority order.",
     )
+    parser.add_argument(
+        "--image-path-roots",
+        default="",
+        help="Comma-separated data roots used to resolve relocated manifest image paths.",
+    )
     parser.add_argument("--edit-manifest", default=None)
     parser.add_argument("--edit-image-column", default="source_image")
     parser.add_argument("--edit-instruction-column", default="instruction")
@@ -643,6 +648,7 @@ def main() -> None:
     if len(set(source_names)) != len(source_names):
         raise ValueError("generation source names must be unique")
     image_columns = split_csv(args.generation_image_columns)
+    image_path_roots = split_paths(args.image_path_roots)
     generation_sources = [
         CaptionManifestDataset(
             path,
@@ -652,6 +658,7 @@ def main() -> None:
             fallback_column=args.caption_fallback_column,
             image_columns=image_columns,
             max_samples=args.max_samples,
+            image_path_roots=image_path_roots,
         )
         for path, name in zip(manifest_paths, source_names)
     ]
@@ -727,6 +734,7 @@ def main() -> None:
                 image_columns=image_columns,
                 max_samples=args.max_samples,
                 require_existing_image=True,
+                image_path_roots=image_path_roots,
             )
             for source in generation_sources
             if source.source_name in grounded_source_names

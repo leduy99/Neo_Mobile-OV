@@ -77,6 +77,7 @@ trap - EXIT INT TERM
   --generation-prompt-manifests "${PROMPT_MANIFESTS}" \
   --generation-source-weights "${PROMPT_WEIGHTS}" \
   --generation-source-names "${PROMPT_NAMES}" \
+  --image-path-roots "${MOBILEO_ROOT}" \
   --grounded-source-names journeydb \
   --output-dir "${OUT}" \
   --target-step "${TARGET_STEP}" \

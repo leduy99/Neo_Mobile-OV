@@ -96,3 +96,34 @@ def test_train_ready_video_path_keeps_images_but_rejects_video_files(tmp_path) -
     assert dataset[0].image_path == str(image_path)
     assert dataset[1].image_path == ""
     assert dataset.image_candidate_rows == 1
+
+
+def test_manifest_dataset_rebases_a_relocated_absolute_image_path(tmp_path) -> None:
+    data_root = tmp_path / "mobileo_data"
+    image_path = data_root / "journeydb_pretrain" / "raw" / "images" / "sample.jpg"
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), "green").save(image_path)
+    manifest = tmp_path / "manifests" / "journey.csv"
+    manifest.parent.mkdir()
+    pd.DataFrame(
+        [
+            {
+                "caption": "a green square",
+                "image_path": "/old/project/data/journeydb_pretrain/raw/images/sample.jpg",
+            }
+        ]
+    ).to_csv(manifest, index=False)
+
+    dataset = CaptionManifestDataset(
+        manifest,
+        source_name="journeydb",
+        variant_columns=[],
+        variant_weights=[],
+        fallback_column="caption",
+        image_columns=["image_path"],
+        max_samples=-1,
+        require_existing_image=True,
+        image_path_roots=[data_root],
+    )
+
+    assert dataset[0].image_path == str(image_path)
