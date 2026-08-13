@@ -2,9 +2,10 @@
 """Isolate DreamLite image conditioning from NeoDragon text/video conditioning.
 
 For every prompt and fixed seed, the experiment renders two DreamLite anchors
-(``native_qwen`` and ``v8_imageonly``) and combines each with both NeoDragon
-text conditions (native ContextAdapter and Exp1-64K bridge).  The four video
-cells form a small causal ablation rather than an end-to-end comparison alone.
+(``native_qwen`` and ``v8_imageonly``) and combines each with one or more
+NeoDragon text conditions.  By default it retains the original two-by-two
+matrix (native ContextAdapter and Exp1-64K bridge); callers can instead select
+only the native NeoDragon condition to isolate the image bridge.
 """
 
 from __future__ import annotations
@@ -60,6 +61,10 @@ class VBenchReuse:
 
     root: Path
     generation_summary: dict[str, object]
+
+
+IMAGE_CONDITION_NAMES = ("native_qwen", "v8_imageonly")
+VIDEO_CONDITION_NAMES = ("native_neodragon", "exp1_64k")
 
 
 def safe_stem(value: str, max_length: int = 72) -> str:
@@ -437,29 +442,6 @@ def generate_anchors(
 
 
 @torch.inference_mode()
-def make_video_conditions(
-    video_cfg,
-    prompts: list[PromptItem],
-    *,
-    checkpoint: Path,
-    backend,
-    modifier: str,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> tuple[dict[str, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]], dict[str, object]]:
-    prompt_texts = [item.prompt + modifier for item in prompts]
-    native_conditions = make_native_video_conditions(backend, prompt_texts)
-    student_conditions, metadata = make_exp1_video_conditions(
-        video_cfg,
-        prompt_texts,
-        checkpoint=checkpoint,
-        device=device,
-        dtype=dtype,
-    )
-    return {"native_neodragon": native_conditions, "exp1_64k": student_conditions}, metadata
-
-
-@torch.inference_mode()
 def make_native_video_conditions(
     backend,
     prompt_texts: list[str],
@@ -674,7 +656,7 @@ def load_anchors(
     *,
     expected_size: tuple[int, int],
 ) -> dict[str, list[Image.Image]]:
-    anchors: dict[str, list[Image.Image]] = {"native_qwen": [], "v8_imageonly": []}
+    anchors: dict[str, list[Image.Image]] = {name: [] for name in IMAGE_CONDITION_NAMES}
     for index, item in enumerate(prompts):
         for name, values in anchors.items():
             path = image_path(output_dir, name, index + 1, item)
@@ -709,7 +691,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-config", default="configs/mobile_ov_dreamlite_compact_v8.yaml")
     parser.add_argument("--video-config", default="configs/mobile_ov_neodragon.yaml")
     parser.add_argument("--image-bridge-checkpoint", required=True, type=Path)
-    parser.add_argument("--video-bridge-checkpoint", required=True, type=Path)
+    parser.add_argument(
+        "--video-bridge-checkpoint",
+        type=Path,
+        help="Required only when --video-condition-names includes exp1_64k.",
+    )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
         "--reuse-vbench-root",
@@ -730,6 +716,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-height", type=int, default=320)
     parser.add_argument("--num-frames", type=int, default=49)
     parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument(
+        "--video-condition-names",
+        nargs="+",
+        choices=VIDEO_CONDITION_NAMES,
+        default=list(VIDEO_CONDITION_NAMES),
+        help=(
+            "NeoDragon text conditions to render. Use native_neodragon alone for an "
+            "image-bridge-only ablation."
+        ),
+    )
     parser.add_argument(
         "--stage",
         choices=("all", "image_conditions", "anchors", "video_conditions", "videos", "summary"),
@@ -818,23 +814,28 @@ def run_video_conditions(
     video_cfg = load_config(args.video_config)
     modifier = prepare_neodragon_modifier(video_cfg)
     prompt_texts = [item.prompt + modifier for item in prompts]
-
-    backend = build_generation_backend(video_cfg.backend, device=device)
-    native_conditions = make_native_video_conditions(backend, prompt_texts)
-    del backend
-    release()
-
-    student_conditions, metadata = make_exp1_video_conditions(
-        video_cfg,
-        prompt_texts,
-        checkpoint=args.video_bridge_checkpoint,
-        device=device,
-        dtype=dtype,
-    )
+    conditions: dict[str, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = {}
+    metadata: dict[str, object] = {}
+    if "native_neodragon" in args.video_condition_names:
+        backend = build_generation_backend(video_cfg.backend, device=device)
+        conditions["native_neodragon"] = make_native_video_conditions(backend, prompt_texts)
+        metadata["native_neodragon"] = {"source": "released_neodragon_context_adapter"}
+        del backend
+        release()
+    if "exp1_64k" in args.video_condition_names:
+        student_conditions, checkpoint_metadata = make_exp1_video_conditions(
+            video_cfg,
+            prompt_texts,
+            checkpoint=args.video_bridge_checkpoint,
+            device=device,
+            dtype=dtype,
+        )
+        conditions["exp1_64k"] = student_conditions
+        metadata["exp1_64k"] = checkpoint_metadata
     save_video_conditions(
         output_dir,
         prompts,
-        {"native_neodragon": native_conditions, "exp1_64k": student_conditions},
+        conditions,
         metadata,
     )
     print(f"Saved staged video conditions: {video_conditions_path(output_dir)}", flush=True)
@@ -884,32 +885,47 @@ def build_summary(
     output_dir: Path,
     reuse: VBenchReuse | None,
 ) -> dict[str, object]:
-    _, condition_metrics, image_checkpoint = load_image_conditions(output_dir, prompts)
-    _, video_checkpoint = load_video_conditions(output_dir, prompts)
+    image_conditions, condition_metrics, image_checkpoint = load_image_conditions(output_dir, prompts)
+    video_conditions, video_metadata = load_video_conditions(output_dir, prompts)
     anchor_payload = json.loads(anchor_timings_path(output_dir).read_text(encoding="utf-8"))
     video_payload = json.loads(video_timings_path(output_dir).read_text(encoding="utf-8"))
     anchor_seconds = anchor_payload["timings"]
     video_seconds = video_payload["timings"]
+    image_names = list(image_conditions)
+    video_names = list(args.video_condition_names)
+    missing_video_names = [name for name in video_names if name not in video_conditions]
+    if missing_video_names:
+        raise RuntimeError(
+            "Staged video conditions do not contain the requested conditions: "
+            f"{missing_video_names}"
+        )
+    selected_video_metadata = {
+        name: video_metadata.get(name, {}) for name in video_names
+    }
+    cells = [
+        f"image_{image_name}__text_{text_name}"
+        for image_name in image_names
+        for text_name in video_names
+    ]
+    image_only = video_names == ["native_neodragon"]
     return {
         "status": "ok",
         "protocol": {
-            "image_conditions": ["native_qwen", "v8_imageonly"],
-            "video_conditions": ["native_neodragon", "exp1_64k"],
-            "cells": [
-                "image_native_qwen__text_native_neodragon",
-                "image_native_qwen__text_exp1_64k",
-                "image_v8_imageonly__text_native_neodragon",
-                "image_v8_imageonly__text_exp1_64k",
-            ],
+            "image_conditions": image_names,
+            "video_conditions": video_names,
+            "cells": cells,
             "controls": (
                 "Every cell for a prompt uses the same DreamLite seed, NeoDragon seed, render size, "
-                "logical time_ids, released DreamLite generator, released Hybrid NeoDragon DiT, and "
-                "fixed Exp1-64K checkpoint when the Exp1 text condition is selected."
+                "logical time_ids, released DreamLite generator, and released Hybrid NeoDragon DiT."
             ),
             "interpretation": {
                 "native_qwen_vs_v8_imageonly": "DreamLite image-bridge alignment and anchor generation effect.",
-                "native_neodragon_vs_exp1_64k": "NeoDragon video text-condition effect with an identical anchor.",
-                "full_pipeline": "V8 image bridge plus Exp1-64K video bridge under fixed released generators.",
+                "native_neodragon_vs_exp1_64k": (
+                    "NeoDragon video text-condition effect with an identical anchor."
+                    if "exp1_64k" in video_names
+                    else "Not included: this run intentionally fixes native NeoDragon text conditioning."
+                ),
+                "image_only": image_only,
             },
             "reused_control": (
                 None
@@ -922,7 +938,7 @@ def build_summary(
             ),
         },
         "image_checkpoint": image_checkpoint,
-        "video_checkpoint": video_checkpoint,
+        "video_condition_metadata": selected_video_metadata,
         "seed": args.seed,
         "image_render": {
             "width": args.anchor_width,
@@ -955,14 +971,14 @@ def build_summary(
                 "condition_metrics_v8_vs_native": condition_metrics[index],
                 "anchors": {
                     name: str(image_path(output_dir, name, index + 1, item))
-                    for name in ("native_qwen", "v8_imageonly")
+                    for name in image_names
                 },
                 "videos": {
                     f"image_{image_name}__text_{text_name}": str(
                         video_path(output_dir, image_name, text_name, index + 1, item)
                     )
-                    for image_name in ("native_qwen", "v8_imageonly")
-                    for text_name in ("native_neodragon", "exp1_64k")
+                    for image_name in image_names
+                    for text_name in video_names
                 },
             }
             for index, item in enumerate(prompts)
@@ -975,6 +991,10 @@ def main() -> None:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     if args.reuse_vbench_root is not None and args.vbench_info is None:
         raise ValueError("--reuse-vbench-root requires --vbench-info for an exact prompt-to-asset mapping.")
+    if len(set(args.video_condition_names)) != len(args.video_condition_names):
+        raise ValueError("--video-condition-names must not contain duplicates.")
+    if "exp1_64k" in args.video_condition_names and args.video_bridge_checkpoint is None:
+        raise ValueError("--video-bridge-checkpoint is required when --video-condition-names includes exp1_64k.")
     prompts = (
         load_vbench_prompts(args.vbench_info, args.max_prompts)
         if args.vbench_info is not None
