@@ -15,7 +15,9 @@ CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
 PYTHON_BIN="${CONDA_ENV}/bin/python"
 TORCHRUN_BIN="${CONDA_ENV}/bin/torchrun"
 CONFIG="${CONFIG:-configs/mobile_ov_dreamlite_compact_v9.yaml}"
-OPENVID_PROMPTS="${OPENVID_PROMPTS:-download_data/data/openvid/manifests/openvid_all_recaptions_merged.csv}"
+MOBILEO_ROOT="${MOBILEO_ROOT:-../Mobile-OV_Alpha/data}"
+JOURNEYDB_PROMPTS="${JOURNEYDB_PROMPTS:-${MOBILEO_ROOT}/journeydb_pretrain/manifests/journeydb_pretrain_train_ready.csv}"
+SHORT_PROMPTS="${SHORT_PROMPTS:-${MOBILEO_ROOT}/short_caption_pretrain/manifests/short_caption_pretrain_source.csv}"
 OUT="${OUT:-output/dreamlite_compact_v9_grounded_from_scratch/${SLURM_JOB_ID:-local}}"
 TARGET_STEP="${TARGET_STEP:-160000}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
@@ -24,11 +26,14 @@ STOP_FILE="${TMPDIR%/}/dreamlite_v9_setup_${SLURM_JOB_ID:-local}.stop"
 
 test -x "${PYTHON_BIN}"
 test -x "${TORCHRUN_BIN}"
-test -f "${OPENVID_PROMPTS}"
+test -f "${JOURNEYDB_PROMPTS}"
+test -f "${SHORT_PROMPTS}"
 
-PROMPT_MANIFESTS="${OPENVID_PROMPTS}"
-PROMPT_WEIGHTS="1.0"
-PROMPT_NAMES="openvid"
+# Preserve V8 image-only's verified caption distribution. These manifests are
+# intentionally caption-only here: V9 does not resolve or read their raw images.
+PROMPT_MANIFESTS="${JOURNEYDB_PROMPTS};${SHORT_PROMPTS}"
+PROMPT_WEIGHTS="0.7142857143,0.2857142857"
+PROMPT_NAMES="journeydb,shortcaption"
 
 mkdir -p logs "${OUT}"
 export PATH="${CONDA_ENV}/bin:${PATH}"
@@ -42,7 +47,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 echo "Mobile-OV DreamLite V9 caption-only functional distillation from scratch"
 echo "PROMPT_MANIFESTS=${PROMPT_MANIFESTS}"
 echo "PROMPT_WEIGHTS=${PROMPT_WEIGHTS} PROMPT_NAMES=${PROMPT_NAMES}"
-echo "Grounded image batches are disabled; V9 uses only caption-conditioned distillation."
+echo "V8 image-only caption distribution; grounded image batches are disabled."
 echo "OUT=${OUT} TARGET_STEP=${TARGET_STEP}"
 echo "RESOLUTION_BUCKETS=${RESOLUTION_BUCKETS}"
 nvidia-smi || true
