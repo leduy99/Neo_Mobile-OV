@@ -546,6 +546,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--functional-batch-size", type=int, default=1)
     parser.add_argument("--functional-call-weights", default="1,1,1,1")
     parser.add_argument("--grounded-functional-probability", type=float, default=0.0)
+    parser.add_argument(
+        "--grounded-batch-probability",
+        type=float,
+        default=0.0,
+        help=(
+            "Probability of drawing an entire functional batch from a dedicated "
+            "image-verified loader. This guarantees grounded supervision instead "
+            "of relying on incidental image paths in the main prompt batch."
+        ),
+    )
     parser.add_argument("--grounded-functional-weight", type=float, default=1.0)
     parser.add_argument("--grounded-functional-start-step", type=int, default=-1)
     parser.add_argument(
@@ -656,6 +666,16 @@ def main() -> None:
         raise ValueError("student state probability must be in [0, 1]")
     if not 0.0 <= args.grounded_functional_probability <= 1.0:
         raise ValueError("grounded functional probability must be in [0, 1]")
+    if not 0.0 <= args.grounded_batch_probability <= 1.0:
+        raise ValueError("grounded batch probability must be in [0, 1]")
+    if (
+        args.grounded_functional_probability > 0
+        and args.grounded_batch_probability > 0
+    ):
+        raise ValueError(
+            "Use either legacy --grounded-functional-probability or the dedicated "
+            "--grounded-batch-probability, not both."
+        )
     if args.grounded_functional_weight < 0:
         raise ValueError("grounded functional weight must be non-negative")
     lr_decay_end_step = (
@@ -688,6 +708,37 @@ def main() -> None:
             "Grounded functional loss is enabled, but its selected manifests "
             "contain no image paths with a supported extension."
         )
+    if args.grounded_batch_probability > 0 and not grounded_source_names:
+        raise ValueError(
+            "Dedicated grounded batches require --grounded-source-names so their "
+            "image-caption distribution is explicit."
+        )
+
+    grounded_data = None
+    if args.grounded_batch_probability > 0:
+        source_weight_by_name = dict(zip(source_names, source_weights))
+        grounded_sources = [
+            CaptionManifestDataset(
+                source.path,
+                source_name=source.source_name,
+                variant_columns=columns,
+                variant_weights=weights,
+                fallback_column=args.caption_fallback_column,
+                image_columns=image_columns,
+                max_samples=args.max_samples,
+                require_existing_image=True,
+            )
+            for source in generation_sources
+            if source.source_name in grounded_source_names
+        ]
+        grounded_weights = [
+            source_weight_by_name[source.source_name] for source in grounded_sources
+        ]
+        grounded_data = MixedPromptDataset(
+            grounded_sources,
+            grounded_weights,
+            seed=args.seed + 67,
+        )
     generation_sampler = (
         DistributedSampler(
             generation_data,
@@ -707,6 +758,30 @@ def main() -> None:
         num_workers=0,
         drop_last=True,
         collate_fn=prompt_example_collate,
+    )
+    grounded_sampler = (
+        DistributedSampler(
+            grounded_data,
+            num_replicas=context.world_size,
+            rank=context.rank,
+            shuffle=True,
+            seed=args.seed + 11,
+        )
+        if grounded_data is not None and context.is_distributed
+        else None
+    )
+    grounded_loader = (
+        DataLoader(
+            grounded_data,
+            batch_size=args.batch_size,
+            sampler=grounded_sampler,
+            shuffle=grounded_sampler is None,
+            num_workers=0,
+            drop_last=True,
+            collate_fn=prompt_example_collate,
+        )
+        if grounded_data is not None
+        else None
     )
     semantic_data = CompositionalPromptDataset(
         len(generation_data),
@@ -880,9 +955,16 @@ def main() -> None:
     rank0_print(
         context,
         f"Grounded functional: probability={args.grounded_functional_probability:g} "
+        f"dedicated_batch_probability={args.grounded_batch_probability:g} "
         f"weight={args.grounded_functional_weight:g} start_step={grounded_start_step} "
         f"sources={sorted(grounded_source_names) or ['all-image-sources']}",
     )
+    if grounded_data is not None:
+        rank0_print(
+            context,
+            "Dedicated grounded prompt sources: "
+            + json.dumps(grounded_data.source_summary),
+        )
     rank0_print(
         context,
         "Resolution buckets: "
@@ -891,8 +973,10 @@ def main() -> None:
         ),
     )
     generation_epoch = 0
+    grounded_epoch = 0
     edit_epoch = 0
     generation_iter = iter(generation_loader)
+    grounded_iter = iter(grounded_loader) if grounded_loader is not None else None
     semantic_epoch = 0
     semantic_iter = iter(semantic_loader)
     edit_iter = iter(edit_loader) if edit_loader else None
@@ -913,6 +997,19 @@ def main() -> None:
                 generation_sampler.set_epoch(generation_epoch)
             generation_iter = iter(generation_loader)
             return next(generation_iter)
+
+    def next_grounded():
+        nonlocal grounded_iter, grounded_epoch
+        if grounded_loader is None or grounded_iter is None:
+            raise RuntimeError("Dedicated grounded loader is unavailable")
+        try:
+            return next(grounded_iter)
+        except StopIteration:
+            grounded_epoch += 1
+            if grounded_sampler is not None:
+                grounded_sampler.set_epoch(grounded_epoch)
+            grounded_iter = iter(grounded_loader)
+            return next(grounded_iter)
 
     def next_edit():
         nonlocal edit_iter, edit_epoch
@@ -976,8 +1073,16 @@ def main() -> None:
                 if functional_rng.random() < student_state_probability
                 else "teacher"
             )
+            use_dedicated_grounded_batch = (
+                grounded_loader is not None
+                and current_step
+                >= max(grounded_start_step, args.functional_start_step)
+                and functional_rng.random() < args.grounded_batch_probability
+            )
             use_edit = (
-                edit_loader is not None and mode_rng.random() < args.edit_probability
+                not use_dedicated_grounded_batch
+                and edit_loader is not None
+                and mode_rng.random() < args.edit_probability
             )
             if use_edit:
                 image_paths, prompts = next_edit()
@@ -992,9 +1097,16 @@ def main() -> None:
                 use_semantic_prompts = False
             else:
                 use_semantic_prompts = (
-                    mode_rng.random() < args.semantic_prompt_probability
+                    not use_dedicated_grounded_batch
+                    and mode_rng.random() < args.semantic_prompt_probability
                 )
-                if use_semantic_prompts:
+                if use_dedicated_grounded_batch:
+                    (
+                        prompts,
+                        generation_image_paths,
+                        generation_source_names,
+                    ) = next_grounded()
+                elif use_semantic_prompts:
                     prompts = list(next_semantic())
                     generation_image_paths = [""] * len(prompts)
                     generation_source_names = ["semantic"] * len(prompts)
@@ -1014,8 +1126,14 @@ def main() -> None:
                 and not use_semantic_prompts
                 and current_step
                 >= max(grounded_start_step, args.functional_start_step)
-                and args.grounded_functional_probability > 0
-                and functional_rng.random() < args.grounded_functional_probability
+                and (
+                    use_dedicated_grounded_batch
+                    or (
+                        args.grounded_functional_probability > 0
+                        and functional_rng.random()
+                        < args.grounded_functional_probability
+                    )
+                )
             )
             if attempt_grounded:
                 grounded_images, grounded_indices = load_grounding_images(
@@ -1024,6 +1142,13 @@ def main() -> None:
                     allowed_sources=grounded_source_names,
                     max_images=args.functional_batch_size,
                 )
+                if use_dedicated_grounded_batch:
+                    expected = min(args.functional_batch_size, len(prompts))
+                    if len(grounded_images) != expected:
+                        raise RuntimeError(
+                            "Dedicated grounded batch lost an image path: "
+                            f"expected={expected}, loaded={len(grounded_images)}."
+                        )
             optimizer.zero_grad(set_to_none=True)
             autocast_enabled = (
                 context.device.type == "cuda" and inference_dtype != torch.float32
@@ -1054,7 +1179,8 @@ def main() -> None:
                     student = bridge(prompts, mode=mode, images=images)
                 teacher_condition = teacher.encode(prompts, mode=mode, images=images)
                 use_content_alignment = (
-                    args.training_version.lower() in {"v5", "v6", "v7", "v8", "shared_v1"}
+                    args.training_version.lower()
+                    in {"v5", "v6", "v7", "v8", "v9", "shared_v1"}
                     and mode == "generate"
                 )
                 use_direct_alignment = (
@@ -1314,6 +1440,7 @@ def main() -> None:
                     "functional_call_index": functional.call_index,
                     "functional_state_source": functional.state_source,
                     "grounded_images": len(grounded_images),
+                    "dedicated_grounded_batch": use_dedicated_grounded_batch,
                     "functional_transition_relative_mse": scalar_mean(
                         functional.transition_relative_mse.detach(),
                         context,
@@ -1343,7 +1470,7 @@ def main() -> None:
                         "func": f"{item['functional_relative_mse']:.4f}",
                         "res": resolution.label,
                     }
-                    if args.training_version.lower() in {"v5", "v6", "v7", "v8", "shared_v1"}:
+                    if args.training_version.lower() in {"v5", "v6", "v7", "v8", "v9", "shared_v1"}:
                         postfix["trans"] = (
                             f"{item['functional_transition_relative_mse']:.4f}"
                         )
@@ -1378,7 +1505,7 @@ def main() -> None:
                             if shared_video_bridge is not None
                             else
                             "MobileOVDreamLiteCompactBridgeV7"
-                            if args.training_version.lower() in {"v7", "v8", "shared_v1"}
+                            if args.training_version.lower() in {"v7", "v8", "v9", "shared_v1"}
                             else "MobileOVDreamLiteCompactBridgeV6"
                             if args.training_version.lower() == "v6"
                             else "MobileOVDreamLiteCompactBridgeV5"
@@ -1414,7 +1541,7 @@ def main() -> None:
                         "functional_teacher": (
                             "frozen DreamLite-mobile UNet, native 4-call schedule, "
                             "mixed generated and real-image-derived same-state response distillation"
-                            if args.training_version.lower() in {"v7", "v8", "shared_v1"}
+                            if args.training_version.lower() in {"v7", "v8", "v9", "shared_v1"}
                             else "frozen DreamLite-mobile UNet, native 4-call schedule, "
                             "mixed teacher/student-prefix same-state prediction and transition distillation"
                             if args.training_version.lower() in {"v5", "v6"}

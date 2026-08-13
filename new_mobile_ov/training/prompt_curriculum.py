@@ -43,6 +43,7 @@ class CaptionManifestDataset(Dataset):
         fallback_column: str,
         image_columns: Sequence[str],
         max_samples: int,
+        require_existing_image: bool = False,
     ) -> None:
         self.path = Path(path).expanduser()
         sep = "\t" if self.path.suffix.lower() == ".tsv" else ","
@@ -87,6 +88,7 @@ class CaptionManifestDataset(Dataset):
         ]
         self.fallback = fallback
         self.image_columns = available_image_columns
+        self.require_existing_image = bool(require_existing_image)
         caption_columns = sorted(
             {name for name, _ in self.variants}
             | ({fallback} if fallback is not None else set())
@@ -113,6 +115,10 @@ class CaptionManifestDataset(Dataset):
             values = self.frame[name].fillna("").astype(str).str.strip().str.lower()
             image_candidates |= values.str.endswith(image_suffixes)
         self.image_candidate_rows = int(image_candidates.sum())
+        if self.require_existing_image and self.image_candidate_rows == 0:
+            raise ValueError(
+                f"{self.path} has no rows with an image path supported for grounded training."
+            )
 
     def _image_path(self, row: pd.Series, columns: Sequence[str]) -> str:
         for column in columns:
@@ -146,7 +152,7 @@ class CaptionManifestDataset(Dataset):
     def __len__(self) -> int:
         return len(self.frame)
 
-    def sample(self, index: int, *, rng: random.Random) -> PromptExample:
+    def _sample_once(self, index: int, *, rng: random.Random) -> PromptExample:
         row = self.frame.iloc[int(index) % len(self.frame)]
         choices = []
         for name, weight in self.variants:
@@ -162,6 +168,24 @@ class CaptionManifestDataset(Dataset):
         )[0]
         image_path = self._image_path(row, self.image_columns)
         return PromptExample(prompt, image_path, self.source_name)
+
+    def sample(self, index: int, *, rng: random.Random) -> PromptExample:
+        example = self._sample_once(index, rng=rng)
+        if not self.require_existing_image:
+            return example
+        if example.image_path and Path(example.image_path).is_file():
+            return example
+
+        # A manifest may contain stale paths. Retry deterministically so a
+        # grounded batch never silently falls back to ungrounded supervision.
+        attempts = min(max(len(self.frame), 1), 128)
+        for offset in range(1, attempts + 1):
+            candidate = self._sample_once(int(index) + offset, rng=rng)
+            if candidate.image_path and Path(candidate.image_path).is_file():
+                return candidate
+        raise FileNotFoundError(
+            f"Could not find a readable image after {attempts} rows in {self.path}."
+        )
 
     def __getitem__(self, index: int) -> PromptExample:
         rng = random.Random(int(index))
