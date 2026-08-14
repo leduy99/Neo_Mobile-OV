@@ -131,7 +131,13 @@ variant_setting() {
       IMAGE_HF_FILE="dreamlite_compact_v8_mix/17245433/dreamlite_image_bridge_latest.pt"
       IMAGE_STEP=160000
       ;;
-    *) echo "Unknown variant=${1}; expected v7,v8_imageonly,v8_mix" >&2; exit 2 ;;
+    v9_grounded)
+      IMAGE_CONFIG="configs/mobile_ov_dreamlite_compact_v9.yaml"
+      IMAGE_CKPT="checkpoints/hf_mobile_ov/dreamlite_compact_v9_grounded_from_scratch/17275939/dreamlite_image_bridge_latest.pt"
+      IMAGE_HF_FILE="dreamlite_compact_v9_grounded_from_scratch/17275939/dreamlite_image_bridge_latest.pt"
+      IMAGE_STEP=160000
+      ;;
+    *) echo "Unknown variant=${1}; expected v7,v8_imageonly,v8_mix,v9_grounded" >&2; exit 2 ;;
   esac
   download_checkpoint "${IMAGE_CKPT}" "${IMAGE_HF_FILE}" "${IMAGE_STEP}"
 }
