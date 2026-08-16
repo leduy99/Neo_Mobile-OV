@@ -395,6 +395,32 @@ def content_aware_representation_total(
     )
 
 
+CONTENT_AWARE_LEGACY_VERSIONS = frozenset(
+    {"v5", "v6", "v7", "v8", "v9", "v10", "shared_v1"}
+)
+
+
+def resolve_representation_objective(args: argparse.Namespace) -> str:
+    """Keep historical launchers working while making new objectives explicit."""
+
+    if args.representation_objective != "auto":
+        return args.representation_objective
+    if args.training_version.lower() in CONTENT_AWARE_LEGACY_VERSIONS:
+        return "content_aware"
+    if args.representation_mode == "direct":
+        return "direct"
+    return "interpolated"
+
+
+def validate_representation_objective(args: argparse.Namespace) -> str:
+    objective = resolve_representation_objective(args)
+    if args.global_contrastive and objective != "content_aware":
+        raise ValueError(
+            "--global-contrastive requires --representation-objective content_aware."
+        )
+    return objective
+
+
 def choose_resolution_bucket(
     buckets: list[DreamLiteResolutionBucket],
     *,
@@ -521,6 +547,15 @@ def parse_args() -> argparse.Namespace:
         choices=("interpolated", "direct"),
         default="interpolated",
     )
+    parser.add_argument(
+        "--representation-objective",
+        choices=("auto", "interpolated", "direct", "content_aware"),
+        default="auto",
+        help=(
+            "Representation-loss family. New experiments should set this explicitly; "
+            "auto preserves historical version-based behavior."
+        ),
+    )
     parser.add_argument("--token-mean-weight", type=float, default=0.0)
     parser.add_argument("--token-std-weight", type=float, default=0.0)
     parser.add_argument("--projected-weight", type=float, default=0.0)
@@ -591,6 +626,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    args.resolved_representation_objective = validate_representation_objective(args)
     context = setup_distributed()
     torch.manual_seed(args.seed + context.rank)
     random.seed(args.seed + context.rank)
@@ -945,7 +981,8 @@ def main() -> None:
         f"trainable_params={trainable_count:,} generation_rows={len(generation_data)} "
         f"semantic_rows={len(semantic_data)} semantic_probability={args.semantic_prompt_probability:g} "
         f"edit_rows={len(edit_loader.dataset) if edit_loader else 0} target_step={args.target_step} "
-        f"shared_smolvlm2={bool(shared_video_bridge)}",
+        f"shared_smolvlm2={bool(shared_video_bridge)} "
+        f"representation_objective={args.resolved_representation_objective}",
     )
     rank0_print(
         context,
@@ -1183,12 +1220,12 @@ def main() -> None:
                     student = bridge(prompts, mode=mode, images=images)
                 teacher_condition = teacher.encode(prompts, mode=mode, images=images)
                 use_content_alignment = (
-                    args.training_version.lower()
-                    in {"v5", "v6", "v7", "v8", "v9", "shared_v1"}
+                    args.resolved_representation_objective == "content_aware"
                     and mode == "generate"
                 )
                 use_direct_alignment = (
-                    args.representation_mode == "direct" and mode == "generate"
+                    args.resolved_representation_objective == "direct"
+                    and mode == "generate"
                 )
                 if use_content_alignment:
                     repr_losses = dreamlite_content_aware_representation_losses(
@@ -1355,6 +1392,7 @@ def main() -> None:
                     "mode": mode,
                     "prompt_source": prompt_source if mode == "generate" else "edit",
                     "phase": phase,
+                    "representation_objective": args.resolved_representation_objective,
                     "resolution_bucket": resolution.label,
                     "actual_width": resolution.width,
                     "actual_height": resolution.height,
@@ -1474,7 +1512,7 @@ def main() -> None:
                         "func": f"{item['functional_relative_mse']:.4f}",
                         "res": resolution.label,
                     }
-                    if args.training_version.lower() in {"v5", "v6", "v7", "v8", "v9", "shared_v1"}:
+                    if args.resolved_representation_objective == "content_aware":
                         postfix["trans"] = (
                             f"{item['functional_transition_relative_mse']:.4f}"
                         )
@@ -1508,8 +1546,11 @@ def main() -> None:
                             "MobileOVDreamLiteSharedSmolVLM2ImageBridgeV1"
                             if shared_video_bridge is not None
                             else
-                            "MobileOVDreamLiteCompactBridgeV7"
-                            if args.training_version.lower() in {"v7", "v8", "v9", "shared_v1"}
+                            "MobileOVDreamLiteCompactBridgeV11"
+                            if args.training_version.lower().startswith("v11")
+                            else "MobileOVDreamLiteCompactBridgeV7"
+                            if args.training_version.lower()
+                            in {"v7", "v8", "v9", "v10", "shared_v1"}
                             else "MobileOVDreamLiteCompactBridgeV6"
                             if args.training_version.lower() == "v6"
                             else "MobileOVDreamLiteCompactBridgeV5"
@@ -1545,7 +1586,9 @@ def main() -> None:
                         "functional_teacher": (
                             "frozen DreamLite-mobile UNet, native 4-call schedule, "
                             "mixed generated and real-image-derived same-state response distillation"
-                            if args.training_version.lower() in {"v7", "v8", "v9", "shared_v1"}
+                            if args.training_version.lower().startswith("v11")
+                            or args.training_version.lower()
+                            in {"v7", "v8", "v9", "v10", "shared_v1"}
                             else "frozen DreamLite-mobile UNet, native 4-call schedule, "
                             "mixed teacher/student-prefix same-state prediction and transition distillation"
                             if args.training_version.lower() in {"v5", "v6"}
