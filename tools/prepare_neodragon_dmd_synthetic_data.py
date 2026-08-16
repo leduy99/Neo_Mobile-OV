@@ -159,6 +159,98 @@ def valid_latent(path: Path) -> bool:
         return False
 
 
+def available_latent(path: Path) -> bool:
+    """Fast resume check for atomically written teacher trajectories."""
+
+    return path.is_file() and path.stat().st_size >= 1024
+
+
+def infer_prompt_modifier(output_dir: Path, prompts: list[str]) -> str:
+    """Recover the exact teacher suffix from one saved trajectory."""
+
+    for index, prompt in enumerate(prompts):
+        path = latent_path(output_dir, index)
+        if not available_latent(path):
+            continue
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+            condition_prompt = normalize_text(
+                payload.get("condition_prompt", "") if isinstance(payload, dict) else ""
+            )
+        except Exception:
+            continue
+        if condition_prompt.startswith(prompt):
+            return condition_prompt[len(prompt) :]
+        raise RuntimeError(
+            f"Saved DMD condition does not match source prompt at index={index}: {path}"
+        )
+    raise RuntimeError("Could not recover a condition prompt from any saved DMD trajectory.")
+
+
+def write_manifest(
+    *,
+    output_dir: Path,
+    prompts: list[str],
+    prompt_source: Path,
+    args: argparse.Namespace,
+    native_model_path: str | None,
+    finalize_only: bool,
+) -> int:
+    """Index completed samples without requiring the remaining trajectories."""
+
+    prompt_modifier = infer_prompt_modifier(output_dir, prompts)
+    manifest = output_dir / args.manifest_name
+    temporary_manifest = manifest.with_name(f".{manifest.name}.tmp")
+    is_ready = available_latent if finalize_only else valid_latent
+    ready = 0
+    with temporary_manifest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=("index", "latent_path", "prompt", "condition_prompt"),
+        )
+        writer.writeheader()
+        for index, prompt in enumerate(prompts):
+            path = latent_path(output_dir, index)
+            if is_ready(path):
+                writer.writerow(
+                    {
+                        "index": index,
+                        "latent_path": str(path.relative_to(output_dir)),
+                        "prompt": prompt,
+                        "condition_prompt": prompt + prompt_modifier,
+                    }
+                )
+                ready += 1
+    temporary_manifest.replace(manifest)
+
+    metadata = {
+        "objective": "neodragon_pyramidal_dmd_synthetic_teacher_data",
+        "dataset_status": "complete" if ready == len(prompts) else "partial",
+        "finalized_from_existing_trajectories": bool(finalize_only),
+        "integrity_check": (
+            "atomic_file_size_and_one_condition_payload"
+            if finalize_only
+            else "full_torch_load_validation"
+        ),
+        "prompt_source": str(prompt_source),
+        "prompt_count_requested": len(prompts),
+        "prompt_count_ready": ready,
+        "teacher": "released_neodragon_multistep_20_10_cfg",
+        "native_model_path": native_model_path,
+        "height": args.height,
+        "width": args.width,
+        "num_frames": args.num_frames,
+        "first_unit_steps": args.first_unit_steps,
+        "video_unit_steps": args.video_unit_steps,
+        "seed": args.seed,
+    }
+    metadata_path = output_dir / args.metadata_name
+    temporary_metadata = metadata_path.with_name(f".{metadata_path.name}.tmp")
+    temporary_metadata.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    temporary_metadata.replace(metadata_path)
+    return ready
+
+
 def atomic_save(payload: dict[str, object], destination: Path) -> None:
     temporary = destination.with_name(f".{destination.name}.tmp")
     torch.save(payload, temporary)
@@ -180,6 +272,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260812)
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--manifest-name",
+        default="manifest.csv",
+        help="Manifest filename inside --output-dir (use a distinct name for a partial set).",
+    )
+    parser.add_argument(
+        "--metadata-name",
+        default="metadata.json",
+        help="Metadata filename inside --output-dir.",
+    )
+    parser.add_argument(
+        "--finalize-only",
+        action="store_true",
+        help=(
+            "Write a partial manifest from existing atomically saved trajectories "
+            "without loading the teacher or generating missing samples."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -197,6 +307,22 @@ def main() -> None:
             max_prompts=args.max_prompts,
             seed=args.seed,
         )
+        if args.finalize_only:
+            if ctx.is_main:
+                ready = write_manifest(
+                    output_dir=output_dir,
+                    prompts=prompts,
+                    prompt_source=prompt_source,
+                    args=args,
+                    native_model_path=None,
+                    finalize_only=True,
+                )
+                rank0_print(
+                    ctx,
+                    f"Wrote partial DMD manifest with {ready}/{len(prompts)} existing teacher samples.",
+                )
+            barrier()
+            return
         rank_indices = list(range(ctx.rank, len(prompts), ctx.world_size))
         teacher = load_teacher(cfg, device=ctx.device, dtype=dtype_from_name(args.dtype))
         rank0_print(
@@ -262,42 +388,19 @@ def main() -> None:
 
         barrier()
         if ctx.is_main:
-            manifest = output_dir / "manifest.csv"
-            with manifest.open("w", encoding="utf-8", newline="") as handle:
-                writer = csv.DictWriter(
-                    handle,
-                    fieldnames=("index", "latent_path", "prompt", "condition_prompt"),
-                )
-                writer.writeheader()
-                ready = 0
-                for index, prompt in enumerate(prompts):
-                    path = latent_path(output_dir, index)
-                    if valid_latent(path):
-                        writer.writerow(
-                            {
-                                "index": index,
-                                "latent_path": str(path.relative_to(output_dir)),
-                                "prompt": prompt,
-                                "condition_prompt": prompt + str(teacher["prompt_modifier"]),
-                            }
-                        )
-                        ready += 1
-            metadata = {
-                "objective": "neodragon_pyramidal_dmd_synthetic_teacher_data",
-                "prompt_source": str(prompt_source),
-                "prompt_count_requested": len(prompts),
-                "prompt_count_ready": ready,
-                "teacher": "released_neodragon_multistep_20_10_cfg",
-                "native_model_path": teacher["model_path"],
-                "height": args.height,
-                "width": args.width,
-                "num_frames": args.num_frames,
-                "first_unit_steps": args.first_unit_steps,
-                "video_unit_steps": args.video_unit_steps,
-                "seed": args.seed,
-            }
-            (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-            rank0_print(ctx, f"Wrote {ready}/{len(prompts)} valid synthetic teacher samples to {manifest}")
+            ready = write_manifest(
+                output_dir=output_dir,
+                prompts=prompts,
+                prompt_source=prompt_source,
+                args=args,
+                native_model_path=str(teacher["model_path"]),
+                finalize_only=False,
+            )
+            rank0_print(
+                ctx,
+                f"Wrote {ready}/{len(prompts)} valid synthetic teacher samples to "
+                f"{output_dir / args.manifest_name}",
+            )
         barrier()
     finally:
         cleanup_distributed()
