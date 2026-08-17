@@ -117,3 +117,23 @@ def test_original_exp1_functional_policy_remains_random_and_skips_unit_zero() ->
     )
 
     assert functional_unit_for_step(cfg, args, step=1) is None
+
+
+def test_monolithic_submit_keeps_fp32_weights_with_fsdp() -> None:
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "train_neodragon_monolithic_text_bridge_1node8gpu.sbatch"
+    ).read_text(encoding="utf-8")
+
+    assert "--parallel fsdp" in script
+    assert "--trainable-fp32" in script
+
+
+def test_single_rank_fsdp_is_not_downgraded_to_no_parallel() -> None:
+    trainer = Path(__file__).resolve().parents[1] / "tools" / "train_neodragon_text_bridge.py"
+    source = trainer.read_text(encoding="utf-8")
+
+    assert 'if args.parallel == "ddp" and not ctx.is_distributed:' in source
+    assert 'elif args.parallel == "fsdp" and not ctx.is_distributed:' in source
+    assert "using NO_SHARD for a faithful FSDP smoke test" in source

@@ -7,6 +7,7 @@ import math
 import os
 import random
 import sys
+import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -424,13 +425,29 @@ def wrap_bridge(
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp import ShardingStrategy
 
-        strategy = ShardingStrategy.FULL_SHARD if torch.distributed.get_world_size() > 1 else ShardingStrategy.NO_SHARD
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        strategy = ShardingStrategy.FULL_SHARD if world_size > 1 else ShardingStrategy.NO_SHARD
+        # The bridge owns frozen SmolVLM2 BF16 weights and FP32 trainable MCP
+        # heads. FSDP cannot flatten mixed dtypes into one FlatParameter. Keep
+        # frozen weights outside the sharded parameter set; they have no
+        # gradients and remain inexpensive to replicate on the target GPUs.
+        parameter_dtypes = {parameter.dtype for parameter in bridge.parameters()}
+        ignored_states = None
+        if len(parameter_dtypes) > 1:
+            ignored_states = [parameter for parameter in bridge.parameters() if not parameter.requires_grad]
+            trainable_dtypes = {parameter.dtype for parameter in bridge.parameters() if parameter.requires_grad}
+            if not ignored_states or len(trainable_dtypes) != 1:
+                raise RuntimeError(
+                    "Mixed bridge parameter dtypes require all frozen parameters to be ignored "
+                    f"and all trainable parameters to share one dtype; got trainable={trainable_dtypes}."
+                )
         return FSDP(
             bridge,
             device_id=device,
             use_orig_params=True,
             sharding_strategy=strategy,
             sync_module_states=True,
+            ignored_states=ignored_states,
         )
     if parallel == "deepspeed":
         return bridge
@@ -774,9 +791,26 @@ def main() -> None:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("FSDP_USE_ORIG_PARAMS", "true")
     ctx = setup_distributed()
-    if args.parallel in {"ddp", "fsdp"} and not ctx.is_distributed:
-        rank0_print(ctx, f"Warning: --parallel={args.parallel} requested with WORLD_SIZE=1; falling back to --parallel=none.")
+    if args.parallel == "ddp" and not ctx.is_distributed:
+        rank0_print(ctx, "Warning: --parallel=ddp requested with WORLD_SIZE=1; falling back to --parallel=none.")
         args.parallel = "none"
+    elif args.parallel == "fsdp" and not ctx.is_distributed:
+        # FSDP supports a single-rank NO_SHARD configuration. Keep it active so
+        # one-GPU smoke tests exercise the same mixed-dtype grouping used by the
+        # multi-GPU training job.
+        rank0_print(ctx, "FSDP requested with WORLD_SIZE=1; using NO_SHARD for a faithful FSDP smoke test.")
+        if not dist.is_initialized():
+            # setup_distributed deliberately skips world-size-one process groups,
+            # but FSDP still requires one. A local FileStore avoids depending on
+            # torchrun's MASTER_ADDR/MASTER_PORT environment for the smoke path.
+            store_path = Path(tempfile.gettempdir()) / f"mobile_ov_fsdp_{os.getpid()}"
+            store_path.unlink(missing_ok=True)
+            dist.init_process_group(
+                backend="nccl" if ctx.device.type == "cuda" else "gloo",
+                init_method=f"file://{store_path}",
+                rank=0,
+                world_size=1,
+            )
 
     cfg = load_config(args.config)
     if args.dtype:

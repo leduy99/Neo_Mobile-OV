@@ -8,6 +8,7 @@ PYTHON_BIN="${PYTHON_BIN:-/share_4/users/duy/.conda/envs/neo_mobileov/bin/python
 RUN_NAME="${RUN_NAME:-monolithic_bridge_smoke7_local}"
 OUT="${OUT:-output/neo_monolithic_text_bridge/${RUN_NAME}}"
 PROMPTS="${PROMPTS:-configs/prompts/neodragon_monolithic_bridge_smoke.txt}"
+PARALLEL="${PARALLEL:-fsdp}"
 
 test -n "${SLURM_JOB_ID:-}${SLURM_STEP_ID:-}" || {
   echo "Run this CUDA smoke through srun or sbatch." >&2
@@ -28,7 +29,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
   --steps 7 \
   --batch-size 1 \
   --lr 5e-5 \
-  --parallel none \
+  --parallel "${PARALLEL}" \
   --target-stack multistep \
   --raw-token-weight 0.25 \
   --normalized-token-weight 1.0 \
