@@ -75,6 +75,28 @@ def set_requires_grad(module: torch.nn.Module, enabled: bool) -> None:
         parameter.requires_grad_(enabled)
 
 
+def select_native_unit_stage(
+    step: int,
+    *,
+    include_first_unit: bool,
+    num_stages: int = 3,
+) -> tuple[int, int]:
+    """Cycle one shared native ``unit x stage`` position across DDP ranks.
+
+    Synthetic trajectories contain the complete native seven-unit T2V video.
+    The paper's step-distilled settings likewise generate all seven units with
+    the same schedule, so the default includes unit zero.  ``False`` remains
+    available only for reproducing the old external-anchor-only ablation.
+    """
+
+    if step < 1 or num_stages < 1:
+        raise ValueError("step and num_stages must be positive")
+    units = 7 if include_first_unit else 6
+    position = (int(step) - 1) % (units * int(num_stages))
+    relative_unit, stage = divmod(position, int(num_stages))
+    return (relative_unit if include_first_unit else relative_unit + 1), stage
+
+
 class SyntheticTeacherLatentDataset(Dataset):
     """Random-access synthetic teacher samples written by the preparation job."""
 
@@ -219,14 +241,27 @@ def save_checkpoint(
             "model_type": "neodragon_multistep_dit_distilled_to_conditional_one_step",
             "teacher_dit_id": models["dit_id"],
             "context_adapter_id": models["context_adapter_id"],
-            "schedule": "hybrid_1-1-1_video_units_only",
+            "schedule": (
+                "pyramidal_1-1-1_all_native_units"
+                if args.include_first_unit
+                else "hybrid_1-1-1_video_units_only"
+            ),
             "objective": {
-                "name": "pyramidal_dmd_reproduction_v1",
+                "name": (
+                    "pyramidal_dmd_reproduction_v2_all_native_units"
+                    if args.include_first_unit
+                    else "pyramidal_dmd_reproduction_v1_legacy_video_units_only"
+                ),
                 "teacher": "released_neodragon_multistep_cfg",
                 "student_init": "released_neodragon_multistep",
                 "fake_init": "released_neodragon_multistep",
                 "student_fake_update_ratio": f"1:{args.fake_updates}",
                 "student_probe_sigmas": list(student_probe_sigmas()),
+                "native_unit_indices": list(range(7)) if args.include_first_unit else list(range(1, 7)),
+                "teacher_guidance": {
+                    "first_unit": args.teacher_first_guidance,
+                    "video_units": args.teacher_video_guidance,
+                },
                 "dmd_weight": args.dmd_weight,
                 "cauchy_weight": args.cauchy_weight,
             },
@@ -256,10 +291,22 @@ def load_resume(
     fake: torch.nn.Module,
     student_optimizer: torch.optim.Optimizer,
     fake_optimizer: torch.optim.Optimizer,
+    include_first_unit: bool,
 ) -> tuple[int, list[dict[str, object]]]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if "student" not in payload or "fake" not in payload:
         raise ValueError(f"{path} is not a resumable Pyramidal-DMD checkpoint")
+    expected_schedule = (
+        "pyramidal_1-1-1_all_native_units"
+        if include_first_unit
+        else "hybrid_1-1-1_video_units_only"
+    )
+    actual_schedule = payload.get("schedule")
+    if actual_schedule != expected_schedule:
+        raise ValueError(
+            "Refusing to resume a checkpoint with a different unit protocol: "
+            f"checkpoint={actual_schedule!r}, requested={expected_schedule!r}."
+        )
     unwrap(student).load_state_dict(payload["student"], strict=True)
     unwrap(fake).load_state_dict(payload["fake"], strict=True)
     if "student_optimizer" in payload and "fake_optimizer" in payload:
@@ -284,6 +331,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dmd-weight", type=float, default=1.0)
     parser.add_argument("--cauchy-weight", type=float, default=0.5)
     parser.add_argument("--max-dmd-weight", type=float, default=100.0)
+    parser.add_argument(
+        "--include-first-unit",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Distil all seven native T2V units.  This is the paper-aligned "
+            "default for synthetic [7,C,H,W] teacher trajectories."
+        ),
+    )
+    parser.add_argument("--teacher-first-guidance", type=float, default=7.0)
     parser.add_argument("--teacher-video-guidance", type=float, default=5.0)
     parser.add_argument("--clip-grad-norm", type=float, default=1.0)
     parser.add_argument("--save-every", type=int, default=500)
@@ -358,6 +415,7 @@ def main() -> None:
                     fake=fake,
                     student_optimizer=student_optimizer,
                     fake_optimizer=fake_optimizer,
+                    include_first_unit=args.include_first_unit,
                 )
                 rank0_print(ctx, f"Resumed Pyramidal-DMD at step={start_step} from {requested}")
 
@@ -368,7 +426,8 @@ def main() -> None:
             f"world_size={ctx.world_size} batch_per_gpu={args.batch_size} "
             f"global_batch={ctx.world_size * args.batch_size} synthetic_rows={len(dataset)} "
             f"steps={start_step}->{args.steps} student_params={parameters:,} "
-            f"student:fake=1:{args.fake_updates} dtype={dtype}",
+            f"student:fake=1:{args.fake_updates} units="
+            f"{'0-6' if args.include_first_unit else '1-6'} dtype={dtype}",
         )
 
         scheduler = models["scheduler"]
@@ -386,12 +445,16 @@ def main() -> None:
             if clean_video.shape[2] != 7:
                 raise RuntimeError(f"Expected [B,C,7,H,W] teacher latents, got {tuple(clean_video.shape)}")
 
-            # Cycle all 18 deployed video calls identically on every DDP rank.
-            position = (step - 1) % (6 * 3)
-            unit, stage = divmod(position, 3)
+            # Every rank takes the same native position.  Unit zero is a real
+            # T2V training target here because our synthetic data was created
+            # with image=None, not an external first-frame anchor.
+            unit, stage = select_native_unit_stage(
+                step,
+                include_first_unit=args.include_first_unit,
+            )
             video_pyramid = pyramid_latents(clean_video, num_stages=3)
-            clean_endpoint = video_pyramid[stage][:, :, unit + 1 : unit + 2]
-            history_frames = [clean_video[:, :, index : index + 1] for index in range(unit + 1)]
+            clean_endpoint = video_pyramid[stage][:, :, unit : unit + 1]
+            history_frames = [clean_video[:, :, index : index + 1] for index in range(unit)]
             past_conditions = tuple(
                 prepare_past_conditions(history_frames, num_stages=3)[stage]
             )
@@ -399,10 +462,11 @@ def main() -> None:
             pair = build_stage_pair(clean=clean_endpoint, scheduler=scheduler, stage=stage, noise=noise)
             start_timestep = stage_timestep(scheduler, stage=stage, local_sigma=1.0, device=ctx.device)
 
-            # The synthetic latent's first unit is the fixed image anchor. All
-            # six DMD targets are therefore native *video* units, not the
-            # monolithic first-image unit that uses CFG=7.
-            teacher_guidance = args.teacher_video_guidance
+            # Match the released teacher's first/video CFG convention.  The
+            # student and fake remain conditional-only, as in Pyramidal DMD.
+            teacher_guidance = (
+                args.teacher_first_guidance if unit == 0 else args.teacher_video_guidance
+            )
             with torch.no_grad():
                 teacher_condition = native_condition(
                     text_bundle=models["text"],
@@ -478,7 +542,13 @@ def main() -> None:
                 timestep=start_timestep,
             )
             student_endpoint = pair.start - student_prediction
-            tau = student_probe_sigmas()[((step - 1) // (6 * 3)) % len(student_probe_sigmas())]
+            # Rotate the four fixed student probes after a complete shared
+            # unit/stage pass.  The corrected native-T2V protocol has 7 x 3
+            # positions; the legacy external-anchor ablation has 6 x 3.
+            positions_per_pass = (7 if args.include_first_unit else 6) * 3
+            tau = student_probe_sigmas()[
+                ((step - 1) // positions_per_pass) % len(student_probe_sigmas())
+            ]
             probe_noise = torch.randn_like(student_endpoint)
             probe, probe_start, probe_end = stage_noisy_student_endpoint(
                 endpoint=student_endpoint,

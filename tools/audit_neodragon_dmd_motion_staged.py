@@ -69,7 +69,10 @@ def native_paths(cfg) -> tuple[Path, str]:
 
 def checkpoint_info(path: Path) -> tuple[dict[str, object], dict[str, torch.Tensor] | None]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if payload.get("schedule") != "hybrid_1-1-1_video_units_only":
+    if payload.get("schedule") not in {
+        "hybrid_1-1-1_video_units_only",
+        "pyramidal_1-1-1_all_native_units",
+    }:
         raise ValueError(f"Not a Pyramidal-DMD student checkpoint: {path}")
     info = {
         "step": int(payload.get("step", -1)),

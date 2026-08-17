@@ -453,7 +453,10 @@ def load_models(
     from neodragon.utils.generation_utils import DEFAULT_NEGATIVE_PROMPT, DEFAULT_PROMPT_MODIFIER
 
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    if payload.get("schedule") != "hybrid_1-1-1_video_units_only":
+    if payload.get("schedule") not in {
+        "hybrid_1-1-1_video_units_only",
+        "pyramidal_1-1-1_all_native_units",
+    }:
         raise ValueError(f"Not a Pyramidal-DMD checkpoint: {checkpoint}")
     checkpoint_step = int(payload.get("step", -1))
     adapter_id = str(payload.get("context_adapter_id", MULTISTEP_CONTEXT_ADAPTER_ID))

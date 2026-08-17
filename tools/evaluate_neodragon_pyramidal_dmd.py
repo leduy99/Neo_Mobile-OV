@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 # ruff: noqa: E402
-"""Run a trained Pyramidal-DMD student over six controlled one-step video units.
+"""Evaluate a Pyramidal-DMD student on synthetic native teacher trajectories.
 
-This evaluator intentionally keeps the first latent unit from the synthetic
-monolithic sample fixed.  It therefore measures the DMD DiT only, without
-mixing in a separate first-frame generator such as SSD1B or DreamLite.
+All-native-unit DMD-v2 checkpoints generate units zero through six.  The
+legacy checkpoint format generates only units one through six after a fixed
+first unit so its historical diagnostic remains reproducible.
 """
 
 from __future__ import annotations
@@ -49,7 +49,10 @@ def load_models(cfg, checkpoint: Path, device: torch.device, dtype: torch.dtype)
     from neodragon.text_encoder_bundle import TextEncoderBundle
 
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    if payload.get("schedule") != "hybrid_1-1-1_video_units_only":
+    if payload.get("schedule") not in {
+        "hybrid_1-1-1_video_units_only",
+        "pyramidal_1-1-1_all_native_units",
+    }:
         raise ValueError(f"Not a Pyramidal-DMD student checkpoint: {checkpoint}")
     adapter_id = str(payload["context_adapter_id"])
     dit_id = str(payload["teacher_dit_id"])
@@ -100,16 +103,18 @@ def main() -> None:
         cfg, Path(args.checkpoint), device, dtype
     )
     prompt = str(row["condition_prompt"])
+    all_native_units = payload["schedule"] == "pyramidal_1-1-1_all_native_units"
     with torch.no_grad():
         tokens, mask, pooled = text([prompt], device)
         condition = DMDCondition(tokens=adapter(tokens), mask=mask, pooled=pooled)
         generator = torch.Generator(device=device).manual_seed(args.seed + args.index)
         full_noise = torch.randn(target.shape, device=device, dtype=dtype, generator=generator)
         low_noise = downsample_noise_2x(full_noise, 2)
-        generated = [target[:, :, :1]]
-        for unit in range(6):
+        generated: list[torch.Tensor] = [] if all_native_units else [target[:, :, :1]]
+        start_unit = 0 if all_native_units else 1
+        for unit in range(start_unit, 7):
             histories = prepare_past_conditions(generated, num_stages=3)
-            current = low_noise[:, :, unit + 1 : unit + 2]
+            current = low_noise[:, :, unit : unit + 1]
             for stage in range(3):
                 if stage > 0:
                     current = upsample_pyramidal_latent(
@@ -136,10 +141,20 @@ def main() -> None:
         "checkpoint": str(args.checkpoint),
         "checkpoint_step": int(payload["step"]),
         "sample_index": args.index,
-        "student_video_mse": float(torch.nn.functional.mse_loss(prediction[:, :, 1:].float(), target[:, :, 1:].float()).cpu()),
-        "anchor_mse": float(torch.nn.functional.mse_loss(prediction[:, :, :1].float(), target[:, :, :1].float()).cpu()),
+        "student_target_mse": float(
+            torch.nn.functional.mse_loss(
+                prediction[:, :, start_unit:].float(), target[:, :, start_unit:].float()
+            ).cpu()
+        ),
+        "unit_zero_mse": float(
+            torch.nn.functional.mse_loss(prediction[:, :, :1].float(), target[:, :, :1].float()).cpu()
+        ),
         "shape": list(prediction.shape),
-        "schedule": "six units x three stages x one conditional DiT call",
+        "schedule": (
+            "seven native units x three stages x one conditional DiT call"
+            if all_native_units
+            else "legacy fixed unit zero + six units x three stages x one conditional DiT call"
+        ),
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(metrics, indent=2))
