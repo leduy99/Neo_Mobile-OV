@@ -1,9 +1,11 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
 from tools.train_neodragon_text_bridge import (
     PromptDataset,
+    functional_unit_for_step,
     learning_rate_scale,
     newest_text_checkpoint,
     promote_trainable_parameters_to_fp32,
@@ -89,3 +91,29 @@ def test_exp1_200k_script_uses_single_call_trainer_not_rollout() -> None:
     assert "--functional-every 1" in script
     assert "--trainable-fp32" in script
     assert "--no-save-latest" in script
+
+
+def test_monolithic_functional_cycle_covers_all_native_units() -> None:
+    cfg = SimpleNamespace(data=SimpleNamespace(frame_num=49))
+    args = SimpleNamespace(
+        functional_unit_policy="cycle",
+        functional_include_first_unit=True,
+        functional_start_step=1,
+        functional_every=1,
+    )
+
+    sampled = [functional_unit_for_step(cfg, args, step) for step in range(1, 15)]
+
+    assert sampled == [0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6]
+
+
+def test_original_exp1_functional_policy_remains_random_and_skips_unit_zero() -> None:
+    cfg = SimpleNamespace(data=SimpleNamespace(frame_num=49))
+    args = SimpleNamespace(
+        functional_unit_policy="random",
+        functional_include_first_unit=False,
+        functional_start_step=1,
+        functional_every=1,
+    )
+
+    assert functional_unit_for_step(cfg, args, step=1) is None

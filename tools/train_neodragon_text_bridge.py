@@ -215,7 +215,41 @@ def newest_text_checkpoint(output_dir: Path) -> Path | None:
     return None if best is None else best[1]
 
 
-def load_neodragon_text_modules(cfg, device: torch.device, dtype: torch.dtype):
+def resolve_neodragon_stack(target_stack: str) -> dict[str, str]:
+    """Resolve a released NeoDragon condition/DiT pair without changing Exp1 defaults."""
+
+    from neodragon import (
+        CONTEXT_ADAPTER_ID,
+        DIT_ID,
+        MULTISTEP_CONTEXT_ADAPTER_ID,
+        MULTISTEP_DIT_ID,
+    )
+
+    stacks = {
+        "hybrid": {
+            "name": "hybrid",
+            "context_adapter_id": CONTEXT_ADAPTER_ID,
+            "dit_id": DIT_ID,
+        },
+        "multistep": {
+            "name": "multistep",
+            "context_adapter_id": MULTISTEP_CONTEXT_ADAPTER_ID,
+            "dit_id": MULTISTEP_DIT_ID,
+        },
+    }
+    try:
+        return stacks[target_stack]
+    except KeyError as error:
+        raise ValueError(f"Unsupported NeoDragon target stack: {target_stack!r}") from error
+
+
+def load_neodragon_text_modules(
+    cfg,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    target_stack: str = "hybrid",
+):
     repo_path, _, local_model_path = ensure_neodragon_assets(
         repo_path=cfg.backend.extra.get("repo_path"),
         cache_dir=cfg.backend.extra.get("cache_dir"),
@@ -226,14 +260,14 @@ def load_neodragon_text_modules(cfg, device: torch.device, dtype: torch.dtype):
     if str(repo_path) not in sys.path:
         sys.path.insert(0, str(repo_path))
 
-    from neodragon import CONTEXT_ADAPTER_ID
     from neodragon.context_adapter import ContextAdapter
     from neodragon.text_encoder_bundle import TextEncoderBundle
     from neodragon.utils.generation_utils import DEFAULT_PROMPT_MODIFIER
 
+    stack = resolve_neodragon_stack(target_stack)
     text_bundle = TextEncoderBundle.from_pretrained(local_model_path, torch_dtype=dtype).to(device).eval()
     context_adapter = ContextAdapter.from_pretrained(
-        f"{local_model_path}/{CONTEXT_ADAPTER_ID}",
+        f"{local_model_path}/{stack['context_adapter_id']}",
         torch_dtype=dtype,
     ).to(device).eval()
     for module in [text_bundle, context_adapter]:
@@ -262,7 +296,13 @@ def cycle_loader(
         skip_batches = 0
 
 
-def load_neodragon_functional_modules(cfg, device: torch.device, dtype: torch.dtype):
+def load_neodragon_functional_modules(
+    cfg,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    target_stack: str = "hybrid",
+):
     repo_path, _, local_model_path = ensure_neodragon_assets(
         repo_path=cfg.backend.extra.get("repo_path"),
         cache_dir=cfg.backend.extra.get("cache_dir"),
@@ -273,11 +313,13 @@ def load_neodragon_functional_modules(cfg, device: torch.device, dtype: torch.dt
     if str(repo_path) not in sys.path:
         sys.path.insert(0, str(repo_path))
 
-    from neodragon import DIT_ID
     from neodragon.pyramid_mmdit import PyramidMMDiT
     from neodragon.pyramid_scheduler import PyramidFlowMatchEulerDiscreteScheduler
 
-    dit = PyramidMMDiT.from_pretrained(f"{local_model_path}/{DIT_ID}", torch_dtype=dtype).to(device).eval()
+    stack = resolve_neodragon_stack(target_stack)
+    dit = PyramidMMDiT.from_pretrained(
+        f"{local_model_path}/{stack['dit_id']}", torch_dtype=dtype
+    ).to(device).eval()
     for param in dit.parameters():
         param.requires_grad_(False)
     return dit, PyramidFlowMatchEulerDiscreteScheduler()
@@ -291,6 +333,8 @@ def sample_functional_input(
     dtype: torch.dtype,
     *,
     generator: torch.Generator | None = None,
+    include_first_unit: bool = False,
+    unit_index: int | None = None,
 ):
     from neodragon.utils.generation_utils import _get_pyramid_latent, _prepare_past_condition_latents
 
@@ -307,7 +351,21 @@ def sample_functional_input(
         dtype=dtype,
         generator=generator,
     )
-    unit_index = int(torch.randint(1, latent_t, (1,), device=device, generator=generator).item())
+    minimum_unit = 0 if include_first_unit else 1
+    if minimum_unit >= latent_t:
+        raise ValueError(
+            f"Cannot sample a functional unit from latent_t={latent_t} with "
+            f"include_first_unit={include_first_unit}"
+        )
+    if unit_index is None:
+        unit_index = int(
+            torch.randint(minimum_unit, latent_t, (1,), device=device, generator=generator).item()
+        )
+    if not minimum_unit <= int(unit_index) < latent_t:
+        raise ValueError(
+            f"functional unit_index={unit_index} is outside [{minimum_unit}, {latent_t})"
+        )
+    unit_index = int(unit_index)
     stage = int(
         torch.randint(0, scheduler.config.stages, (1,), device=device, generator=generator).item()
     )
@@ -332,6 +390,22 @@ def sample_functional_input(
         sigmas = sigmas.view(-1, *([1] * (clean.dim() - 1)))
     noisy = sigmas * noise + (1.0 - sigmas) * clean
     return past_conditions[stage] + [noisy], timestep, stage, unit_index
+
+
+def functional_unit_for_step(cfg, args: argparse.Namespace, step: int) -> int | None:
+    """Return a deterministic unit only for the balanced native-unit protocol."""
+
+    if args.functional_unit_policy == "random":
+        return None
+    latent_t = ((int(cfg.data.frame_num) - 1) // 8) + 1
+    minimum_unit = 0 if args.functional_include_first_unit else 1
+    unit_count = latent_t - minimum_unit
+    if unit_count < 1:
+        raise ValueError(f"No eligible functional units for latent_t={latent_t}")
+    functional_call_index = (int(step) - int(args.functional_start_step)) // max(
+        int(args.functional_every), 1
+    )
+    return minimum_unit + (functional_call_index % unit_count)
 
 
 def wrap_bridge(
@@ -403,11 +477,18 @@ def save_text_checkpoint(
             "history": history,
             "validation": validation,
             "best_score": best_score,
-            "target": "neodragon_dit_condition_direct",
+            "target": f"neodragon_{args.target_stack}_dit_condition_direct",
+            "teacher_stack": {
+                "name": args.target_stack,
+                "context_adapter_id": args.target_context_adapter_id,
+                "dit_id": args.target_dit_id,
+            },
             "architecture": {
                 "bridge_contract": "original_neodragon_direct_condition",
                 "functional_distillation": True,
                 "functional_calls_per_step": 1,
+                "functional_include_first_unit": bool(args.functional_include_first_unit),
+                "functional_unit_policy": args.functional_unit_policy,
                 "fp32_master_trainable_parameters": bool(args.trainable_fp32),
             },
             "parallel": {
@@ -488,6 +569,7 @@ def evaluate_text_bridge_validation(
                 ctx.device,
                 frozen_dtype,
                 generator=generator,
+                include_first_unit=args.functional_include_first_unit,
             )
             teacher_prediction = functional_dit(
                 sample=[stage_input],
@@ -598,6 +680,24 @@ def main() -> None:
     parser.add_argument("--functional-ramp-steps", type=int, default=0)
     parser.add_argument("--functional-every", type=int, default=1)
     parser.add_argument("--functional-batch-size", type=int, default=1)
+    parser.add_argument(
+        "--functional-include-first-unit",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include native unit 0 in frozen-DiT functional sampling.",
+    )
+    parser.add_argument(
+        "--functional-unit-policy",
+        choices=("random", "cycle"),
+        default="random",
+        help="Random preserves Exp1; cycle gives every native unit equal functional coverage.",
+    )
+    parser.add_argument(
+        "--target-stack",
+        choices=("hybrid", "multistep"),
+        default="hybrid",
+        help="Released NeoDragon TextEncoder/ContextAdapter/DiT stack to distill.",
+    )
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--resume", default="none")
@@ -732,9 +832,18 @@ def main() -> None:
         ctx,
         f"Text bridge distill: parallel={args.parallel} world_size={ctx.world_size} "
         f"batch_per_gpu={args.batch_size} prompts={len(dataset)} dtype={frozen_dtype} "
-        f"caption_aug={args.caption_aug} caption_columns={caption_columns} caption_weights={caption_weights}",
+        f"target_stack={args.target_stack} caption_aug={args.caption_aug} "
+        f"caption_columns={caption_columns} caption_weights={caption_weights}",
     )
-    teacher, context_adapter, prompt_modifier = load_neodragon_text_modules(cfg, ctx.device, frozen_dtype)
+    teacher, context_adapter, prompt_modifier = load_neodragon_text_modules(
+        cfg,
+        ctx.device,
+        frozen_dtype,
+        target_stack=args.target_stack,
+    )
+    stack = resolve_neodragon_stack(args.target_stack)
+    args.target_context_adapter_id = stack["context_adapter_id"]
+    args.target_dit_id = stack["dit_id"]
     functional_dit = None
     functional_scheduler = None
     functional_enabled = args.functional_weight > 0.0 or args.functional_cos_weight > 0.0
@@ -743,13 +852,16 @@ def main() -> None:
             cfg,
             ctx.device,
             frozen_dtype,
+            target_stack=args.target_stack,
         )
         rank0_print(
             ctx,
             "Functional bridge distillation enabled: "
             f"mse={args.functional_weight} cos={args.functional_cos_weight} "
             f"start={args.functional_start_step} ramp={args.functional_ramp_steps} "
-            f"every={args.functional_every} batch={args.functional_batch_size}",
+            f"every={args.functional_every} batch={args.functional_batch_size} "
+            f"units={'0..6' if args.functional_include_first_unit else '1..6'} "
+            f"policy={args.functional_unit_policy}",
         )
     bridge = MobileOVNeodragonTextBridge(cfg.bridge, device=ctx.device, dtype=frozen_dtype).train()
     if args.trainable_fp32:
@@ -758,6 +870,12 @@ def main() -> None:
     checkpoint: dict = {}
     if checkpoint_path is not None:
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        checkpoint_stack = checkpoint.get("teacher_stack")
+        if isinstance(checkpoint_stack, dict) and checkpoint_stack.get("name") not in {None, args.target_stack}:
+            raise ValueError(
+                f"Checkpoint targets NeoDragon stack={checkpoint_stack.get('name')!r}, "
+                f"but this run requested --target-stack={args.target_stack!r}."
+            )
         bridge_state = checkpoint.get("bridge", checkpoint.get("student_state", checkpoint))
         if not isinstance(bridge_state, dict):
             raise TypeError(
@@ -961,12 +1079,15 @@ def main() -> None:
                 ramp_steps=args.functional_ramp_steps,
             )
             effect_bs = min(max(args.functional_batch_size, 1), pred_tokens.shape[0])
+            functional_unit_index = functional_unit_for_step(cfg, args, step)
             stage_input, timestep, functional_stage, functional_unit = sample_functional_input(
                 cfg,
                 functional_scheduler,
                 effect_bs,
                 ctx.device,
                 frozen_dtype,
+                include_first_unit=args.functional_include_first_unit,
+                unit_index=functional_unit_index,
             )
             with torch.no_grad():
                 teacher_prediction = functional_dit(
