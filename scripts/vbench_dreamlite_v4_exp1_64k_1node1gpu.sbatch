@@ -48,6 +48,13 @@ HF_REPO="${HF_REPO:-Amshaker/Mobile-OV}"
 MAX_PROMPTS="${MAX_PROMPTS:-0}"
 SAMPLES_PER_PROMPT="${SAMPLES_PER_PROMPT:-1}"
 RECAPTION_FILE="${RECAPTION_FILE:-}"
+WITH_QUICKSR="${WITH_QUICKSR:-0}"
+QUICKSR_VARIANT="${QUICKSR_VARIANT:-medium}"
+QUICKSR_SCALE="${QUICKSR_SCALE:-2}"
+QUICKSR_CHECKPOINT="${QUICKSR_CHECKPOINT:-}"
+QUICKSR_CHECKPOINT_DIR="${QUICKSR_CHECKPOINT_DIR:-checkpoints/quicksrnet}"
+QUICKSR_DTYPE="${QUICKSR_DTYPE:-fp16}"
+QUICKSR_BATCH_FRAMES="${QUICKSR_BATCH_FRAMES:-4}"
 STOP_FILE="${TMPDIR%/}/mov_vbench_setup_${SLURM_JOB_ID:-local}.stop"
 
 mkdir -p logs "${ANCHOR_DIR}" "${VIDEO_DIR}" "${SCORE_DIR}"
@@ -129,12 +136,28 @@ echo "RECAPTION_FILE=${RECAPTION_FILE:-<raw VBench prompts>}"
 echo "IMAGE_CONFIG=${IMAGE_CONFIG}"
 echo "IMAGE_CKPT=${IMAGE_CKPT}"
 echo "VIDEO_CKPT=${VIDEO_CKPT}"
+echo "WITH_QUICKSR=${WITH_QUICKSR} variant=${QUICKSR_VARIANT} scale=${QUICKSR_SCALE} dtype=${QUICKSR_DTYPE} batch_frames=${QUICKSR_BATCH_FRAMES}"
 nvidia-smi || true
 
 RECAPTION_ARGS=()
 if [[ -n "${RECAPTION_FILE}" ]]; then
   test -f "${RECAPTION_FILE}"
   RECAPTION_ARGS=(--recaption-file "${RECAPTION_FILE}")
+fi
+
+QUICKSR_ARGS=()
+if [[ "${WITH_QUICKSR}" == "1" ]]; then
+  QUICKSR_ARGS=(
+    --with-quicksr
+    --quicksr-variant "${QUICKSR_VARIANT}"
+    --quicksr-scale "${QUICKSR_SCALE}"
+    --quicksr-checkpoint-dir "${QUICKSR_CHECKPOINT_DIR}"
+    --quicksr-dtype "${QUICKSR_DTYPE}"
+    --quicksr-batch-frames "${QUICKSR_BATCH_FRAMES}"
+  )
+  if [[ -n "${QUICKSR_CHECKPOINT}" ]]; then
+    QUICKSR_ARGS+=(--quicksr-checkpoint "${QUICKSR_CHECKPOINT}")
+  fi
 fi
 
 "${PYTHON_BIN}" tools/generate_vbench_dreamlite_exp1.py \
@@ -147,7 +170,8 @@ fi
   --video-dir "${VIDEO_DIR}" \
   --summary "${RUN_ROOT}/generation_summary.json" \
   --samples-per-prompt "${SAMPLES_PER_PROMPT}" \
-  --max-prompts "${MAX_PROMPTS}"
+  --max-prompts "${MAX_PROMPTS}" \
+  "${QUICKSR_ARGS[@]}"
 
 if [[ "${MAX_PROMPTS}" -gt 0 ]]; then
   echo "Smoke generation completed for MAX_PROMPTS=${MAX_PROMPTS}; skipping full VBench scores."

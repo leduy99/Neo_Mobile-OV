@@ -10,6 +10,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 from decord import VideoReader
 from diffusers.utils import export_to_video
@@ -118,14 +119,35 @@ def valid_image(path: Path, expected_size: tuple[int, int]) -> bool:
         return False
 
 
-def valid_video(path: Path, expected_frames: int) -> bool:
+def valid_video(
+    path: Path,
+    expected_frames: int,
+    expected_size: tuple[int, int] | None = None,
+) -> bool:
     if not path.is_file() or path.stat().st_size < 4096:
         return False
     try:
         reader = VideoReader(str(path), num_threads=1)
-        return len(reader) == expected_frames
+        if len(reader) != expected_frames:
+            return False
+        if expected_size is None:
+            return True
+        frame = reader[0]
+        height, width = frame.shape[:2]
+        return (width, height) == expected_size
     except Exception:
         return False
+
+
+def output_video_size(args: argparse.Namespace) -> tuple[int, int]:
+    scale = args.quicksr_scale if args.with_quicksr else 1
+    return args.video_width * scale, args.video_height * scale
+
+
+def quicksr_dtype(name: str, device: torch.device) -> torch.dtype:
+    if device.type != "cuda":
+        return torch.float32
+    return {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[name]
 
 
 def load_bridge_state(path: Path, key: str = "bridge") -> tuple[dict[str, torch.Tensor], int]:
@@ -254,6 +276,7 @@ def generate_videos(
         if not valid_video(
             video_path(video_dir, prompt, sample_index),
             args.num_frames,
+            output_video_size(args),
         )
     ]
     if not missing:
@@ -287,6 +310,33 @@ def generate_videos(
         )
     del state
     backend = build_generation_backend(config.backend, device=device)
+    quicksr_model = None
+    quicksr_summary: dict[str, object] = {"enabled": bool(args.with_quicksr)}
+    if args.with_quicksr:
+        from new_mobile_ov.generation.quicksrnet import load_quicksrnet, model_parameter_count
+        from tools.apply_quicksrnet_video import upscale_frames
+
+        quicksr_model, quicksr_checkpoint = load_quicksrnet(
+            variant=args.quicksr_variant,
+            scale=args.quicksr_scale,
+            checkpoint=args.quicksr_checkpoint,
+            cache_dir=args.quicksr_checkpoint_dir,
+            device=device,
+            dtype=quicksr_dtype(args.quicksr_dtype, device),
+        )
+        quicksr_summary.update(
+            {
+                "variant": args.quicksr_variant,
+                "scale": args.quicksr_scale,
+                "checkpoint": str(quicksr_checkpoint.resolve()),
+                "parameter_count": model_parameter_count(quicksr_model),
+                "dtype": args.quicksr_dtype,
+                "batch_frames": args.quicksr_batch_frames,
+                "upload_seconds": 0.0,
+                "forward_seconds": 0.0,
+                "download_seconds": 0.0,
+            }
+        )
     generated = 0
     started = time.perf_counter()
     for prompt_index, prompt, sample_index in missing:
@@ -320,6 +370,23 @@ def generate_videos(
                 width=args.video_width,
                 num_frames=args.num_frames,
             )
+        if quicksr_model is not None:
+            frames_array = np.stack([np.asarray(frame.convert("RGB")) for frame in frames])
+            # Keep QuickSR's requested precision instead of inheriting the BF16 DiT autocast.
+            with torch.autocast("cuda", enabled=False):
+                upscaled, timing = upscale_frames(
+                    frames_array,
+                    model=quicksr_model,
+                    device=device,
+                    dtype=quicksr_dtype(args.quicksr_dtype, device),
+                    batch_frames=args.quicksr_batch_frames,
+                    reset_peak_memory=False,
+                )
+            if upscaled is None:
+                raise RuntimeError("QuickSR did not return output frames.")
+            frames = [Image.fromarray(frame) for frame in upscaled]
+            for field in ("upload_seconds", "forward_seconds", "download_seconds"):
+                quicksr_summary[field] = float(quicksr_summary[field]) + timing[field]
         destination = video_path(video_dir, prompt, sample_index)
         temporary = destination.with_suffix(".tmp.mp4")
         export_to_video(frames, temporary, fps=args.fps)
@@ -332,13 +399,16 @@ def generate_videos(
                 f"new={generated} rate={generated / max(elapsed, 1e-6):.2f}/s",
                 flush=True,
             )
-    release(backend, bridge)
-    return {
+    release(backend, bridge, quicksr_model)
+    summary = {
         "checkpoint_step": checkpoint_step,
         "generated": generated,
         "reused": total - generated,
         "seconds": time.perf_counter() - started,
     }
+    if args.with_quicksr:
+        summary["quicksr"] = quicksr_summary
+    return summary
 
 
 def parse_args() -> argparse.Namespace:
@@ -366,6 +436,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-height", type=int, default=320)
     parser.add_argument("--num-frames", type=int, default=49)
     parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument(
+        "--with-quicksr",
+        action="store_true",
+        help="Apply public Qualcomm QuickSRNet to every generated video before MP4 export.",
+    )
+    parser.add_argument("--quicksr-variant", choices=("small", "medium", "large"), default="medium")
+    parser.add_argument("--quicksr-scale", type=int, choices=(2, 3, 4), default=2)
+    parser.add_argument("--quicksr-checkpoint")
+    parser.add_argument("--quicksr-checkpoint-dir", default="checkpoints/quicksrnet")
+    parser.add_argument("--quicksr-dtype", choices=("fp16", "bf16", "fp32"), default="fp16")
+    parser.add_argument("--quicksr-batch-frames", type=int, default=4)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument(
         "--samples-per-prompt",
@@ -385,6 +466,8 @@ def main() -> None:
         raise RuntimeError("VBench generation requires one allocated CUDA GPU.")
     if args.samples_per_prompt <= 0:
         raise ValueError("--samples-per-prompt must be positive")
+    if args.quicksr_batch_frames <= 0:
+        raise ValueError("--quicksr-batch-frames must be positive")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -396,6 +479,8 @@ def main() -> None:
         f"anchor={args.anchor_width}x{args.anchor_height}"
         f"@{args.anchor_time_id_width}x{args.anchor_time_id_height} "
         f"video={args.video_width}x{args.video_height}x{args.num_frames} "
+        f"output={output_video_size(args)[0]}x{output_video_size(args)[1]} "
+        f"quicksr={args.quicksr_variant}x{args.quicksr_scale if args.with_quicksr else 1} "
         f"conditioning={'smolvlm2_recaption' if args.recaption_file else 'raw_vbench'}",
         flush=True,
     )
@@ -422,6 +507,7 @@ def main() -> None:
         if not valid_video(
             video_path(Path(args.video_dir), prompt, sample_index),
             args.num_frames,
+            output_video_size(args),
         )
     ]
     summary = {
@@ -448,6 +534,8 @@ def main() -> None:
         "video": {
             "width": args.video_width,
             "height": args.video_height,
+            "output_width": output_video_size(args)[0],
+            "output_height": output_video_size(args)[1],
             "frames": args.num_frames,
             "fps": args.fps,
             **video_summary,
