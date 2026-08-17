@@ -31,7 +31,7 @@ sys.path.insert(0, str(ROOT))
 
 from new_mobile_ov.checkpoints import ensure_neodragon_assets
 from new_mobile_ov.config import load_config
-from new_mobile_ov.training.neodragon_pyramidal_dmd import DMDCondition, predict_flow
+from new_mobile_ov.training.neodragon_pyramidal_dmd import DMDCondition, _down_then_up, predict_flow
 from new_mobile_ov.training.neodragon_rollout import (
     downsample_noise_2x,
     prepare_past_conditions,
