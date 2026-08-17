@@ -374,10 +374,14 @@ def checkpoint_update_metrics(
     total_reference = 0.0
     groups: dict[str, list[float]] = {}
     for key, reference in teacher_state.items():
-        candidate = student_state[key]
+        candidate_value = student_state[key]
         if not torch.is_floating_point(reference):
             continue
-        delta = float((candidate.float() - reference.float()).square().sum().cpu())
+        # The checkpoint stays on CPU while the initial model is on CUDA.
+        # Move one tensor at a time so the diagnostic does not duplicate a
+        # full 3 GB DiT state on the GPU.
+        candidate_value = candidate_value.to(device=reference.device, dtype=reference.dtype)
+        delta = float((candidate_value.float() - reference.float()).square().sum().cpu())
         base = float(reference.float().square().sum().cpu())
         total_delta += delta
         total_reference += base
