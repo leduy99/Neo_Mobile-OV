@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -12,6 +13,13 @@ from new_mobile_ov.training.neodragon_pyramidal_dmd import (
     stage_noisy_student_endpoint,
     stage_timestep,
     student_probe_sigmas,
+)
+from tools.train_neodragon_pyramidal_dmd import (
+    ALL_NATIVE_SCHEDULE,
+    ANCHOR_ALT_SCHEDULE,
+    LEGACY_VIDEO_ONLY_SCHEDULE,
+    protocol_metadata,
+    select_native_unit_stage,
 )
 
 
@@ -77,3 +85,55 @@ def test_dmd_surrogate_has_endpoint_gradient_and_cauchy_is_positive() -> None:
     assert endpoint.grad is not None
     assert torch.isfinite(endpoint.grad).all()
     assert direction_rms.item() > 0
+
+
+def test_anchor_alternative_has_a_distinct_checkpoint_contract() -> None:
+    assert protocol_metadata(
+        include_first_unit=True,
+        external_anchor_alternative=False,
+    )[0] == ALL_NATIVE_SCHEDULE
+    assert protocol_metadata(
+        include_first_unit=False,
+        external_anchor_alternative=False,
+    )[0] == LEGACY_VIDEO_ONLY_SCHEDULE
+    schedule, objective = protocol_metadata(
+        include_first_unit=False,
+        external_anchor_alternative=True,
+    )
+    assert schedule == ANCHOR_ALT_SCHEDULE
+    assert objective == "pyramidal_dmd_v2_alt_external_anchor_video_units"
+
+
+def test_anchor_alternative_cycles_only_six_video_units() -> None:
+    positions = [
+        select_native_unit_stage(step, include_first_unit=False)
+        for step in range(1, 19)
+    ]
+    assert positions == [(unit, stage) for unit in range(1, 7) for stage in range(3)]
+
+
+def test_anchor_alternative_rejects_first_unit_optimization() -> None:
+    try:
+        protocol_metadata(
+            include_first_unit=True,
+            external_anchor_alternative=True,
+        )
+    except ValueError as error:
+        assert "--no-include-first-unit" in str(error)
+    else:
+        raise AssertionError("Conflicting DMD protocols must be rejected")
+
+
+def test_anchor_submit_preserves_v2_hyperparameters_and_excludes_unit_zero() -> None:
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "reproduce_neodragon_pyramidal_dmd_v2_anchor_alt_1node8gpu.sbatch"
+    ).read_text(encoding="utf-8")
+
+    assert '--steps "${STEPS:-10000}"' in script
+    assert '--student-lr "${STUDENT_LR:-1e-6}"' in script
+    assert '--fake-updates "${FAKE_UPDATES:-2}"' in script
+    assert '--cauchy-weight "${CAUCHY_WEIGHT:-0.5}"' in script
+    assert "--no-include-first-unit" in script
+    assert "--external-anchor-alternative" in script

@@ -51,6 +51,29 @@ from new_mobile_ov.training.neodragon_pyramidal_dmd import (
 from new_mobile_ov.training.neodragon_rollout import pyramid_latents, prepare_past_conditions
 
 
+ALL_NATIVE_SCHEDULE = "pyramidal_1-1-1_all_native_units"
+LEGACY_VIDEO_ONLY_SCHEDULE = "hybrid_1-1-1_video_units_only"
+ANCHOR_ALT_SCHEDULE = "pyramidal_1-1-1_external_anchor_video_units"
+
+
+def protocol_metadata(
+    *,
+    include_first_unit: bool,
+    external_anchor_alternative: bool,
+) -> tuple[str, str]:
+    """Return an unambiguous schedule/objective pair for a DMD run."""
+
+    if include_first_unit and external_anchor_alternative:
+        raise ValueError(
+            "--external-anchor-alternative requires --no-include-first-unit"
+        )
+    if include_first_unit:
+        return ALL_NATIVE_SCHEDULE, "pyramidal_dmd_reproduction_v2_all_native_units"
+    if external_anchor_alternative:
+        return ANCHOR_ALT_SCHEDULE, "pyramidal_dmd_v2_alt_external_anchor_video_units"
+    return LEGACY_VIDEO_ONLY_SCHEDULE, "pyramidal_dmd_reproduction_v1_legacy_video_units_only"
+
+
 def dtype_from_name(name: str) -> torch.dtype:
     value = str(name).lower()
     if value in {"bf16", "bfloat16"}:
@@ -235,23 +258,19 @@ def save_checkpoint(
     ctx,
 ) -> None:
     if ctx.is_main:
+        schedule, objective_name = protocol_metadata(
+            include_first_unit=args.include_first_unit,
+            external_anchor_alternative=args.external_anchor_alternative,
+        )
         base = {
             "step": int(step),
             "student": {key: value.detach().cpu() for key, value in unwrap(student).state_dict().items()},
             "model_type": "neodragon_multistep_dit_distilled_to_conditional_one_step",
             "teacher_dit_id": models["dit_id"],
             "context_adapter_id": models["context_adapter_id"],
-            "schedule": (
-                "pyramidal_1-1-1_all_native_units"
-                if args.include_first_unit
-                else "hybrid_1-1-1_video_units_only"
-            ),
+            "schedule": schedule,
             "objective": {
-                "name": (
-                    "pyramidal_dmd_reproduction_v2_all_native_units"
-                    if args.include_first_unit
-                    else "pyramidal_dmd_reproduction_v1_legacy_video_units_only"
-                ),
+                "name": objective_name,
                 "teacher": "released_neodragon_multistep_cfg",
                 "student_init": "released_neodragon_multistep",
                 "fake_init": "released_neodragon_multistep",
@@ -264,16 +283,30 @@ def save_checkpoint(
                 },
                 "dmd_weight": args.dmd_weight,
                 "cauchy_weight": args.cauchy_weight,
+                "unit_zero_policy": (
+                    "optimized_as_native_t2v_unit"
+                    if args.include_first_unit
+                    else "excluded_from_optimization_used_as_teacher_forced_history_anchor"
+                ),
+                "deployment_first_frame": (
+                    "native_one_step_unit_zero"
+                    if args.include_first_unit
+                    else "external_ssd1b_dreamlite_or_source_image"
+                ),
+                "training_history_source": "stored_multistep_teacher_trajectory",
             },
             "args": vars(args),
             "history": history,
         }
-        resume = dict(base)
-        resume["fake"] = {key: value.detach().cpu() for key, value in unwrap(fake).state_dict().items()}
-        resume["student_optimizer"] = student_optimizer.state_dict()
-        resume["fake_optimizer"] = fake_optimizer.state_dict()
         atomic_save(base, output_dir / "neodragon_pyramidal_dmd_student_latest.pt")
-        atomic_save(resume, output_dir / "neodragon_pyramidal_dmd_resume.pt")
+        if args.save_resume:
+            resume = dict(base)
+            resume["fake"] = {
+                key: value.detach().cpu() for key, value in unwrap(fake).state_dict().items()
+            }
+            resume["student_optimizer"] = student_optimizer.state_dict()
+            resume["fake_optimizer"] = fake_optimizer.state_dict()
+            atomic_save(resume, output_dir / "neodragon_pyramidal_dmd_resume.pt")
         if archive:
             atomic_save(base, output_dir / f"neodragon_pyramidal_dmd_student_step{step:06d}.pt")
         (output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
@@ -292,14 +325,14 @@ def load_resume(
     student_optimizer: torch.optim.Optimizer,
     fake_optimizer: torch.optim.Optimizer,
     include_first_unit: bool,
+    external_anchor_alternative: bool,
 ) -> tuple[int, list[dict[str, object]]]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if "student" not in payload or "fake" not in payload:
         raise ValueError(f"{path} is not a resumable Pyramidal-DMD checkpoint")
-    expected_schedule = (
-        "pyramidal_1-1-1_all_native_units"
-        if include_first_unit
-        else "hybrid_1-1-1_video_units_only"
+    expected_schedule, _ = protocol_metadata(
+        include_first_unit=include_first_unit,
+        external_anchor_alternative=external_anchor_alternative,
     )
     actual_schedule = payload.get("schedule")
     if actual_schedule != expected_schedule:
@@ -340,11 +373,33 @@ def parse_args() -> argparse.Namespace:
             "default for synthetic [7,C,H,W] teacher trajectories."
         ),
     )
+    parser.add_argument(
+        "--external-anchor-alternative",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Label the six-video-unit run as the controlled DMD-v2 external-anchor "
+            "alternative. Unit zero from each stored teacher trajectory is used only "
+            "as causal history; deployment supplies an external first frame."
+        ),
+    )
     parser.add_argument("--teacher-first-guidance", type=float, default=7.0)
     parser.add_argument("--teacher-video-guidance", type=float, default=5.0)
     parser.add_argument("--clip-grad-norm", type=float, default=1.0)
     parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--archive-every", type=int, default=5000)
+    parser.add_argument(
+        "--save-resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save fake model and optimizer states in the large resumable checkpoint.",
+    )
+    parser.add_argument(
+        "--archive-final",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Archive the final student even when it is off the archive interval.",
+    )
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--resume", default="auto", help="auto, none, or a resumable checkpoint path")
     parser.add_argument("--dtype", default="bf16")
@@ -356,6 +411,10 @@ def main() -> None:
     args = parse_args()
     if args.steps < 1 or args.batch_size < 1 or args.fake_updates < 1:
         raise ValueError("steps, batch-size, and fake-updates must be positive")
+    schedule, objective_name = protocol_metadata(
+        include_first_unit=args.include_first_unit,
+        external_anchor_alternative=args.external_anchor_alternative,
+    )
     ctx = setup_distributed()
     try:
         torch.manual_seed(args.seed + ctx.rank)
@@ -416,6 +475,7 @@ def main() -> None:
                     student_optimizer=student_optimizer,
                     fake_optimizer=fake_optimizer,
                     include_first_unit=args.include_first_unit,
+                    external_anchor_alternative=args.external_anchor_alternative,
                 )
                 rank0_print(ctx, f"Resumed Pyramidal-DMD at step={start_step} from {requested}")
 
@@ -427,7 +487,8 @@ def main() -> None:
             f"global_batch={ctx.world_size * args.batch_size} synthetic_rows={len(dataset)} "
             f"steps={start_step}->{args.steps} student_params={parameters:,} "
             f"student:fake=1:{args.fake_updates} units="
-            f"{'0-6' if args.include_first_unit else '1-6'} dtype={dtype}",
+            f"{'0-6' if args.include_first_unit else '1-6'} dtype={dtype} "
+            f"schedule={schedule} objective={objective_name}",
         )
 
         scheduler = models["scheduler"]
@@ -630,7 +691,10 @@ def main() -> None:
                     history=history,
                     args=args,
                     models=models,
-                    archive=step % args.archive_every == 0 or step == args.steps,
+                    archive=(
+                        step % args.archive_every == 0
+                        or (args.archive_final and step == args.steps)
+                    ),
                     ctx=ctx,
                 )
         rank0_print(ctx, f"Completed NeoDragon Pyramidal-DMD reproduction at step={args.steps}.")

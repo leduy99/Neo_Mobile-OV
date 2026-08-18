@@ -10,6 +10,7 @@ from tools.train_neodragon_text_bridge import (
     newest_text_checkpoint,
     promote_trainable_parameters_to_fp32,
     reserve_validation_prompts,
+    validate_functional_dit_checkpoint,
 )
 
 
@@ -128,6 +129,51 @@ def test_monolithic_submit_keeps_fp32_weights_with_fsdp() -> None:
 
     assert "--parallel fsdp" in script
     assert "--trainable-fp32" in script
+
+
+def test_anchor_bridge_targets_deployed_dmd_and_skips_unit_zero() -> None:
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "train_neodragon_dmd_v2_anchor_text_bridge_1node8gpu.sbatch"
+    ).read_text(encoding="utf-8")
+
+    assert "--target-stack multistep" in script
+    assert "--functional-dit-checkpoint" in script
+    assert "--no-functional-include-first-unit" in script
+    assert "--functional-unit-policy cycle" in script
+    assert "pyramidal_1-1-1_external_anchor_video_units" in script
+
+
+def test_functional_dit_checkpoint_contract_is_strict() -> None:
+    state = {"weight": torch.ones(1)}
+    payload = {
+        "student": state,
+        "step": 10000,
+        "schedule": "pyramidal_1-1-1_external_anchor_video_units",
+        "teacher_dit_id": "diffusion_transformer_320p_multistep_t2v",
+    }
+    loaded, metadata = validate_functional_dit_checkpoint(
+        payload,
+        required_schedule="pyramidal_1-1-1_external_anchor_video_units",
+        target_dit_id="diffusion_transformer_320p_multistep_t2v",
+    )
+    assert loaded is state
+    assert metadata == {
+        "step": 10000,
+        "schedule": "pyramidal_1-1-1_external_anchor_video_units",
+    }
+
+    try:
+        validate_functional_dit_checkpoint(
+            payload,
+            required_schedule="pyramidal_1-1-1_all_native_units",
+            target_dit_id="diffusion_transformer_320p_multistep_t2v",
+        )
+    except ValueError as error:
+        assert "schedule mismatch" in str(error)
+    else:
+        raise AssertionError("A mismatched DMD schedule must be rejected")
 
 
 def test_single_rank_fsdp_is_not_downgraded_to_no_parallel() -> None:

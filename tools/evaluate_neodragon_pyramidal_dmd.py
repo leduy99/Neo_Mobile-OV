@@ -3,8 +3,8 @@
 """Evaluate a Pyramidal-DMD student on synthetic native teacher trajectories.
 
 All-native-unit DMD-v2 checkpoints generate units zero through six.  The
-legacy checkpoint format generates only units one through six after a fixed
-first unit so its historical diagnostic remains reproducible.
+legacy and external-anchor checkpoint formats generate only units one through
+six after a fixed first unit.
 """
 
 from __future__ import annotations
@@ -52,6 +52,7 @@ def load_models(cfg, checkpoint: Path, device: torch.device, dtype: torch.dtype)
     if payload.get("schedule") not in {
         "hybrid_1-1-1_video_units_only",
         "pyramidal_1-1-1_all_native_units",
+        "pyramidal_1-1-1_external_anchor_video_units",
     }:
         raise ValueError(f"Not a Pyramidal-DMD student checkpoint: {checkpoint}")
     adapter_id = str(payload["context_adapter_id"])
@@ -153,8 +154,9 @@ def main() -> None:
         "schedule": (
             "seven native units x three stages x one conditional DiT call"
             if all_native_units
-            else "legacy fixed unit zero + six units x three stages x one conditional DiT call"
+            else "fixed unit-zero anchor + six units x three stages x one conditional DiT call"
         ),
+        "checkpoint_schedule": payload["schedule"],
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(metrics, indent=2))

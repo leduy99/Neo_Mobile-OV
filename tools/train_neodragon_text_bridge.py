@@ -303,6 +303,8 @@ def load_neodragon_functional_modules(
     dtype: torch.dtype,
     *,
     target_stack: str = "hybrid",
+    checkpoint_path: str = "",
+    required_schedule: str = "",
 ):
     repo_path, _, local_model_path = ensure_neodragon_assets(
         repo_path=cfg.backend.extra.get("repo_path"),
@@ -321,9 +323,59 @@ def load_neodragon_functional_modules(
     dit = PyramidMMDiT.from_pretrained(
         f"{local_model_path}/{stack['dit_id']}", torch_dtype=dtype
     ).to(device).eval()
+    metadata = {
+        "source": "released_neodragon",
+        "checkpoint": None,
+        "step": 0,
+        "schedule": None,
+    }
+    if checkpoint_path:
+        path = Path(checkpoint_path).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Functional DiT checkpoint does not exist: {path}")
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        state, checkpoint_metadata = validate_functional_dit_checkpoint(
+            payload,
+            required_schedule=required_schedule,
+            target_dit_id=stack["dit_id"],
+        )
+        dit.load_state_dict(state, strict=True)
+        metadata = {
+            "source": "dmd_student_checkpoint",
+            "checkpoint": str(path),
+            **checkpoint_metadata,
+        }
     for param in dit.parameters():
         param.requires_grad_(False)
-    return dit, PyramidFlowMatchEulerDiscreteScheduler()
+    return dit, PyramidFlowMatchEulerDiscreteScheduler(), metadata
+
+
+def validate_functional_dit_checkpoint(
+    payload: object,
+    *,
+    required_schedule: str,
+    target_dit_id: str,
+) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
+    """Validate a DMD student before it becomes the bridge's frozen function."""
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("student"), dict):
+        raise ValueError("Functional DiT checkpoint must contain a DMD 'student' state")
+    schedule = str(payload.get("schedule", ""))
+    if required_schedule and schedule != required_schedule:
+        raise ValueError(
+            "Functional DiT schedule mismatch: "
+            f"checkpoint={schedule!r}, required={required_schedule!r}"
+        )
+    checkpoint_dit_id = payload.get("teacher_dit_id")
+    if checkpoint_dit_id not in {None, target_dit_id}:
+        raise ValueError(
+            "Functional DiT architecture mismatch: "
+            f"checkpoint teacher={checkpoint_dit_id!r}, target={target_dit_id!r}"
+        )
+    return payload["student"], {
+        "step": int(payload.get("step", 0)),
+        "schedule": schedule,
+    }
 
 
 def sample_functional_input(
@@ -499,6 +551,12 @@ def save_text_checkpoint(
                 "name": args.target_stack,
                 "context_adapter_id": args.target_context_adapter_id,
                 "dit_id": args.target_dit_id,
+            },
+            "functional_dit": {
+                "source": args.functional_dit_source,
+                "checkpoint": args.functional_dit_checkpoint_resolved,
+                "step": int(args.functional_dit_checkpoint_step),
+                "schedule": args.functional_dit_schedule,
             },
             "architecture": {
                 "bridge_contract": "original_neodragon_direct_condition",
@@ -715,6 +773,19 @@ def main() -> None:
         default="hybrid",
         help="Released NeoDragon TextEncoder/ContextAdapter/DiT stack to distill.",
     )
+    parser.add_argument(
+        "--functional-dit-checkpoint",
+        default="",
+        help=(
+            "Optional DMD student checkpoint used as the frozen functional DiT. "
+            "Representation targets still come from --target-stack."
+        ),
+    )
+    parser.add_argument(
+        "--functional-dit-required-schedule",
+        default="",
+        help="Reject a functional DiT checkpoint unless its saved schedule matches exactly.",
+    )
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--resume", default="none")
@@ -878,16 +949,26 @@ def main() -> None:
     stack = resolve_neodragon_stack(args.target_stack)
     args.target_context_adapter_id = stack["context_adapter_id"]
     args.target_dit_id = stack["dit_id"]
+    args.functional_dit_source = "disabled"
+    args.functional_dit_checkpoint_resolved = None
+    args.functional_dit_checkpoint_step = 0
+    args.functional_dit_schedule = None
     functional_dit = None
     functional_scheduler = None
     functional_enabled = args.functional_weight > 0.0 or args.functional_cos_weight > 0.0
     if functional_enabled:
-        functional_dit, functional_scheduler = load_neodragon_functional_modules(
+        functional_dit, functional_scheduler, functional_metadata = load_neodragon_functional_modules(
             cfg,
             ctx.device,
             frozen_dtype,
             target_stack=args.target_stack,
+            checkpoint_path=args.functional_dit_checkpoint,
+            required_schedule=args.functional_dit_required_schedule,
         )
+        args.functional_dit_source = functional_metadata["source"]
+        args.functional_dit_checkpoint_resolved = functional_metadata["checkpoint"]
+        args.functional_dit_checkpoint_step = functional_metadata["step"]
+        args.functional_dit_schedule = functional_metadata["schedule"]
         rank0_print(
             ctx,
             "Functional bridge distillation enabled: "
@@ -895,7 +976,9 @@ def main() -> None:
             f"start={args.functional_start_step} ramp={args.functional_ramp_steps} "
             f"every={args.functional_every} batch={args.functional_batch_size} "
             f"units={'0..6' if args.functional_include_first_unit else '1..6'} "
-            f"policy={args.functional_unit_policy}",
+            f"policy={args.functional_unit_policy} "
+            f"dit_source={args.functional_dit_source} "
+            f"dit_schedule={args.functional_dit_schedule}",
         )
     bridge = MobileOVNeodragonTextBridge(cfg.bridge, device=ctx.device, dtype=frozen_dtype).train()
     if args.trainable_fp32:
