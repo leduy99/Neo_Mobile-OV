@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=neo-dmd-v2a-bridge
+# Distill the Mobile-OV text bridge against the frozen NeoDragon multi-step
+# (monolithic) stack. Functional supervision covers video units 1..6 because
+# the paired DMD alternative receives unit 0 from an external anchor model.
+#
+# This job is independent of DMD training and never loads a DMD checkpoint.
+# Submit:
+#   sbatch scripts/train_neodragon_monolithic_video_units_text_bridge_1node8gpu.sbatch
+#SBATCH --job-name=neo-mono-vbridge
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=8
 #SBATCH --time=72:00:00
-#SBATCH --output=logs/neo-dmd-v2a-bridge-%j.out
-#SBATCH --error=logs/neo-dmd-v2a-bridge-%j.out
+#SBATCH --output=logs/neo-mono-vbridge-%j.out
+#SBATCH --error=logs/neo-mono-vbridge-%j.out
 #SBATCH --account=berzelius-2026-196
 #SBATCH --gres=gpu:8
 
-# Exp1-style bridge distillation for the deployed DMD-v2 anchor alternative.
-# Native multistep tokens remain the representation target, while functional
-# supervision comes directly from the frozen DMD student that will be used at
-# inference. Unit zero is excluded from the bridge functional cycle as well.
 set -euo pipefail
 
 module load buildenv-nvhpc/24.5-cuda12.4
@@ -20,13 +23,11 @@ CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-${CONDA_ENV}/bin/torchrun}"
 CONFIG="${CONFIG:-configs/mobile_ov_neodragon.yaml}"
 PROMPTS="${PROMPTS:-download_data/data/openvid/manifests/openvid_all_recaptions_merged.csv}"
-DMD_CHECKPOINT="${DMD_CHECKPOINT:-output/neodragon_pyramidal_dmd_reproduction/dmd_repro_v2_anchor_alt_10k/neodragon_pyramidal_dmd_student_step010000.pt}"
-RUN_NAME="${RUN_NAME:-dmd_v2_anchor_exp1_functional_${SLURM_JOB_ID}}"
-OUT="${OUT:-output/neo_dmd_v2_anchor_text_bridge/${RUN_NAME}}"
+RUN_NAME="${RUN_NAME:-monolithic_video_units_exp1_functional_${SLURM_JOB_ID}}"
+OUT="${OUT:-output/neo_monolithic_video_units_text_bridge/${RUN_NAME}}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 
 test -f "${PROMPTS}"
-test -f "${DMD_CHECKPOINT}"
 test -x "${TORCHRUN_BIN}"
 mkdir -p logs "${OUT}"
 
@@ -45,10 +46,10 @@ export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export TORCH_DIST_TIMEOUT_MINUTES="${TORCH_DIST_TIMEOUT_MINUTES:-90}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-echo "DMD-v2 anchor bridge: multistep representation + deployed-DMD functional distillation"
-echo "PROMPTS=${PROMPTS} DMD_CHECKPOINT=${DMD_CHECKPOINT}"
+echo "External-anchor bridge: frozen monolithic representation + functional distillation"
+echo "PROMPTS=${PROMPTS}"
 echo "OUT=${OUT} STEPS=${STEPS:-64000} GLOBAL_BATCH=$((NPROC_PER_NODE * ${BATCH_SIZE:-4}))"
-echo "Functional coverage: deployed DMD student, video units 1..6, one call per update"
+echo "Functional coverage: released multistep DiT, video units 1..6, one call per update"
 nvidia-smi || true
 
 INIT_ARGS=()
@@ -70,8 +71,6 @@ fi
   --lr "${LR:-5e-5}" \
   --parallel fsdp \
   --target-stack multistep \
-  --functional-dit-checkpoint "${DMD_CHECKPOINT}" \
-  --functional-dit-required-schedule pyramidal_1-1-1_external_anchor_video_units \
   --caption-variant-columns caption_short,caption_medium,caption_long \
   --caption-variant-weights 1,1,1 \
   --raw-token-weight 0.25 \

@@ -39,24 +39,21 @@ It cannot be resumed as V1 legacy or V2 all-native training.
 
 ## Bridge Redesign
 
-The previous monolithic bridge matched representations and frozen multistep
-DiT responses, then was deployed on a separately distilled DMD student. Local
-flow similarity did not guarantee matching autoregressive DMD rollouts.
-
-The new bridge keeps the successful Exp1 representation losses against the
-native multistep text/context stack, but its functional loss is evaluated by
-the exact frozen DMD-V2-alt student used at deployment. Functional sampling
-cycles only units `1..6`.
+The bridge remains fully separate from DMD training. It keeps the successful
+Exp1 representation losses against the native multistep text/context stack,
+and its functional loss is evaluated by the frozen released **monolithic
+multistep DiT**. Functional sampling cycles only units `1..6`.
 
 ```text
 SmolVLM2 bridge condition ----+
-                              +--> frozen deployed DMD-alt response match
+                              +--> frozen monolithic DiT response match
 native multistep condition ---+
 ```
 
-The bridge checkpoint records the DMD source path, step, and schedule. Training
-fails before the first update if an all-native or legacy DMD checkpoint is
-supplied accidentally.
+No DMD checkpoint is loaded or updated by the bridge job. This preserves the
+intended procedure: first learn the monolithic conditioning interface, then
+independently distill the monolithic DiT into a fast student, and finally test
+whether that unchanged interface transfers to DMD-V2-alt.
 
 ## Commands
 
@@ -66,17 +63,11 @@ Train DMD-V2-alt on Berzelius:
 sbatch scripts/reproduce_neodragon_pyramidal_dmd_v2_anchor_alt_1node8gpu.sbatch
 ```
 
-After the default 10k checkpoint exists, train the bridge from scratch:
+Train the bridge from scratch. This job is independent and can run in parallel
+with DMD-V2-alt:
 
 ```bash
-sbatch scripts/train_neodragon_dmd_v2_anchor_text_bridge_1node8gpu.sbatch
-```
-
-A non-default DMD path can be provided explicitly:
-
-```bash
-DMD_CHECKPOINT=output/neodragon_pyramidal_dmd_reproduction/<run>/neodragon_pyramidal_dmd_student_step010000.pt \
-sbatch scripts/train_neodragon_dmd_v2_anchor_text_bridge_1node8gpu.sbatch
+sbatch scripts/train_neodragon_monolithic_video_units_text_bridge_1node8gpu.sbatch
 ```
 
 ## Decision Rule

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# One-GPU smoke for the anchored DMD protocol and its deployed-DiT bridge.
+# One-GPU smoke for anchored DMD and separate monolithic bridge distillation.
 # Run only inside a local H200 SLURM allocation.
 set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-/share_4/users/duy/.conda/envs/neo_mobileov/bin/python}"
 RUN_NAME="${RUN_NAME:-dmd_v2_anchor_pipeline_smoke_local}"
 OUT_ROOT="${OUT_ROOT:-output/neodragon_pyramidal_dmd_reproduction/${RUN_NAME}}"
-BRIDGE_OUT="${BRIDGE_OUT:-output/neo_dmd_v2_anchor_text_bridge/${RUN_NAME}}"
+BRIDGE_OUT="${BRIDGE_OUT:-output/neo_monolithic_video_units_text_bridge/${RUN_NAME}}"
 AUDIT_LATENT="${AUDIT_LATENT:-output/neodragon_pyramidal_dmd_inference_contract/dmd10k_scale_ablation_car_20260817/teacher_manual_multistep_cfg.pt}"
 PROMPTS="${PROMPTS:-configs/prompts/neodragon_monolithic_bridge_smoke.txt}"
 
@@ -62,7 +62,6 @@ PY
   --log-every 1 \
   --dtype bf16
 
-DMD_CHECKPOINT="${OUT_ROOT}/neodragon_pyramidal_dmd_student_latest.pt"
 "${PYTHON_BIN}" -u tools/train_neodragon_text_bridge.py \
   --prompts "${PROMPTS}" \
   --output-dir "${BRIDGE_OUT}" \
@@ -71,8 +70,6 @@ DMD_CHECKPOINT="${OUT_ROOT}/neodragon_pyramidal_dmd_student_latest.pt"
   --lr 5e-5 \
   --parallel fsdp \
   --target-stack multistep \
-  --functional-dit-checkpoint "${DMD_CHECKPOINT}" \
-  --functional-dit-required-schedule pyramidal_1-1-1_external_anchor_video_units \
   --raw-token-weight 0.25 \
   --normalized-token-weight 1.0 \
   --cos-weight 0.5 \
@@ -110,9 +107,9 @@ bridge = torch.load(
     map_location="cpu",
     weights_only=False,
 )
-assert bridge["functional_dit"]["source"] == "dmd_student_checkpoint"
-assert bridge["functional_dit"]["schedule"] == dmd["schedule"]
+assert bridge["teacher_stack"]["name"] == "multistep"
+assert "functional_dit" not in bridge
 assert bridge["architecture"]["functional_include_first_unit"] is False
 assert bridge["history"][0]["functional_unit"] == 1.0
-print("DMD-v2 anchor alternative + deployed-DiT bridge smoke: PASS")
+print("DMD-v2 anchor alternative + monolithic bridge smoke: PASS")
 PY
