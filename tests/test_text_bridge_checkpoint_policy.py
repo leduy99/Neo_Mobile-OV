@@ -5,6 +5,7 @@ import torch
 
 from tools.train_neodragon_text_bridge import (
     PromptDataset,
+    cfg_combine,
     functional_unit_for_step,
     learning_rate_scale,
     newest_text_checkpoint,
@@ -79,6 +80,13 @@ def test_fp32_master_conversion_only_changes_trainable_parameters() -> None:
     assert module[1].weight.dtype == torch.float32
 
 
+def test_cfg_combine_matches_native_guidance_equation() -> None:
+    positive = torch.tensor([3.0])
+    negative = torch.tensor([1.0])
+
+    assert torch.equal(cfg_combine(positive, negative, 5.0), torch.tensor([11.0]))
+
+
 def test_exp1_200k_script_uses_single_call_trainer_not_rollout() -> None:
     script = (
         Path(__file__).resolve().parents[1]
@@ -141,6 +149,37 @@ def test_anchor_bridge_targets_monolithic_stack_and_skips_unit_zero() -> None:
     assert "--functional-dit-checkpoint" not in script
     assert "--no-functional-include-first-unit" in script
     assert "--functional-unit-policy cycle" in script
+
+
+def test_cfg_v2_bridge_job_preserves_monolithic_external_anchor_contract() -> None:
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "train_neodragon_monolithic_cfg_bridge_v2_1node8gpu.sbatch"
+    ).read_text(encoding="utf-8")
+
+    assert "--target-stack multistep" in script
+    assert "--no-functional-include-first-unit" in script
+    assert "--negative-repr-weight" in script
+    assert "--cfg-token-delta-weight" in script
+    assert "--cfg-functional-weight" in script
+    assert "--trainable-fp32" in script
+
+
+def test_joint_monolithic_job_stages_bridge_and_preserves_cfg() -> None:
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "train_mobileov_monolithic_joint_flow_1node8gpu.sbatch"
+    ).read_text(encoding="utf-8")
+
+    assert "--target-stack multistep" in script
+    assert "--train-bridge" in script
+    assert "--bridge-start-step" in script
+    assert "--cfg-distill-weight" in script
+    assert "--bridge-cfg-functional-weight" in script
+    assert "--dit-trainable-fp32" in script
+    assert "--bridge-trainable-fp32" in script
 
 
 def test_single_rank_fsdp_is_not_downgraded_to_no_parallel() -> None:

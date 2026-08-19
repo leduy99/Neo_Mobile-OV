@@ -195,6 +195,36 @@ def learning_rate_scale(
     return float(final_scale) + (1.0 - float(final_scale)) * cosine
 
 
+def cfg_combine(
+    positive: torch.Tensor,
+    negative: torch.Tensor,
+    guidance_scale: float,
+) -> torch.Tensor:
+    """Apply the same classifier-free guidance algebra used at inference."""
+    return negative + float(guidance_scale) * (positive - negative)
+
+
+def bridge_representation_objective(
+    *,
+    pred_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    target_mask: torch.Tensor,
+    pred_pooled: torch.Tensor,
+    target_pooled: torch.Tensor,
+    args: argparse.Namespace,
+) -> torch.Tensor:
+    return (
+        args.raw_token_weight * masked_token_mse(pred_tokens, target_tokens, target_mask)
+        + args.normalized_token_weight
+        * masked_token_mse(pred_tokens, target_tokens, target_mask, normalize_tokens=True)
+        + args.cos_weight * masked_token_cosine(pred_tokens, target_tokens, target_mask)
+        + args.token_norm_weight * token_norm_alignment(pred_tokens, target_tokens, target_mask)
+        + args.pooled_weight * F.mse_loss(pred_pooled.float(), target_pooled.float())
+        + args.pooled_cos_weight * pooled_cosine(pred_pooled, target_pooled)
+        + args.relational_weight * relational_cosine(pred_tokens, target_tokens, target_mask)
+    )
+
+
 def newest_text_checkpoint(output_dir: Path) -> Path | None:
     best: tuple[int, Path] | None = None
     for path in output_dir.glob("neodragon_text_bridge_step*.pt"):
@@ -506,6 +536,17 @@ def save_text_checkpoint(
                 "functional_calls_per_step": 1,
                 "functional_include_first_unit": bool(args.functional_include_first_unit),
                 "functional_unit_policy": args.functional_unit_policy,
+                "negative_representation_distillation": bool(args.negative_repr_weight),
+                "cfg_direction_distillation": bool(
+                    args.cfg_token_delta_weight
+                    or args.cfg_token_delta_cos_weight
+                    or args.cfg_pooled_delta_weight
+                    or args.cfg_pooled_delta_cos_weight
+                ),
+                "cfg_functional_distillation": bool(
+                    args.cfg_functional_weight or args.cfg_functional_cos_weight
+                ),
+                "cfg_scale": float(args.cfg_scale),
                 "fp32_master_trainable_parameters": bool(args.trainable_fp32),
             },
             "parallel": {
@@ -552,7 +593,22 @@ def evaluate_text_bridge_validation(
     local_prompts = prompts[ctx.rank :: ctx.world_size]
     generator = torch.Generator(device=ctx.device)
     generator.manual_seed(args.validation_seed + ctx.rank)
-    totals = torch.zeros(4, device=ctx.device, dtype=torch.float64)
+    cfg_supervision_enabled = bool(
+        args.negative_repr_weight
+        or args.cfg_token_delta_weight
+        or args.cfg_token_delta_cos_weight
+        or args.cfg_pooled_delta_weight
+        or args.cfg_pooled_delta_cos_weight
+        or args.cfg_functional_weight
+        or args.cfg_functional_cos_weight
+    )
+    cfg_functional_enabled = bool(
+        args.cfg_functional_weight or args.cfg_functional_cos_weight
+    )
+    if cfg_supervision_enabled:
+        from neodragon.utils.generation_utils import DEFAULT_NEGATIVE_PROMPT
+
+    totals = torch.zeros(7, device=ctx.device, dtype=torch.float64)
 
     for start in range(0, len(local_prompts), batch_size):
         raw_batch = local_prompts[start : start + batch_size]
@@ -565,18 +621,56 @@ def evaluate_text_bridge_validation(
             target_tokens, target_mask, target_pooled = teacher(batch, ctx.device)
             target_tokens = context_adapter(target_tokens)
             pred_tokens, pred_mask, pred_pooled = bridge_model(batch)
-            raw_token_loss = masked_token_mse(pred_tokens, target_tokens, target_mask)
-            normalized_token_loss = masked_token_mse(
-                pred_tokens,
-                target_tokens,
-                target_mask,
-                normalize_tokens=True,
+            representation_loss = bridge_representation_objective(
+                pred_tokens=pred_tokens,
+                target_tokens=target_tokens,
+                target_mask=target_mask,
+                pred_pooled=pred_pooled,
+                target_pooled=target_pooled,
+                args=args,
             )
-            pooled_loss = F.mse_loss(pred_pooled.float(), target_pooled.float())
-            cos_loss = masked_token_cosine(pred_tokens, target_tokens, target_mask)
-            norm_loss = token_norm_alignment(pred_tokens, target_tokens, target_mask)
-            pooled_cos_loss = pooled_cosine(pred_pooled, target_pooled)
-            relational_loss = relational_cosine(pred_tokens, target_tokens, target_mask)
+
+            negative_repr_loss = pred_tokens.new_zeros(())
+            cfg_delta_loss = pred_tokens.new_zeros(())
+            target_negative_tokens = target_negative_mask = target_negative_pooled = None
+            pred_negative_tokens = pred_negative_mask = pred_negative_pooled = None
+            if cfg_supervision_enabled:
+                negative_batch = [DEFAULT_NEGATIVE_PROMPT] * len(batch)
+                target_negative_tokens, target_negative_mask, target_negative_pooled = teacher(
+                    negative_batch, ctx.device
+                )
+                target_negative_tokens = context_adapter(target_negative_tokens)
+                pred_negative_tokens, pred_negative_mask, pred_negative_pooled = bridge_model(
+                    negative_batch
+                )
+                negative_repr_loss = bridge_representation_objective(
+                    pred_tokens=pred_negative_tokens,
+                    target_tokens=target_negative_tokens,
+                    target_mask=target_negative_mask,
+                    pred_pooled=pred_negative_pooled,
+                    target_pooled=target_negative_pooled,
+                    args=args,
+                )
+                delta_mask = target_mask.bool() | target_negative_mask.bool()
+                pred_token_delta = pred_tokens - pred_negative_tokens
+                target_token_delta = target_tokens - target_negative_tokens
+                pred_pooled_delta = pred_pooled - pred_negative_pooled
+                target_pooled_delta = target_pooled - target_negative_pooled
+                cfg_delta_loss = (
+                    args.cfg_token_delta_weight
+                    * masked_token_mse(
+                        pred_token_delta,
+                        target_token_delta,
+                        delta_mask,
+                        normalize_tokens=True,
+                    )
+                    + args.cfg_token_delta_cos_weight
+                    * masked_token_cosine(pred_token_delta, target_token_delta, delta_mask)
+                    + args.cfg_pooled_delta_weight
+                    * F.mse_loss(pred_pooled_delta.float(), target_pooled_delta.float())
+                    + args.cfg_pooled_delta_cos_weight
+                    * pooled_cosine(pred_pooled_delta, target_pooled_delta)
+                )
 
             effect_bs = min(args.functional_batch_size, len(batch))
             stage_input, timestep, _, _ = sample_functional_input(
@@ -604,34 +698,76 @@ def evaluate_text_bridge_validation(
             )[0]
             functional_loss = F.mse_loss(student_prediction.float(), teacher_prediction.float())
             functional_cos_loss = flat_cosine_distance(student_prediction, teacher_prediction)
-            representation_loss = (
-                args.raw_token_weight * raw_token_loss
-                + args.normalized_token_weight * normalized_token_loss
-                + args.cos_weight * cos_loss
-                + args.token_norm_weight * norm_loss
-                + args.pooled_weight * pooled_loss
-                + args.pooled_cos_weight * pooled_cos_loss
-                + args.relational_weight * relational_loss
-            )
-            total_loss = representation_loss + (
-                args.functional_weight * functional_loss
+            cfg_functional_loss = pred_tokens.new_zeros(())
+            cfg_functional_cos_loss = pred_tokens.new_zeros(())
+            if cfg_functional_enabled:
+                assert target_negative_tokens is not None
+                assert target_negative_mask is not None
+                assert target_negative_pooled is not None
+                assert pred_negative_tokens is not None
+                assert pred_negative_mask is not None
+                assert pred_negative_pooled is not None
+                teacher_negative_prediction = functional_dit(
+                    sample=[stage_input],
+                    encoder_hidden_states=target_negative_tokens[:effect_bs].to(dtype=frozen_dtype),
+                    encoder_attention_mask=target_negative_mask[:effect_bs],
+                    pooled_projections=target_negative_pooled[:effect_bs].to(dtype=frozen_dtype),
+                    timestep_ratio=timestep,
+                )[0]
+                student_negative_prediction = functional_dit(
+                    sample=[stage_input],
+                    encoder_hidden_states=pred_negative_tokens[:effect_bs],
+                    encoder_attention_mask=pred_negative_mask[:effect_bs],
+                    pooled_projections=pred_negative_pooled[:effect_bs],
+                    timestep_ratio=timestep,
+                )[0]
+                teacher_cfg_prediction = cfg_combine(
+                    teacher_prediction, teacher_negative_prediction, args.cfg_scale
+                )
+                student_cfg_prediction = cfg_combine(
+                    student_prediction, student_negative_prediction, args.cfg_scale
+                )
+                cfg_functional_loss = F.mse_loss(
+                    student_cfg_prediction.float(), teacher_cfg_prediction.float()
+                )
+                cfg_functional_cos_loss = flat_cosine_distance(
+                    student_cfg_prediction, teacher_cfg_prediction
+                )
+            total_loss = (
+                representation_loss
+                + args.negative_repr_weight * negative_repr_loss
+                + cfg_delta_loss
+                + args.functional_weight * functional_loss
                 + args.functional_cos_weight * functional_cos_loss
+                + args.cfg_functional_weight * cfg_functional_loss
+                + args.cfg_functional_cos_weight * cfg_functional_cos_loss
             )
 
         totals += torch.tensor(
-            [float(total_loss), float(representation_loss), float(functional_loss), 1.0],
+            [
+                float(total_loss),
+                float(representation_loss),
+                float(negative_repr_loss),
+                float(cfg_delta_loss),
+                float(functional_loss),
+                float(cfg_functional_loss),
+                1.0,
+            ],
             device=ctx.device,
             dtype=torch.float64,
         )
 
     if ctx.is_distributed:
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
-    count = totals[3].clamp_min(1.0)
+    count = totals[6].clamp_min(1.0)
     metrics = {
         "loss": float((totals[0] / count).cpu()),
         "representation_loss": float((totals[1] / count).cpu()),
-        "functional_loss": float((totals[2] / count).cpu()),
-        "batches": float(totals[3].cpu()),
+        "negative_representation_loss": float((totals[2] / count).cpu()),
+        "cfg_delta_loss": float((totals[3] / count).cpu()),
+        "functional_loss": float((totals[4] / count).cpu()),
+        "cfg_functional_loss": float((totals[5] / count).cpu()),
+        "batches": float(totals[6].cpu()),
     }
     bridge_model.train()
     return metrics
@@ -693,6 +829,19 @@ def main() -> None:
     parser.add_argument("--relational-weight", type=float, default=0.0)
     parser.add_argument("--functional-weight", type=float, default=0.0)
     parser.add_argument("--functional-cos-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--negative-repr-weight",
+        type=float,
+        default=0.0,
+        help="Scale the standard representation objective on NeoDragon's fixed negative prompt.",
+    )
+    parser.add_argument("--cfg-token-delta-weight", type=float, default=0.0)
+    parser.add_argument("--cfg-token-delta-cos-weight", type=float, default=0.0)
+    parser.add_argument("--cfg-pooled-delta-weight", type=float, default=0.0)
+    parser.add_argument("--cfg-pooled-delta-cos-weight", type=float, default=0.0)
+    parser.add_argument("--cfg-functional-weight", type=float, default=0.0)
+    parser.add_argument("--cfg-functional-cos-weight", type=float, default=0.0)
+    parser.add_argument("--cfg-scale", type=float, default=5.0)
     parser.add_argument("--functional-start-step", type=int, default=1)
     parser.add_argument("--functional-ramp-steps", type=int, default=0)
     parser.add_argument("--functional-every", type=int, default=1)
@@ -763,6 +912,13 @@ def main() -> None:
         "relational": args.relational_weight,
         "functional": args.functional_weight,
         "functional cosine": args.functional_cos_weight,
+        "negative representation": args.negative_repr_weight,
+        "CFG token delta": args.cfg_token_delta_weight,
+        "CFG token delta cosine": args.cfg_token_delta_cos_weight,
+        "CFG pooled delta": args.cfg_pooled_delta_weight,
+        "CFG pooled delta cosine": args.cfg_pooled_delta_cos_weight,
+        "CFG functional": args.cfg_functional_weight,
+        "CFG functional cosine": args.cfg_functional_cos_weight,
     }
     invalid_weights = {name: value for name, value in weighted_losses.items() if value < 0.0}
     if invalid_weights:
@@ -771,6 +927,8 @@ def main() -> None:
         raise ValueError("At least one bridge distillation loss weight must be positive.")
     if args.functional_every < 1 or args.functional_batch_size < 1:
         raise ValueError("--functional-every and --functional-batch-size must be >= 1.")
+    if args.cfg_scale <= 1.0:
+        raise ValueError("--cfg-scale must be greater than 1.0 when CFG supervision is configured.")
     if args.steps < 1 or args.log_every < 1 or args.save_every < 1:
         raise ValueError("--steps, --log-every, and --save-every must be >= 1.")
     if args.target_step == 0 or args.target_step < -1:
@@ -880,7 +1038,21 @@ def main() -> None:
     args.target_dit_id = stack["dit_id"]
     functional_dit = None
     functional_scheduler = None
-    functional_enabled = args.functional_weight > 0.0 or args.functional_cos_weight > 0.0
+    cfg_supervision_enabled = bool(
+        args.negative_repr_weight
+        or args.cfg_token_delta_weight
+        or args.cfg_token_delta_cos_weight
+        or args.cfg_pooled_delta_weight
+        or args.cfg_pooled_delta_cos_weight
+        or args.cfg_functional_weight
+        or args.cfg_functional_cos_weight
+    )
+    functional_enabled = bool(
+        args.functional_weight
+        or args.functional_cos_weight
+        or args.cfg_functional_weight
+        or args.cfg_functional_cos_weight
+    )
     if functional_enabled:
         functional_dit, functional_scheduler = load_neodragon_functional_modules(
             cfg,
@@ -897,6 +1069,21 @@ def main() -> None:
             f"units={'0..6' if args.functional_include_first_unit else '1..6'} "
             f"policy={args.functional_unit_policy}",
         )
+    if cfg_supervision_enabled:
+        from neodragon.utils.generation_utils import DEFAULT_NEGATIVE_PROMPT
+
+        negative_prompt = DEFAULT_NEGATIVE_PROMPT
+        rank0_print(
+            ctx,
+            "CFG-aware bridge distillation enabled: "
+            f"negative_repr={args.negative_repr_weight} "
+            f"token_delta={args.cfg_token_delta_weight}/{args.cfg_token_delta_cos_weight} "
+            f"pooled_delta={args.cfg_pooled_delta_weight}/{args.cfg_pooled_delta_cos_weight} "
+            f"functional={args.cfg_functional_weight}/{args.cfg_functional_cos_weight} "
+            f"scale={args.cfg_scale}",
+        )
+    else:
+        negative_prompt = ""
     bridge = MobileOVNeodragonTextBridge(cfg.bridge, device=ctx.device, dtype=frozen_dtype).train()
     if args.trainable_fp32:
         promote_trainable_parameters_to_fp32(bridge)
@@ -1081,6 +1268,57 @@ def main() -> None:
         target_pooled = target_pooled.float()
         target_mask = target_mask.to(device=ctx.device)
 
+        negative_repr_loss = pred_tokens.new_zeros(())
+        cfg_delta_loss = pred_tokens.new_zeros(())
+        target_negative_tokens = target_negative_mask = target_negative_pooled = None
+        pred_negative_tokens = pred_negative_mask = pred_negative_pooled = None
+        if cfg_supervision_enabled:
+            negative_prompts = [negative_prompt] * len(prompts)
+            with torch.no_grad():
+                target_negative_tokens, target_negative_mask, target_negative_pooled = teacher(
+                    negative_prompts, ctx.device
+                )
+                target_negative_tokens = context_adapter(target_negative_tokens)
+            with torch.autocast(
+                device_type=ctx.device.type,
+                dtype=frozen_dtype,
+                enabled=ctx.device.type == "cuda",
+            ):
+                pred_negative_tokens, pred_negative_mask, pred_negative_pooled = bridge_model(
+                    negative_prompts
+                )
+            target_negative_tokens = target_negative_tokens.float()
+            target_negative_pooled = target_negative_pooled.float()
+            target_negative_mask = target_negative_mask.to(device=ctx.device)
+            negative_repr_loss = bridge_representation_objective(
+                pred_tokens=pred_negative_tokens,
+                target_tokens=target_negative_tokens,
+                target_mask=target_negative_mask,
+                pred_pooled=pred_negative_pooled,
+                target_pooled=target_negative_pooled,
+                args=args,
+            )
+            delta_mask = target_mask.bool() | target_negative_mask.bool()
+            pred_token_delta = pred_tokens - pred_negative_tokens
+            target_token_delta = target_tokens - target_negative_tokens
+            pred_pooled_delta = pred_pooled - pred_negative_pooled
+            target_pooled_delta = target_pooled - target_negative_pooled
+            cfg_delta_loss = (
+                args.cfg_token_delta_weight
+                * masked_token_mse(
+                    pred_token_delta,
+                    target_token_delta,
+                    delta_mask,
+                    normalize_tokens=True,
+                )
+                + args.cfg_token_delta_cos_weight
+                * masked_token_cosine(pred_token_delta, target_token_delta, delta_mask)
+                + args.cfg_pooled_delta_weight
+                * F.mse_loss(pred_pooled_delta.float(), target_pooled_delta.float())
+                + args.cfg_pooled_delta_cos_weight
+                * pooled_cosine(pred_pooled_delta, target_pooled_delta)
+            )
+
         raw_token_loss = masked_token_mse(pred_tokens, target_tokens, target_mask)
         normalized_token_loss = masked_token_mse(
             pred_tokens,
@@ -1096,6 +1334,8 @@ def main() -> None:
 
         functional_loss = pred_tokens.new_zeros(())
         functional_cos_loss = pred_tokens.new_zeros(())
+        cfg_functional_loss = pred_tokens.new_zeros(())
+        cfg_functional_cos_loss = pred_tokens.new_zeros(())
         functional_scale = 0.0
         functional_stage = -1
         functional_unit = -1
@@ -1140,6 +1380,40 @@ def main() -> None:
             )[0]
             functional_loss = F.mse_loss(student_prediction.float(), teacher_prediction.float())
             functional_cos_loss = flat_cosine_distance(student_prediction, teacher_prediction)
+            if args.cfg_functional_weight > 0.0 or args.cfg_functional_cos_weight > 0.0:
+                assert target_negative_tokens is not None
+                assert target_negative_mask is not None
+                assert target_negative_pooled is not None
+                assert pred_negative_tokens is not None
+                assert pred_negative_mask is not None
+                assert pred_negative_pooled is not None
+                with torch.no_grad():
+                    teacher_negative_prediction = functional_dit(
+                        sample=[stage_input],
+                        encoder_hidden_states=target_negative_tokens[:effect_bs].to(dtype=frozen_dtype),
+                        encoder_attention_mask=target_negative_mask[:effect_bs],
+                        pooled_projections=target_negative_pooled[:effect_bs].to(dtype=frozen_dtype),
+                        timestep_ratio=timestep,
+                    )[0]
+                student_negative_prediction = functional_dit(
+                    sample=[stage_input],
+                    encoder_hidden_states=pred_negative_tokens[:effect_bs],
+                    encoder_attention_mask=pred_negative_mask[:effect_bs],
+                    pooled_projections=pred_negative_pooled[:effect_bs],
+                    timestep_ratio=timestep,
+                )[0]
+                teacher_cfg_prediction = cfg_combine(
+                    teacher_prediction, teacher_negative_prediction, args.cfg_scale
+                )
+                student_cfg_prediction = cfg_combine(
+                    student_prediction, student_negative_prediction, args.cfg_scale
+                )
+                cfg_functional_loss = F.mse_loss(
+                    student_cfg_prediction.float(), teacher_cfg_prediction.float()
+                )
+                cfg_functional_cos_loss = flat_cosine_distance(
+                    student_cfg_prediction, teacher_cfg_prediction
+                )
 
         loss = (
             args.raw_token_weight * raw_token_loss
@@ -1149,10 +1423,14 @@ def main() -> None:
             + args.pooled_weight * pooled_loss
             + args.pooled_cos_weight * pooled_cos_loss
             + args.relational_weight * relational_loss
+            + args.negative_repr_weight * negative_repr_loss
+            + cfg_delta_loss
             + functional_scale
             * (
                 args.functional_weight * functional_loss
                 + args.functional_cos_weight * functional_cos_loss
+                + args.cfg_functional_weight * cfg_functional_loss
+                + args.cfg_functional_cos_weight * cfg_functional_cos_loss
             )
         )
 
@@ -1191,6 +1469,10 @@ def main() -> None:
                 "mask_accuracy": scalar_mean(mask_accuracy.detach(), ctx),
                 "functional_loss": scalar_mean(functional_loss.detach(), ctx),
                 "functional_cos_loss": scalar_mean(functional_cos_loss.detach(), ctx),
+                "negative_repr_loss": scalar_mean(negative_repr_loss.detach(), ctx),
+                "cfg_delta_loss": scalar_mean(cfg_delta_loss.detach(), ctx),
+                "cfg_functional_loss": scalar_mean(cfg_functional_loss.detach(), ctx),
+                "cfg_functional_cos_loss": scalar_mean(cfg_functional_cos_loss.detach(), ctx),
                 "functional_scale": float(functional_scale),
                 "functional_stage": float(functional_stage),
                 "functional_unit": float(functional_unit),
@@ -1208,6 +1490,7 @@ def main() -> None:
                     pool=f"{item['pooled_loss']:.4f}",
                     cos=f"{item['cos_loss']:.4f}",
                     func=f"{item['functional_loss']:.4f}",
+                    cfg=f"{item['cfg_functional_loss']:.4f}",
                     norm=f"{item['pred_norm']:.1f}/{item['target_norm']:.1f}",
                 )
 
