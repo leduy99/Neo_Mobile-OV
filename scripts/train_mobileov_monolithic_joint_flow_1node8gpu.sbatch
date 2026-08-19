@@ -3,8 +3,8 @@
 # DiT on precomputed OpenVid latents. The bridge is protected at the beginning,
 # then updated with direct and CFG-aware frozen-teacher anchors.
 #
-# Required:
-#   BRIDGE_CKPT=/path/to/neodragon_text_bridge_best.pt sbatch <this-script>
+# Default: use the latest validated monolithic video-units bridge from job
+# 17318011. BRIDGE_CKPT can still override it for a controlled ablation.
 #SBATCH --job-name=neo-mono-joint
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=8
@@ -22,7 +22,8 @@ CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-${CONDA_ENV}/bin/torchrun}"
 CONFIG="${CONFIG:-configs/mobile_ov_neodragon.yaml}"
 MANIFEST="${MANIFEST:-data/openvid_neodragon_2s_latents/latent_manifest.csv}"
-BRIDGE_CKPT="${BRIDGE_CKPT:?Set BRIDGE_CKPT to the CFG-v2 bridge best checkpoint}"
+DEFAULT_BRIDGE_CKPT="output/neo_monolithic_video_units_text_bridge/monolithic_video_units_exp1_functional_17318011/neodragon_text_bridge_latest.pt"
+BRIDGE_CKPT="${BRIDGE_CKPT:-${DEFAULT_BRIDGE_CKPT}}"
 RUN_NAME="${RUN_NAME:-mobileov_monolithic_joint_flow_${SLURM_JOB_ID}}"
 OUT="${OUT:-output/mobileov_monolithic_joint_flow/${RUN_NAME}}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"

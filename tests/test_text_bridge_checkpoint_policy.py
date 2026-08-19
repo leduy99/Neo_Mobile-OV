@@ -180,6 +180,19 @@ def test_joint_monolithic_job_stages_bridge_and_preserves_cfg() -> None:
     assert "--bridge-cfg-functional-weight" in script
     assert "--dit-trainable-fp32" in script
     assert "--bridge-trainable-fp32" in script
+    assert "monolithic_video_units_exp1_functional_17318011" in script
+
+
+def test_monolithic_jobs_are_submitted_independently() -> None:
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "submit_mobileov_monolithic_two_stage.sh"
+    ).read_text(encoding="utf-8")
+
+    assert script.count("sbatch --parsable") == 2
+    assert "--dependency" not in script
+    assert "BRIDGE_CKPT=" not in script
 
 
 def test_single_rank_fsdp_is_not_downgraded_to_no_parallel() -> None:
