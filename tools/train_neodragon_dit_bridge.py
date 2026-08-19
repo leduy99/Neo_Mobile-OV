@@ -29,6 +29,9 @@ from new_mobile_ov.training.neodragon_objectives import (
     bridge_representation_losses,
     flat_cosine_distance,
     masked_mean_pool,
+    masked_token_cosine,
+    masked_token_mse,
+    pooled_cosine,
     relational_cosine,
     scheduled_weight,
     weighted_loss_sum,
@@ -693,6 +696,11 @@ def main() -> None:
     parser.add_argument("--bridge-pooled-weight", type=float, default=0.25)
     parser.add_argument("--bridge-pooled-cos-weight", type=float, default=0.2)
     parser.add_argument("--bridge-relational-weight", type=float, default=0.0)
+    parser.add_argument("--bridge-negative-repr-weight", type=float, default=0.0)
+    parser.add_argument("--bridge-cfg-token-delta-weight", type=float, default=0.0)
+    parser.add_argument("--bridge-cfg-token-delta-cos-weight", type=float, default=0.0)
+    parser.add_argument("--bridge-cfg-pooled-delta-weight", type=float, default=0.0)
+    parser.add_argument("--bridge-cfg-pooled-delta-cos-weight", type=float, default=0.0)
     parser.add_argument("--bridge-functional-weight", type=float, default=0.0)
     parser.add_argument("--bridge-functional-cos-weight", type=float, default=0.0)
     parser.add_argument("--bridge-functional-final-scale", type=float, default=1.0)
@@ -757,6 +765,11 @@ def main() -> None:
         "bridge pooled": args.bridge_pooled_weight,
         "bridge pooled cosine": args.bridge_pooled_cos_weight,
         "bridge relational": args.bridge_relational_weight,
+        "bridge negative representation": args.bridge_negative_repr_weight,
+        "bridge CFG token delta": args.bridge_cfg_token_delta_weight,
+        "bridge CFG token delta cosine": args.bridge_cfg_token_delta_cos_weight,
+        "bridge CFG pooled delta": args.bridge_cfg_pooled_delta_weight,
+        "bridge CFG pooled delta cosine": args.bridge_cfg_pooled_delta_cos_weight,
         "bridge functional": args.bridge_functional_weight,
         "bridge functional cosine": args.bridge_functional_cos_weight,
         "bridge functional final scale": args.bridge_functional_final_scale,
@@ -801,6 +814,11 @@ def main() -> None:
         "bridge representation final": (
             args.bridge_repr_weight if args.bridge_repr_final_weight is None else args.bridge_repr_final_weight
         ),
+        "bridge negative representation": args.bridge_negative_repr_weight,
+        "bridge CFG token delta": args.bridge_cfg_token_delta_weight,
+        "bridge CFG token delta cosine": args.bridge_cfg_token_delta_cos_weight,
+        "bridge CFG pooled delta": args.bridge_cfg_pooled_delta_weight,
+        "bridge CFG pooled delta cosine": args.bridge_cfg_pooled_delta_cos_weight,
         "bridge functional": args.bridge_functional_weight,
         "bridge functional cosine": args.bridge_functional_cos_weight,
         "CFG cross distill": args.cfg_distill_weight,
@@ -1160,6 +1178,11 @@ def main() -> None:
         cfg_distill_cos_loss = pred.new_zeros(())
         bridge_cfg_functional_loss = pred.new_zeros(())
         bridge_cfg_functional_cos_loss = pred.new_zeros(())
+        bridge_negative_repr_loss = pred.new_zeros(())
+        bridge_cfg_token_delta_loss = pred.new_zeros(())
+        bridge_cfg_token_delta_cos_loss = pred.new_zeros(())
+        bridge_cfg_pooled_delta_loss = pred.new_zeros(())
+        bridge_cfg_pooled_delta_cos_loss = pred.new_zeros(())
         cfg_frequency_scale = 0.0
         teacher_tokens = None
         teacher_mask = None
@@ -1262,6 +1285,11 @@ def main() -> None:
                     or args.cfg_distill_cos_weight > 0.0
                     or args.bridge_cfg_functional_weight > 0.0
                     or args.bridge_cfg_functional_cos_weight > 0.0
+                    or args.bridge_negative_repr_weight > 0.0
+                    or args.bridge_cfg_token_delta_weight > 0.0
+                    or args.bridge_cfg_token_delta_cos_weight > 0.0
+                    or args.bridge_cfg_pooled_delta_weight > 0.0
+                    or args.bridge_cfg_pooled_delta_cos_weight > 0.0
                 )
                 and (step - 1) % args.cfg_every == 0
             )
@@ -1299,6 +1327,58 @@ def main() -> None:
                         teacher_pred,
                         teacher_negative_pred,
                         args.cfg_scale,
+                    )
+
+                if bridge_active and args.bridge_negative_repr_weight > 0.0:
+                    bridge_negative_repr_losses = bridge_representation_losses(
+                        bridge_negative_tokens,
+                        teacher_negative_tokens,
+                        teacher_negative_mask,
+                        bridge_negative_pooled,
+                        teacher_negative_pooled,
+                    )
+                    bridge_negative_repr_loss = weighted_loss_sum(
+                        bridge_negative_repr_losses,
+                        {
+                            "raw_token": args.bridge_raw_token_weight,
+                            "normalized_token": args.bridge_normalized_token_weight,
+                            "token_cosine": args.bridge_cos_weight,
+                            "token_norm": args.bridge_token_norm_weight,
+                            "pooled_mse": args.bridge_pooled_weight,
+                            "pooled_cosine": args.bridge_pooled_cos_weight,
+                            "relational": args.bridge_relational_weight,
+                        },
+                    )
+
+                if bridge_active and (
+                    args.bridge_cfg_token_delta_weight > 0.0
+                    or args.bridge_cfg_token_delta_cos_weight > 0.0
+                    or args.bridge_cfg_pooled_delta_weight > 0.0
+                    or args.bridge_cfg_pooled_delta_cos_weight > 0.0
+                ):
+                    delta_mask = teacher_mask.bool() | teacher_negative_mask.bool()
+                    bridge_token_delta = bridge_tokens - bridge_negative_tokens
+                    teacher_token_delta = teacher_tokens - teacher_negative_tokens
+                    bridge_pooled_delta = pooled - bridge_negative_pooled
+                    teacher_pooled_delta = teacher_pooled - teacher_negative_pooled
+                    bridge_cfg_token_delta_loss = masked_token_mse(
+                        bridge_token_delta,
+                        teacher_token_delta,
+                        delta_mask,
+                        normalize_tokens=True,
+                    )
+                    bridge_cfg_token_delta_cos_loss = masked_token_cosine(
+                        bridge_token_delta,
+                        teacher_token_delta,
+                        delta_mask,
+                    )
+                    bridge_cfg_pooled_delta_loss = F.mse_loss(
+                        bridge_pooled_delta.float(),
+                        teacher_pooled_delta.float(),
+                    )
+                    bridge_cfg_pooled_delta_cos_loss = pooled_cosine(
+                        bridge_pooled_delta,
+                        teacher_pooled_delta,
                     )
 
                 if args.cfg_distill_weight > 0.0 or args.cfg_distill_cos_weight > 0.0:
@@ -1370,6 +1450,11 @@ def main() -> None:
                 + args.cfg_distill_cos_weight * cfg_distill_cos_loss
                 + args.bridge_cfg_functional_weight * bridge_cfg_functional_loss
                 + args.bridge_cfg_functional_cos_weight * bridge_cfg_functional_cos_loss
+                + args.bridge_negative_repr_weight * bridge_negative_repr_loss
+                + args.bridge_cfg_token_delta_weight * bridge_cfg_token_delta_loss
+                + args.bridge_cfg_token_delta_cos_weight * bridge_cfg_token_delta_cos_loss
+                + args.bridge_cfg_pooled_delta_weight * bridge_cfg_pooled_delta_loss
+                + args.bridge_cfg_pooled_delta_cos_weight * bridge_cfg_pooled_delta_cos_loss
             )
         )
 
@@ -1473,6 +1558,17 @@ def main() -> None:
                     "bridge_cfg_functional_cos_loss": scalar_mean(
                         bridge_cfg_functional_cos_loss.detach(), ctx
                     ),
+                    "bridge_negative_repr_loss": scalar_mean(bridge_negative_repr_loss.detach(), ctx),
+                    "bridge_cfg_token_delta_loss": scalar_mean(bridge_cfg_token_delta_loss.detach(), ctx),
+                    "bridge_cfg_token_delta_cos_loss": scalar_mean(
+                        bridge_cfg_token_delta_cos_loss.detach(), ctx
+                    ),
+                    "bridge_cfg_pooled_delta_loss": scalar_mean(
+                        bridge_cfg_pooled_delta_loss.detach(), ctx
+                    ),
+                    "bridge_cfg_pooled_delta_cos_loss": scalar_mean(
+                        bridge_cfg_pooled_delta_cos_loss.detach(), ctx
+                    ),
                     "cfg_frequency_scale": float(cfg_frequency_scale),
                     "bridge_active": float(bridge_active),
                     "bridge_lr_scale": float(bridge_lr_scale * lr_cooldown_scale),
@@ -1547,6 +1643,15 @@ def main() -> None:
                         "frozen_teacher_bridge_cfg_functional_distillation": bool(
                             args.bridge_cfg_functional_weight
                             or args.bridge_cfg_functional_cos_weight
+                        ),
+                        "bridge_negative_representation_distillation": bool(
+                            args.bridge_negative_repr_weight
+                        ),
+                        "bridge_cfg_embedding_delta_distillation": bool(
+                            args.bridge_cfg_token_delta_weight
+                            or args.bridge_cfg_token_delta_cos_weight
+                            or args.bridge_cfg_pooled_delta_weight
+                            or args.bridge_cfg_pooled_delta_cos_weight
                         ),
                         "cfg_scale": float(args.cfg_scale),
                         "bridge_start_step": int(args.bridge_start_step),
