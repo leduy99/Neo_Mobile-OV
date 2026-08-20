@@ -36,6 +36,11 @@ from new_mobile_ov.training.neodragon_objectives import (
     scheduled_weight,
     weighted_loss_sum,
 )
+from new_mobile_ov.training.neodragon_pyramid_flow import (
+    build_pyramid_flow_state,
+    corrupt_history,
+    stage_from_ratio_slot,
+)
 from new_mobile_ov.training.distributed import (
     barrier,
     build_deepspeed_config,
@@ -638,6 +643,11 @@ def main() -> None:
         default="",
         help="Optional aligned bridge checkpoint. Empty means random bridge initialization.",
     )
+    parser.add_argument(
+        "--init-joint-ckpt",
+        default="",
+        help="Optional prior joint checkpoint whose DiT and bridge states initialize this phase.",
+    )
     parser.add_argument("--output-dir", default="output/neodragon_dit_bridge_train")
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -679,6 +689,26 @@ def main() -> None:
     parser.add_argument("--flow-start-weight", type=float, default=None)
     parser.add_argument("--flow-weight", type=float, default=1.0)
     parser.add_argument("--flow-final-weight", type=float, default=None)
+    parser.add_argument(
+        "--flow-contract",
+        choices=("legacy", "pyramid"),
+        default="legacy",
+        help=(
+            "legacy reproduces the former noise-to-clean objective at every stage; "
+            "pyramid uses NeoDragon/Pyramidal-Flow stage endpoints and correlated noise."
+        ),
+    )
+    parser.add_argument(
+        "--history-corrupt-max",
+        type=float,
+        default=0.0,
+        help="Maximum uniform Gaussian corruption applied to causal history for pyramid training.",
+    )
+    parser.add_argument(
+        "--stage-sampling-ratio",
+        default="1,1,1",
+        help="Positive integer sampling ratio for low/mid/high Pyramidal-Flow stages.",
+    )
     parser.add_argument("--flow-ramp-steps", type=int, default=0)
     parser.add_argument("--cooldown-steps", type=int, default=0)
     parser.add_argument("--dit-warmup-steps", type=int, default=0)
@@ -801,10 +831,22 @@ def main() -> None:
         raise ValueError("--cfg-every must be >= 1 and --cfg-scale must be greater than 1.")
     if args.archive_every < 0:
         raise ValueError("--archive-every must be non-negative.")
+    if not 0.0 <= args.history_corrupt_max <= 1.0:
+        raise ValueError("--history-corrupt-max must be between 0 and 1.")
+    if args.flow_contract == "legacy" and args.history_corrupt_max > 0.0:
+        raise ValueError("History corruption is only supported with --flow-contract pyramid.")
+    try:
+        stage_sampling_ratio = tuple(int(value) for value in args.stage_sampling_ratio.split(","))
+    except ValueError as exc:
+        raise ValueError("--stage-sampling-ratio must contain comma-separated integers.") from exc
+    if len(stage_sampling_ratio) != 3 or any(value <= 0 for value in stage_sampling_ratio):
+        raise ValueError("--stage-sampling-ratio must contain three positive integers.")
     if args.train_bridge and args.parallel == "deepspeed":
         raise ValueError("Joint bridge + DiT training requires --parallel fsdp or ddp, not deepspeed.")
-    if not args.bridge_ckpt and not args.train_bridge:
+    if not args.bridge_ckpt and not args.init_joint_ckpt and not args.train_bridge:
         raise ValueError("Random bridge initialization requires --train-bridge.")
+    if args.init_joint_ckpt and not Path(args.init_joint_ckpt).is_file():
+        raise FileNotFoundError(f"Joint initialization checkpoint not found: {args.init_joint_ckpt}")
     teacher_weights = {
         "cross distill": args.distill_weight,
         "cross distill cosine": args.distill_cos_weight,
@@ -842,7 +884,8 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+        torch.cuda.manual_seed(args.seed)
+    rank0_print(ctx, "Random generators initialized.")
 
     cfg = load_config(args.config)
     if args.dtype:
@@ -855,6 +898,7 @@ def main() -> None:
     if ctx.is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
     barrier()
+    rank0_print(ctx, "Configuration and output directory ready.")
 
     caption_columns = [x.strip() for x in args.caption_variant_columns.split(",") if x.strip()]
     caption_weights = [float(x.strip()) for x in args.caption_variant_weights.split(",") if x.strip()]
@@ -890,6 +934,7 @@ def main() -> None:
         ),
     )
     batches = cycle_loader(loader, sampler)
+    rank0_print(ctx, "Training manifest and data loader ready.")
 
     rank0_print(
         ctx,
@@ -897,6 +942,7 @@ def main() -> None:
         f"batch_per_gpu={args.batch_size} samples={len(dataset)} dtype={dtype} "
         f"data_mode={'precomputed_latents' if use_precomputed_latents else 'online_vae'}",
     )
+    rank0_print(ctx, f"Loading released NeoDragon {args.target_stack} student stack...")
     dit, vae, scheduler, prompt_modifier = load_neodragon_train_modules(
         cfg,
         ctx.device,
@@ -904,6 +950,8 @@ def main() -> None:
         target_stack=args.target_stack,
         load_vae=not use_precomputed_latents,
     )
+    rank0_print(ctx, "Released NeoDragon student stack ready.")
+    rank0_print(ctx, "Loading Mobile-OV text bridge...")
     bridge = load_bridge(
         cfg,
         args.bridge_ckpt or None,
@@ -912,6 +960,18 @@ def main() -> None:
         target_stack=args.target_stack,
         trainable=args.train_bridge,
     )
+    rank0_print(ctx, "Mobile-OV text bridge ready.")
+    if args.init_joint_ckpt:
+        joint_payload = torch.load(args.init_joint_ckpt, map_location="cpu", weights_only=False)
+        if not isinstance(joint_payload, dict):
+            raise ValueError("--init-joint-ckpt must contain a checkpoint dictionary.")
+        dit_state = joint_payload.get("dit")
+        bridge_state = joint_payload.get("bridge")
+        if not isinstance(dit_state, dict) or not isinstance(bridge_state, dict):
+            raise ValueError("--init-joint-ckpt must contain both 'dit' and 'bridge' state dictionaries.")
+        dit.load_state_dict(dit_state, strict=True)
+        bridge.load_state_dict(bridge_state, strict=True)
+        rank0_print(ctx, f"Initialized DiT and bridge from {args.init_joint_ckpt}")
     freeze_dit_for_last_n_blocks(dit, args.train_last_n_blocks)
     if args.dit_trainable_fp32:
         promote_trainable_parameters_to_fp32(dit)
@@ -1017,7 +1077,7 @@ def main() -> None:
     np.random.seed(rank_seed)
     torch.manual_seed(rank_seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(rank_seed)
+        torch.cuda.manual_seed(rank_seed)
     sample_generator = torch.Generator(device=ctx.device)
     sample_generator.manual_seed(rank_seed + 100_000)
 
@@ -1028,7 +1088,11 @@ def main() -> None:
     )
 
     history: list[dict[str, float]] = []
-    bridge_initialization = "checkpoint" if args.bridge_ckpt else "random"
+    bridge_initialization = (
+        "joint_checkpoint"
+        if args.init_joint_ckpt
+        else ("checkpoint" if args.bridge_ckpt else "random")
+    )
     rank0_print(
         ctx,
         f"Objective mode={args.objective_mode} bridge_initialization={bridge_initialization} seed={args.seed}",
@@ -1110,15 +1174,21 @@ def main() -> None:
         unit_index = int(
             torch.randint(1, latent_t, (1,), device=ctx.device, generator=sample_generator).item()
         )
-        stage = int(
-            torch.randint(
-                0,
-                scheduler.config.stages,
-                (1,),
-                device=ctx.device,
-                generator=sample_generator,
-            ).item()
-        )
+        if args.flow_contract == "pyramid":
+            stage = stage_from_ratio_slot(
+                (step - 1) * ctx.world_size + ctx.rank,
+                stage_sampling_ratio,
+            )
+        else:
+            stage = int(
+                torch.randint(
+                    0,
+                    scheduler.config.stages,
+                    (1,),
+                    device=ctx.device,
+                    generator=sample_generator,
+                ).item()
+            )
         past_units = [latents[:, :, i : i + 1] for i in range(unit_index)]
         past_conditions = _prepare_past_condition_latents(
             past_units,
@@ -1126,28 +1196,63 @@ def main() -> None:
             do_classifier_free_guidance=False,
         )
         clean_full = latents[:, :, unit_index : unit_index + 1]
-        clean_stage = _get_pyramid_latent(clean_full, scheduler.config.stages)[stage].to(dtype=dtype)
-        noise = torch.randn(
-            clean_stage.shape,
-            device=clean_stage.device,
-            dtype=clean_stage.dtype,
-            generator=sample_generator,
-        )
         t_idx = torch.randint(
             0,
             scheduler.config.num_train_timesteps,
-            (clean_stage.shape[0],),
+            (clean_full.shape[0],),
             device=ctx.device,
             generator=sample_generator,
         )
         sigmas = scheduler.sigmas_per_stage[stage].to(device=ctx.device, dtype=dtype)[t_idx]
         timestep = scheduler.timesteps_per_stage[stage].to(device=ctx.device, dtype=dtype)[t_idx]
-        while sigmas.dim() < clean_stage.dim():
-            sigmas = sigmas.view(-1, *([1] * (clean_stage.dim() - 1)))
-        noisy = sigmas * noise + (1.0 - sigmas) * clean_stage
-        target_flow = noise - clean_stage
+        if args.flow_contract == "pyramid":
+            noise_high = torch.randn(
+                clean_full.shape,
+                device=clean_full.device,
+                dtype=clean_full.dtype,
+                generator=sample_generator,
+            )
+            flow_state = build_pyramid_flow_state(
+                clean_full,
+                stage=stage,
+                local_sigma=sigmas,
+                start_sigma=scheduler.start_sigmas[stage],
+                end_sigma=scheduler.end_sigmas[stage],
+                noise_high=noise_high,
+                stages=scheduler.config.stages,
+            )
+            noisy = flow_state.noisy
+            target_flow = flow_state.target
+        else:
+            clean_stage = _get_pyramid_latent(clean_full, scheduler.config.stages)[stage].to(dtype=dtype)
+            noise = torch.randn(
+                clean_stage.shape,
+                device=clean_stage.device,
+                dtype=clean_stage.dtype,
+                generator=sample_generator,
+            )
+            sigma_view = sigmas.view(-1, *([1] * (clean_stage.dim() - 1)))
+            noisy = sigma_view * noise + (1.0 - sigma_view) * clean_stage
+            target_flow = noise - clean_stage
 
-        stage_input = past_conditions[stage] + [noisy]
+        history_corrupt_sigma = torch.zeros(clean_full.shape[0], device=ctx.device, dtype=dtype)
+        selected_history = past_conditions[stage]
+        if args.flow_contract == "pyramid" and args.history_corrupt_max > 0.0:
+            history_corrupt_sigma = (
+                torch.rand(
+                    clean_full.shape[0],
+                    device=ctx.device,
+                    generator=sample_generator,
+                ).to(dtype=dtype)
+                * args.history_corrupt_max
+            )
+            selected_history = corrupt_history(
+                selected_history,
+                sigma=history_corrupt_sigma,
+                generator=sample_generator,
+            )
+
+        stage_input = selected_history + [noisy]
         with autocast_trainable(ctx.device, dtype):
             pred = dit_model(
                 sample=[stage_input],
@@ -1582,6 +1687,7 @@ def main() -> None:
                     "dit_lr_scale": float(warmup_scale * lr_cooldown_scale),
                     "unit_index": float(unit_index),
                     "stage": float(stage),
+                    "history_corrupt_sigma": scalar_mean(history_corrupt_sigma, ctx),
                     "latent_t": float(latent_t),
                     "trainable_params": float(trainable_count),
                     "trainable_bridge_params": float(bridge_trainable_count),
@@ -1621,6 +1727,7 @@ def main() -> None:
                     "dit": state,
                     "bridge": bridge_state,
                     "bridge_ckpt": args.bridge_ckpt or None,
+                    "init_joint_ckpt": args.init_joint_ckpt or None,
                     "bridge_initialization": bridge_initialization,
                     "config": cfg,
                     "args": vars(args),
@@ -1628,6 +1735,11 @@ def main() -> None:
                     "objective": {
                         "mode": args.objective_mode,
                         "flow_matching": True,
+                        "flow_contract": args.flow_contract,
+                        "stage_sampling_ratio": (
+                            list(stage_sampling_ratio) if args.flow_contract == "pyramid" else None
+                        ),
+                        "history_corrupt_max": float(args.history_corrupt_max),
                         "teacher_cross_distillation": bool(args.distill_weight or args.distill_cos_weight),
                         "teacher_condition_preservation": bool(
                             args.preservation_weight or args.preservation_cos_weight
