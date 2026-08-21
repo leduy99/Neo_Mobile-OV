@@ -29,10 +29,23 @@ MAX_SAMPLES="${MAX_SAMPLES:--1}"
 STEPS="${STEPS:-1000}"
 
 cd "${ROOT}"
-test -s "${MANIFEST}"
-test -s "${BRIDGE_CKPT}"
-test -s "${INIT_JOINT_CKPT}"
-test -x "${TORCHRUN_BIN}"
+
+require_file() {
+  local label="$1"
+  local path="$2"
+  if [[ ! -s "${path}" ]]; then
+    echo "ERROR: ${label} is missing or empty: ${path}" >&2
+    exit 1
+  fi
+}
+
+require_file "training manifest" "${MANIFEST}"
+require_file "frozen bridge checkpoint" "${BRIDGE_CKPT}"
+require_file "initial joint checkpoint" "${INIT_JOINT_CKPT}"
+if [[ ! -x "${TORCHRUN_BIN}" ]]; then
+  echo "ERROR: torchrun is missing or not executable: ${TORCHRUN_BIN}" >&2
+  exit 1
+fi
 mkdir -p logs "${OUT}"
 
 export PATH="${CONDA_ENV}/bin:${PATH}"
