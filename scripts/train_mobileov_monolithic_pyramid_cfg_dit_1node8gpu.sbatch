@@ -20,7 +20,7 @@ TORCHRUN_BIN="${TORCHRUN_BIN:-${CONDA_ENV}/bin/torchrun}"
 CONFIG="${CONFIG:-configs/mobile_ov_neodragon.yaml}"
 MANIFEST="${MANIFEST:-data/openvid_neodragon_2s_latents/latent_manifest.csv}"
 BRIDGE_CKPT="${BRIDGE_CKPT:-output/neo_monolithic_cfg_bridge_v2/monolithic_cfg_bridge_v2_17327720/neodragon_text_bridge_latest.pt}"
-INIT_JOINT_CKPT="${INIT_JOINT_CKPT:-output/mobileov_monolithic_pyramid_recipe/mobileov_monolithic_pyramid_17344858/phase1/neodragon_dit_bridge_step000300.pt}"
+INIT_JOINT_CKPT="${INIT_JOINT_CKPT:-}"
 RUN_NAME="${RUN_NAME:-mobileov_monolithic_pyramid_cfg_dit_${SLURM_JOB_ID}}"
 OUT="${OUT:-output/mobileov_monolithic_pyramid_cfg_dit/${RUN_NAME}}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
@@ -41,7 +41,11 @@ require_file() {
 
 require_file "training manifest" "${MANIFEST}"
 require_file "frozen bridge checkpoint" "${BRIDGE_CKPT}"
-require_file "initial joint checkpoint" "${INIT_JOINT_CKPT}"
+INIT_ARGS=()
+if [[ -n "${INIT_JOINT_CKPT}" ]]; then
+  require_file "initial joint checkpoint" "${INIT_JOINT_CKPT}"
+  INIT_ARGS=(--init-joint-ckpt "${INIT_JOINT_CKPT}")
+fi
 if [[ ! -x "${TORCHRUN_BIN}" ]]; then
   echo "ERROR: torchrun is missing or not executable: ${TORCHRUN_BIN}" >&2
   exit 1
@@ -65,7 +69,11 @@ export TORCH_DIST_TIMEOUT_MINUTES="${TORCH_DIST_TIMEOUT_MINUTES:-90}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 echo "NeoDragon fixed-bridge Pyramidal-Flow + CFG response refinement"
-echo "INIT_JOINT_CKPT=${INIT_JOINT_CKPT}"
+if [[ -n "${INIT_JOINT_CKPT}" ]]; then
+  echo "Initialization: continuation from ${INIT_JOINT_CKPT}"
+else
+  echo "Initialization: clean released NeoDragon multistep DiT + independent frozen bridge"
+fi
 echo "BRIDGE_CKPT=${BRIDGE_CKPT} MANIFEST=${MANIFEST} OUT=${OUT}"
 echo "Contract: bridge frozen, external anchor, video units 1..6, CFG scale=${CFG_SCALE:-5.0}"
 echo "world_size=${NPROC_PER_NODE} batch_per_gpu=${BATCH_SIZE} global_batch=$((NPROC_PER_NODE * BATCH_SIZE)) steps=${STEPS}"
@@ -77,7 +85,7 @@ nvidia-smi || true
   --target-stack multistep \
   --manifest "${MANIFEST}" \
   --bridge-ckpt "${BRIDGE_CKPT}" \
-  --init-joint-ckpt "${INIT_JOINT_CKPT}" \
+  "${INIT_ARGS[@]}" \
   --output-dir "${OUT}" \
   --steps "${STEPS}" \
   --batch-size "${BATCH_SIZE}" \
