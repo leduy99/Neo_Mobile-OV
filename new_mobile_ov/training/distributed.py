@@ -92,7 +92,10 @@ def reduce_mean(value: torch.Tensor, ctx: DistributedContext) -> torch.Tensor:
 
 
 def scalar_mean(value: torch.Tensor, ctx: DistributedContext) -> float:
-    return float(reduce_mean(value.float(), ctx).detach().cpu())
+    if value.numel() == 0:
+        raise ValueError("Cannot reduce an empty tensor to a scalar mean.")
+    local_mean = value.float().mean()
+    return float(reduce_mean(local_mean, ctx).detach().cpu())
 
 
 def build_deepspeed_config(

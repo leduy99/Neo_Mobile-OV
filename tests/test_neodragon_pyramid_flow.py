@@ -1,5 +1,7 @@
+import pytest
 import torch
 
+from new_mobile_ov.training.distributed import DistributedContext, scalar_mean
 from new_mobile_ov.training.neodragon_pyramid_flow import (
     build_pyramid_flow_state,
     correlated_pyramid_noise,
@@ -65,3 +67,8 @@ def test_stage_ratio_slots_are_configurable():
         1,
         2,
     ]
+
+
+def test_scalar_mean_accepts_per_sample_metrics():
+    ctx = DistributedContext(rank=0, local_rank=0, world_size=1, device=torch.device("cpu"))
+    assert scalar_mean(torch.tensor([0.2, 0.4]), ctx) == pytest.approx(0.3)
