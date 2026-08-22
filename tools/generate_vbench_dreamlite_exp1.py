@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 from decord import VideoReader
 from diffusers.utils import export_to_video
 from PIL import Image
@@ -27,6 +28,36 @@ from new_mobile_ov.checkpoints import ensure_neodragon_assets  # noqa: E402
 from new_mobile_ov.config import load_config  # noqa: E402
 from new_mobile_ov.generation import build_generation_backend  # noqa: E402
 from new_mobile_ov.generation.backends import DreamLiteMobileBackend  # noqa: E402
+
+
+class _PrecomputedCFGTextEncoder(nn.Module):
+    """Serve bridge positive/negative tensors through NeoDragon's text API."""
+
+    def __init__(
+        self,
+        positive: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        negative: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        negative_prompt: str,
+    ):
+        super().__init__()
+        self.negative_prompt = negative_prompt
+        for prefix, values in (("positive", positive), ("negative", negative)):
+            self.register_buffer(f"{prefix}_tokens", values[0].detach(), persistent=False)
+            self.register_buffer(f"{prefix}_mask", values[1].detach(), persistent=False)
+            self.register_buffer(f"{prefix}_pooled", values[2].detach(), persistent=False)
+
+    def forward(self, input_prompts, device: torch.device):
+        prompts = [input_prompts] if isinstance(input_prompts, str) else list(input_prompts)
+        prefix = (
+            "negative"
+            if prompts and all(str(prompt) == self.negative_prompt for prompt in prompts)
+            else "positive"
+        )
+        return (
+            getattr(self, f"{prefix}_tokens").to(device),
+            getattr(self, f"{prefix}_mask").to(device),
+            getattr(self, f"{prefix}_pooled").to(device),
+        )
 
 
 def normalize_prompt(value: str) -> str:
@@ -298,7 +329,11 @@ def generate_videos(
     )
 
     install_neodragon_generation_patches()
-    from neodragon.utils.generation_utils import DEFAULT_PROMPT_MODIFIER
+    from neodragon.utils.generation_utils import (
+        DEFAULT_NEGATIVE_PROMPT,
+        DEFAULT_PROMPT_MODIFIER,
+        generate as generate_neodragon,
+    )
 
     joint_checkpoint = (
         None
@@ -354,8 +389,6 @@ def generate_videos(
 
     negative_condition = None
     if joint_checkpoint is not None:
-        from neodragon.utils.generation_utils import DEFAULT_NEGATIVE_PROMPT
-
         negative_condition = bridge.encode([DEFAULT_NEGATIVE_PROMPT])
     quicksr_model = None
     quicksr_summary: dict[str, object] = {"enabled": bool(args.with_quicksr)}
@@ -407,24 +440,43 @@ def generate_videos(
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
         with torch.autocast("cuda", dtype=dtype):
-            negative_kwargs = {}
             if negative_condition is not None:
-                negative_kwargs = {
-                    "negative_prompt_embeds": negative_condition[0],
-                    "negative_prompt_mask": negative_condition[1],
-                    "negative_pooled_prompt_embeds": negative_condition[2],
-                }
-            frames = backend.generate_video_from_bridge_condition(
-                prompt,
-                prompt_embeds=prompt_embeds,
-                prompt_mask=prompt_mask,
-                pooled_prompt_embeds=pooled,
-                first_frame=first_frame,
-                height=args.video_height,
-                width=args.video_width,
-                num_frames=args.num_frames,
-                **negative_kwargs,
-            )
+                text_encoder = _PrecomputedCFGTextEncoder(
+                    (prompt_embeds, prompt_mask, pooled),
+                    negative_condition,
+                    DEFAULT_NEGATIVE_PROMPT,
+                ).to(device)
+                frames = generate_neodragon(
+                    text_encoder_bundle=text_encoder,
+                    dit=backend.pipeline.dit,
+                    context_adapter=nn.Identity(),
+                    vae=backend.pipeline.vae,
+                    scheduler=backend.pipeline.scheduler,
+                    prompt=prompt,
+                    image=first_frame,
+                    height=args.video_height,
+                    width=args.video_width,
+                    num_frames=args.num_frames,
+                    prompt_modifier=DEFAULT_PROMPT_MODIFIER,
+                    negative_prompt=DEFAULT_NEGATIVE_PROMPT,
+                    frames_per_unit=backend.pipeline.config.frames_per_unit,
+                    num_stages=len(backend.pipeline.config.stages),
+                    output_type="pil",
+                    device=device,
+                    dtype=dtype,
+                    **backend.pipeline.config.gen_confs["monolithic"],
+                )
+            else:
+                frames = backend.generate_video_from_bridge_condition(
+                    prompt,
+                    prompt_embeds=prompt_embeds,
+                    prompt_mask=prompt_mask,
+                    pooled_prompt_embeds=pooled,
+                    first_frame=first_frame,
+                    height=args.video_height,
+                    width=args.video_width,
+                    num_frames=args.num_frames,
+                )
         if quicksr_model is not None:
             frames_array = np.stack([np.asarray(frame.convert("RGB")) for frame in frames])
             # Keep QuickSR's requested precision instead of inheriting the BF16 DiT autocast.
