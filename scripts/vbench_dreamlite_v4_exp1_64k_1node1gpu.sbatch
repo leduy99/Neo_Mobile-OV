@@ -46,6 +46,7 @@ VIDEO_HF_FILE="${VIDEO_HF_FILE:-neo_exp1_bridge_functional/17108893/neodragon_te
 VIDEO_JOINT_CHECKPOINT="${VIDEO_JOINT_CHECKPOINT:-0}"
 IMAGE_EXPECTED_STEP="${IMAGE_EXPECTED_STEP:-}"
 VIDEO_EXPECTED_STEP="${VIDEO_EXPECTED_STEP:-}"
+IMAGE_CONDITION="${IMAGE_CONDITION:-bridge}"
 HF_REPO="${HF_REPO:-Amshaker/Mobile-OV}"
 MAX_PROMPTS="${MAX_PROMPTS:-0}"
 SAMPLES_PER_PROMPT="${SAMPLES_PER_PROMPT:-1}"
@@ -120,7 +121,12 @@ if actual != expected:
 PY
   fi
 }
-download_checkpoint "${IMAGE_CKPT}" "${IMAGE_HF_FILE}" "${IMAGE_EXPECTED_STEP}"
+if [[ "${IMAGE_CONDITION}" == "bridge" ]]; then
+  download_checkpoint "${IMAGE_CKPT}" "${IMAGE_HF_FILE}" "${IMAGE_EXPECTED_STEP}"
+elif [[ "${IMAGE_CONDITION}" != "native_qwen" ]]; then
+  echo "IMAGE_CONDITION must be bridge or native_qwen; got ${IMAGE_CONDITION}" >&2
+  exit 2
+fi
 download_checkpoint "${VIDEO_CKPT}" "${VIDEO_HF_FILE}" "${VIDEO_EXPECTED_STEP}"
 "${PYTHON_BIN}" tools/prepare_checkpoints.py --config "${IMAGE_CONFIG}"
 
@@ -136,7 +142,7 @@ test -f "${VBENCH_INFO}"
 echo "RUN_ROOT=${RUN_ROOT} MAX_PROMPTS=${MAX_PROMPTS} SAMPLES_PER_PROMPT=${SAMPLES_PER_PROMPT}"
 echo "RECAPTION_FILE=${RECAPTION_FILE:-<raw VBench prompts>}"
 echo "IMAGE_CONFIG=${IMAGE_CONFIG}"
-echo "IMAGE_CKPT=${IMAGE_CKPT}"
+echo "IMAGE_CONDITION=${IMAGE_CONDITION} IMAGE_CKPT=${IMAGE_CKPT:-<native Qwen3-VL>}"
 echo "VIDEO_CKPT=${VIDEO_CKPT}"
 echo "VIDEO_JOINT_CHECKPOINT=${VIDEO_JOINT_CHECKPOINT}"
 echo "WITH_QUICKSR=${WITH_QUICKSR} variant=${QUICKSR_VARIANT} scale=${QUICKSR_SCALE} dtype=${QUICKSR_DTYPE} batch_frames=${QUICKSR_BATCH_FRAMES}"
@@ -168,11 +174,16 @@ if [[ "${VIDEO_JOINT_CHECKPOINT}" == "1" ]]; then
   VIDEO_MODEL_ARGS=(--joint-video-checkpoint "${VIDEO_CKPT}")
 fi
 
+IMAGE_MODEL_ARGS=(--image-condition "${IMAGE_CONDITION}")
+if [[ "${IMAGE_CONDITION}" == "bridge" ]]; then
+  IMAGE_MODEL_ARGS+=(--image-bridge-checkpoint "${IMAGE_CKPT}")
+fi
+
 "${PYTHON_BIN}" tools/generate_vbench_dreamlite_exp1.py \
   --vbench-info "${VBENCH_INFO}" \
   "${RECAPTION_ARGS[@]}" \
   --image-config "${IMAGE_CONFIG}" \
-  --image-bridge-checkpoint "${IMAGE_CKPT}" \
+  "${IMAGE_MODEL_ARGS[@]}" \
   "${VIDEO_MODEL_ARGS[@]}" \
   --anchor-dir "${ANCHOR_DIR}" \
   --video-dir "${VIDEO_DIR}" \

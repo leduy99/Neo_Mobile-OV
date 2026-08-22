@@ -28,6 +28,9 @@ from new_mobile_ov.checkpoints import ensure_neodragon_assets  # noqa: E402
 from new_mobile_ov.config import load_config  # noqa: E402
 from new_mobile_ov.generation import build_generation_backend  # noqa: E402
 from new_mobile_ov.generation.backends import DreamLiteMobileBackend  # noqa: E402
+from new_mobile_ov.training.dreamlite_distillation import (  # noqa: E402
+    DreamLiteFrozenQwenTeacher,
+)
 
 
 class _PrecomputedCFGTextEncoder(nn.Module):
@@ -230,21 +233,36 @@ def generate_anchors(
         return {"generated": 0, "reused": total}
 
     config = load_config(args.image_config)
-    state, checkpoint_step = load_bridge_state(Path(args.image_bridge_checkpoint))
-    bridge = MobileOVDreamLiteImageBridge(
-        config.bridge,
-        config.dreamlite_bridge,
-        device=device,
-        dtype=dtype,
-    ).eval()
-    bridge.load_trainable_state_dict(state)
+    checkpoint_step = None
+    if args.image_condition == "bridge":
+        state, checkpoint_step = load_bridge_state(Path(args.image_bridge_checkpoint))
+        condition_encoder = MobileOVDreamLiteImageBridge(
+            config.bridge,
+            config.dreamlite_bridge,
+            device=device,
+            dtype=dtype,
+        ).eval()
+        condition_encoder.load_trainable_state_dict(state)
+        del state
+    else:
+        condition_encoder = DreamLiteFrozenQwenTeacher(
+            config.dreamlite,
+            device=device,
+            dtype=dtype,
+        )
     backend = DreamLiteMobileBackend(config.dreamlite, device=device, dtype=dtype, load_vae=True)
-    del state
     generated = 0
     started = time.perf_counter()
     with torch.autocast("cuda", dtype=dtype):
         for prompt_index, prompt, sample_index in missing:
-            condition = bridge([conditioning_prompts[prompt_index]], mode="generate")
+            if args.image_condition == "bridge":
+                condition = condition_encoder(
+                    [conditioning_prompts[prompt_index]], mode="generate"
+                )
+            else:
+                condition = condition_encoder.encode(
+                    [conditioning_prompts[prompt_index]], mode="generate"
+                )
             image = backend.generate_images(
                 condition,
                 height=args.anchor_height,
@@ -277,8 +295,9 @@ def generate_anchors(
                     f"new={generated} rate={generated / max(elapsed, 1e-6):.2f}/s",
                     flush=True,
                 )
-    release(backend, bridge)
+    release(backend, condition_encoder)
     return {
+        "condition": args.image_condition,
         "checkpoint_step": checkpoint_step,
         "generated": generated,
         "reused": total - generated,
@@ -530,7 +549,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--image-config", default="configs/mobile_ov_dreamlite_compact_v4.yaml")
     parser.add_argument("--video-config", default="configs/mobile_ov_neodragon.yaml")
-    parser.add_argument("--image-bridge-checkpoint", required=True)
+    parser.add_argument(
+        "--image-condition",
+        choices=("bridge", "native_qwen"),
+        default="bridge",
+        help="Condition DreamLite with the distilled bridge or its native Qwen3-VL teacher.",
+    )
+    parser.add_argument("--image-bridge-checkpoint")
     video_group = parser.add_mutually_exclusive_group(required=True)
     video_group.add_argument("--video-bridge-checkpoint")
     video_group.add_argument(
@@ -581,6 +606,8 @@ def main() -> None:
         raise RuntimeError("VBench generation requires one allocated CUDA GPU.")
     if args.samples_per_prompt <= 0:
         raise ValueError("--samples-per-prompt must be positive")
+    if args.image_condition == "bridge" and not args.image_bridge_checkpoint:
+        raise ValueError("--image-bridge-checkpoint is required for --image-condition bridge")
     if args.quicksr_batch_frames <= 0:
         raise ValueError("--quicksr-batch-frames must be positive")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -596,6 +623,7 @@ def main() -> None:
         f"video={args.video_width}x{args.video_height}x{args.num_frames} "
         f"output={output_video_size(args)[0]}x{output_video_size(args)[1]} "
         f"quicksr={args.quicksr_variant}x{args.quicksr_scale if args.with_quicksr else 1} "
+        f"image_condition={args.image_condition} "
         f"conditioning={'smolvlm2_recaption' if args.recaption_file else 'raw_vbench'}",
         flush=True,
     )
@@ -631,7 +659,12 @@ def main() -> None:
         "samples_per_prompt": args.samples_per_prompt,
         "expected_anchors": len(prompts) * args.samples_per_prompt,
         "expected_videos": len(prompts) * args.samples_per_prompt,
-        "image_checkpoint": str(Path(args.image_bridge_checkpoint).resolve()),
+        "image_condition": args.image_condition,
+        "image_checkpoint": (
+            str(Path(args.image_bridge_checkpoint).resolve())
+            if args.image_bridge_checkpoint
+            else None
+        ),
         "video_checkpoint": str(
             Path(args.joint_video_checkpoint or args.video_bridge_checkpoint).resolve()
         ),
