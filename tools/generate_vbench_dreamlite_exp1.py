@@ -300,16 +300,63 @@ def generate_videos(
     install_neodragon_generation_patches()
     from neodragon.utils.generation_utils import DEFAULT_PROMPT_MODIFIER
 
-    state, checkpoint_step = load_bridge_state(Path(args.video_bridge_checkpoint))
+    joint_checkpoint = (
+        None
+        if args.joint_video_checkpoint is None
+        else Path(args.joint_video_checkpoint).expanduser().resolve()
+    )
+    joint_payload = None
+    if joint_checkpoint is not None:
+        joint_payload = torch.load(
+            joint_checkpoint,
+            map_location="cpu",
+            mmap=True,
+            weights_only=False,
+        )
+        stack = joint_payload.get("teacher_stack")
+        if not isinstance(stack, dict) or stack.get("name") != "multistep":
+            raise RuntimeError(
+                f"Joint checkpoint is not a multistep monolithic model: {joint_checkpoint}"
+            )
+        if not isinstance(joint_payload.get("dit"), dict) or not isinstance(
+            joint_payload.get("bridge"), dict
+        ):
+            raise RuntimeError(
+                f"Joint checkpoint must contain both 'dit' and 'bridge': {joint_checkpoint}"
+            )
+        state = joint_payload["bridge"]
+        checkpoint_step = int(joint_payload.get("step", -1))
+        config.backend.extra["mode"] = "monolithic"
+    else:
+        state, checkpoint_step = load_bridge_state(Path(args.video_bridge_checkpoint))
+
     bridge = MobileOVNeodragonTextBridge(config.bridge, device=device, dtype=dtype).eval()
-    missing_keys, unexpected_keys = bridge.load_state_dict(state, strict=False)
+    missing_keys, unexpected_keys = bridge.load_state_dict(
+        state,
+        strict=joint_payload is not None,
+    )
     if missing_keys or unexpected_keys:
         raise RuntimeError(
             "Exp1 checkpoint does not match MobileOVNeodragonTextBridge: "
             f"missing={missing_keys[:10]} unexpected={unexpected_keys[:10]}"
         )
-    del state
     backend = build_generation_backend(config.backend, device=device)
+    if joint_payload is not None:
+        backend.pipeline.dit.load_state_dict(joint_payload["dit"], strict=True)
+        # Bridge inference bypasses both native text modules. Releasing them keeps
+        # the full 944-prompt run comfortably below one-GPU memory limits.
+        backend.pipeline.text_encoder_bundle = None
+        backend.pipeline.context_adapter = None
+        del joint_payload
+    del state
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    negative_condition = None
+    if joint_checkpoint is not None:
+        from neodragon.utils.generation_utils import DEFAULT_NEGATIVE_PROMPT
+
+        negative_condition = bridge.encode([DEFAULT_NEGATIVE_PROMPT])
     quicksr_model = None
     quicksr_summary: dict[str, object] = {"enabled": bool(args.with_quicksr)}
     if args.with_quicksr:
@@ -360,6 +407,13 @@ def generate_videos(
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
         with torch.autocast("cuda", dtype=dtype):
+            negative_kwargs = {}
+            if negative_condition is not None:
+                negative_kwargs = {
+                    "negative_prompt_embeds": negative_condition[0],
+                    "negative_prompt_mask": negative_condition[1],
+                    "negative_pooled_prompt_embeds": negative_condition[2],
+                }
             frames = backend.generate_video_from_bridge_condition(
                 prompt,
                 prompt_embeds=prompt_embeds,
@@ -369,6 +423,7 @@ def generate_videos(
                 height=args.video_height,
                 width=args.video_width,
                 num_frames=args.num_frames,
+                **negative_kwargs,
             )
         if quicksr_model is not None:
             frames_array = np.stack([np.asarray(frame.convert("RGB")) for frame in frames])
@@ -424,7 +479,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-config", default="configs/mobile_ov_dreamlite_compact_v4.yaml")
     parser.add_argument("--video-config", default="configs/mobile_ov_neodragon.yaml")
     parser.add_argument("--image-bridge-checkpoint", required=True)
-    parser.add_argument("--video-bridge-checkpoint", required=True)
+    video_group = parser.add_mutually_exclusive_group(required=True)
+    video_group.add_argument("--video-bridge-checkpoint")
+    video_group.add_argument(
+        "--joint-video-checkpoint",
+        help=(
+            "Joint multistep checkpoint containing both 'dit' and 'bridge'. "
+            "Generation uses monolithic CFG and the provided DreamLite anchor."
+        ),
+    )
     parser.add_argument("--anchor-dir", required=True)
     parser.add_argument("--video-dir", required=True)
     parser.add_argument("--anchor-width", type=int, default=1024)
@@ -517,7 +580,12 @@ def main() -> None:
         "expected_anchors": len(prompts) * args.samples_per_prompt,
         "expected_videos": len(prompts) * args.samples_per_prompt,
         "image_checkpoint": str(Path(args.image_bridge_checkpoint).resolve()),
-        "video_checkpoint": str(Path(args.video_bridge_checkpoint).resolve()),
+        "video_checkpoint": str(
+            Path(args.joint_video_checkpoint or args.video_bridge_checkpoint).resolve()
+        ),
+        "video_checkpoint_kind": (
+            "joint_monolithic" if args.joint_video_checkpoint else "bridge_only_hybrid"
+        ),
         "recaption_file": (
             None if args.recaption_file is None else str(args.recaption_file.resolve())
         ),

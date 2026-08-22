@@ -43,7 +43,9 @@ IMAGE_CKPT="${IMAGE_CKPT:-checkpoints/hf_mobile_ov/dreamlite_compact_v4/17208709
 VIDEO_CKPT="${VIDEO_CKPT:-checkpoints/hf_mobile_ov/neo_exp1_bridge_functional/17108893/neodragon_text_bridge_latest.pt}"
 IMAGE_HF_FILE="${IMAGE_HF_FILE:-dreamlite_compact_v4/17208709/dreamlite_image_bridge_latest.pt}"
 VIDEO_HF_FILE="${VIDEO_HF_FILE:-neo_exp1_bridge_functional/17108893/neodragon_text_bridge_latest.pt}"
+VIDEO_JOINT_CHECKPOINT="${VIDEO_JOINT_CHECKPOINT:-0}"
 IMAGE_EXPECTED_STEP="${IMAGE_EXPECTED_STEP:-}"
+VIDEO_EXPECTED_STEP="${VIDEO_EXPECTED_STEP:-}"
 HF_REPO="${HF_REPO:-Amshaker/Mobile-OV}"
 MAX_PROMPTS="${MAX_PROMPTS:-0}"
 SAMPLES_PER_PROMPT="${SAMPLES_PER_PROMPT:-1}"
@@ -119,7 +121,7 @@ PY
   fi
 }
 download_checkpoint "${IMAGE_CKPT}" "${IMAGE_HF_FILE}" "${IMAGE_EXPECTED_STEP}"
-download_checkpoint "${VIDEO_CKPT}" "${VIDEO_HF_FILE}"
+download_checkpoint "${VIDEO_CKPT}" "${VIDEO_HF_FILE}" "${VIDEO_EXPECTED_STEP}"
 "${PYTHON_BIN}" tools/prepare_checkpoints.py --config "${IMAGE_CONFIG}"
 
 cleanup_heartbeat
@@ -136,6 +138,7 @@ echo "RECAPTION_FILE=${RECAPTION_FILE:-<raw VBench prompts>}"
 echo "IMAGE_CONFIG=${IMAGE_CONFIG}"
 echo "IMAGE_CKPT=${IMAGE_CKPT}"
 echo "VIDEO_CKPT=${VIDEO_CKPT}"
+echo "VIDEO_JOINT_CHECKPOINT=${VIDEO_JOINT_CHECKPOINT}"
 echo "WITH_QUICKSR=${WITH_QUICKSR} variant=${QUICKSR_VARIANT} scale=${QUICKSR_SCALE} dtype=${QUICKSR_DTYPE} batch_frames=${QUICKSR_BATCH_FRAMES}"
 nvidia-smi || true
 
@@ -160,12 +163,17 @@ if [[ "${WITH_QUICKSR}" == "1" ]]; then
   fi
 fi
 
+VIDEO_MODEL_ARGS=(--video-bridge-checkpoint "${VIDEO_CKPT}")
+if [[ "${VIDEO_JOINT_CHECKPOINT}" == "1" ]]; then
+  VIDEO_MODEL_ARGS=(--joint-video-checkpoint "${VIDEO_CKPT}")
+fi
+
 "${PYTHON_BIN}" tools/generate_vbench_dreamlite_exp1.py \
   --vbench-info "${VBENCH_INFO}" \
   "${RECAPTION_ARGS[@]}" \
   --image-config "${IMAGE_CONFIG}" \
   --image-bridge-checkpoint "${IMAGE_CKPT}" \
-  --video-bridge-checkpoint "${VIDEO_CKPT}" \
+  "${VIDEO_MODEL_ARGS[@]}" \
   --anchor-dir "${ANCHOR_DIR}" \
   --video-dir "${VIDEO_DIR}" \
   --summary "${RUN_ROOT}/generation_summary.json" \
