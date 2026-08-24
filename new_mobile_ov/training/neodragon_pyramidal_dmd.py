@@ -191,6 +191,83 @@ def cauchy_endpoint_loss(endpoint: torch.Tensor, clean: torch.Tensor) -> torch.T
     return torch.log1p(squared_l2).mean()
 
 
+def rollout_history_probability(
+    step: int,
+    *,
+    warmup_steps: int,
+    midpoint_step: int,
+    final_step: int,
+    midpoint_probability: float,
+    final_probability: float,
+) -> float:
+    """Piecewise-linear probability of using deployed student history."""
+
+    if step < 1:
+        raise ValueError("step must be positive")
+    if not 0 <= warmup_steps < midpoint_step <= final_step:
+        raise ValueError("Expected 0 <= warmup < midpoint <= final step")
+    if not 0.0 <= midpoint_probability <= final_probability <= 1.0:
+        raise ValueError("History probabilities must satisfy 0 <= midpoint <= final <= 1")
+    if step <= warmup_steps:
+        return 0.0
+    if step <= midpoint_step:
+        progress = (step - warmup_steps) / (midpoint_step - warmup_steps)
+        return float(progress * midpoint_probability)
+    if step <= final_step:
+        progress = (step - midpoint_step) / (final_step - midpoint_step)
+        return float(
+            midpoint_probability
+            + progress * (final_probability - midpoint_probability)
+        )
+    return float(final_probability)
+
+
+def linear_weight_decay(
+    step: int,
+    *,
+    initial: float,
+    final: float,
+    decay_steps: int,
+) -> float:
+    """Linearly decay a non-negative loss weight and then hold it fixed."""
+
+    if step < 1 or decay_steps < 1:
+        raise ValueError("step and decay_steps must be positive")
+    if initial < 0.0 or final < 0.0:
+        raise ValueError("Loss weights must be non-negative")
+    progress = min(max((step - 1) / max(decay_steps - 1, 1), 0.0), 1.0)
+    return float(initial + progress * (final - initial))
+
+
+def motion_residual_anchor_loss(
+    endpoint: torch.Tensor,
+    clean: torch.Tensor,
+    previous: torch.Tensor,
+) -> torch.Tensor:
+    """Match the direction and magnitude of the teacher's temporal residual.
+
+    Unlike another endpoint MSE, this loss normalizes the residual direction
+    and supervises its RMS magnitude separately. Near-static teacher samples
+    contribute only the magnitude term.
+    """
+
+    if endpoint.shape != clean.shape or endpoint.shape != previous.shape:
+        raise ValueError("endpoint, clean, and previous must have identical shapes")
+    predicted = (endpoint.float() - previous.float()).flatten(1)
+    target = (clean.float() - previous.float()).flatten(1)
+    predicted_rms = predicted.square().mean(dim=1).sqrt()
+    target_rms = target.square().mean(dim=1).sqrt()
+    magnitude = F.smooth_l1_loss(predicted_rms, target_rms)
+    moving = target.norm(dim=1) > 1e-6
+    if bool(moving.any()):
+        direction = 1.0 - F.cosine_similarity(
+            predicted[moving], target[moving], dim=1, eps=1e-6
+        ).mean()
+    else:
+        direction = magnitude.new_zeros(())
+    return magnitude + direction
+
+
 def dmd_sample_weight(
     *,
     teacher_flow: torch.Tensor,

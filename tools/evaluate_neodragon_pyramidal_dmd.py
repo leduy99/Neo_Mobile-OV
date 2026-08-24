@@ -53,6 +53,7 @@ def load_models(cfg, checkpoint: Path, device: torch.device, dtype: torch.dtype)
         "hybrid_1-1-1_video_units_only",
         "pyramidal_1-1-1_all_native_units",
         "pyramidal_1-1-1_external_anchor_video_units",
+        "pyramidal_1-1-1_external_anchor_rollout_aware_video_units",
     }:
         raise ValueError(f"Not a Pyramidal-DMD student checkpoint: {checkpoint}")
     adapter_id = str(payload["context_adapter_id"])

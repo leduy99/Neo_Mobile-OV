@@ -43,29 +43,49 @@ from new_mobile_ov.training.neodragon_pyramidal_dmd import (
     cauchy_endpoint_loss,
     dmd_sample_weight,
     dmd_surrogate_loss,
+    linear_weight_decay,
+    motion_residual_anchor_loss,
     predict_flow,
+    rollout_history_probability,
     stage_noisy_student_endpoint,
     stage_timestep,
     student_probe_sigmas,
 )
-from new_mobile_ov.training.neodragon_rollout import pyramid_latents, prepare_past_conditions
+from new_mobile_ov.training.neodragon_rollout import (
+    downsample_noise_2x,
+    prepare_past_conditions,
+    pyramid_latents,
+    upsample_pyramidal_latent,
+)
 
 
 ALL_NATIVE_SCHEDULE = "pyramidal_1-1-1_all_native_units"
 LEGACY_VIDEO_ONLY_SCHEDULE = "hybrid_1-1-1_video_units_only"
 ANCHOR_ALT_SCHEDULE = "pyramidal_1-1-1_external_anchor_video_units"
+ROLLOUT_AWARE_V3_SCHEDULE = "pyramidal_1-1-1_external_anchor_rollout_aware_video_units"
 
 
 def protocol_metadata(
     *,
     include_first_unit: bool,
     external_anchor_alternative: bool,
+    rollout_aware_v3: bool = False,
 ) -> tuple[str, str]:
     """Return an unambiguous schedule/objective pair for a DMD run."""
 
     if include_first_unit and external_anchor_alternative:
         raise ValueError(
             "--external-anchor-alternative requires --no-include-first-unit"
+        )
+    if rollout_aware_v3 and (include_first_unit or not external_anchor_alternative):
+        raise ValueError(
+            "--rollout-aware-v3 requires --no-include-first-unit and "
+            "--external-anchor-alternative"
+        )
+    if rollout_aware_v3:
+        return (
+            ROLLOUT_AWARE_V3_SCHEDULE,
+            "pyramidal_dmd_v3_rollout_aware_external_anchor_video_units",
         )
     if include_first_unit:
         return ALL_NATIVE_SCHEDULE, "pyramidal_dmd_reproduction_v2_all_native_units"
@@ -118,6 +138,55 @@ def select_native_unit_stage(
     position = (int(step) - 1) % (units * int(num_stages))
     relative_unit, stage = divmod(position, int(num_stages))
     return (relative_unit if include_first_unit else relative_unit + 1), stage
+
+
+@torch.no_grad()
+def rollout_student_state_to_position(
+    *,
+    student: torch.nn.Module,
+    scheduler,
+    anchor: torch.Tensor,
+    full_noise: torch.Tensor,
+    condition: DMDCondition,
+    target_unit: int,
+    target_stage: int,
+    generator: torch.Generator | None,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], int]:
+    """Reach one deployed video-unit call using only prior student outputs."""
+
+    if anchor.shape[2] != 1 or full_noise.shape[2] != 7:
+        raise ValueError("V3 expects one anchor and seven units of rollout noise")
+    if not 1 <= target_unit <= 6 or not 0 <= target_stage < 3:
+        raise ValueError("V3 target must be unit 1..6 and stage 0..2")
+    low_noise = downsample_noise_2x(full_noise, 2)
+    generated = [anchor.detach()]
+    calls = 0
+    for unit in range(1, target_unit + 1):
+        histories = prepare_past_conditions(generated, num_stages=3)
+        current = low_noise[:, :, unit : unit + 1]
+        for stage in range(3):
+            if stage > 0:
+                current = upsample_pyramidal_latent(
+                    current,
+                    orig_sigma=1.0 - scheduler.orig_start_sigmas[stage],
+                    gamma=scheduler.config.gamma,
+                    generator=generator,
+                )
+            history = tuple(histories[stage])
+            if unit == target_unit and stage == target_stage:
+                return current.detach(), tuple(value.detach() for value in history), calls
+            timestep = scheduler.get_stage_timesteps(1, stage, device=current.device)[0]
+            current = current - predict_flow(
+                dit=student,
+                current=current,
+                history=history,
+                condition=condition,
+                timestep=timestep,
+            )
+            current = current.detach()
+            calls += 1
+        generated.append(current)
+    raise RuntimeError("Failed to reach the requested V3 rollout position")
 
 
 class SyntheticTeacherLatentDataset(Dataset):
@@ -261,6 +330,7 @@ def save_checkpoint(
         schedule, objective_name = protocol_metadata(
             include_first_unit=args.include_first_unit,
             external_anchor_alternative=args.external_anchor_alternative,
+            rollout_aware_v3=args.rollout_aware_v3,
         )
         base = {
             "step": int(step),
@@ -283,6 +353,9 @@ def save_checkpoint(
                 },
                 "dmd_weight": args.dmd_weight,
                 "cauchy_weight": args.cauchy_weight,
+                "cauchy_final_weight": args.cauchy_final_weight,
+                "cauchy_decay_steps": args.cauchy_decay_steps,
+                "motion_residual_weight": args.motion_residual_weight,
                 "unit_zero_policy": (
                     "optimized_as_native_t2v_unit"
                     if args.include_first_unit
@@ -293,7 +366,22 @@ def save_checkpoint(
                     if args.include_first_unit
                     else "external_ssd1b_dreamlite_or_source_image"
                 ),
-                "training_history_source": "stored_multistep_teacher_trajectory",
+                "training_history_source": (
+                    "teacher_to_deployed_student_rollout_curriculum"
+                    if args.rollout_aware_v3
+                    else "stored_multistep_teacher_trajectory"
+                ),
+                "student_history_curriculum": (
+                    {
+                        "warmup_steps": args.history_warmup_steps,
+                        "midpoint_step": args.history_midpoint_step,
+                        "final_step": args.history_final_step,
+                        "midpoint_probability": args.history_midpoint_probability,
+                        "final_probability": args.history_final_probability,
+                    }
+                    if args.rollout_aware_v3
+                    else None
+                ),
             },
             "args": vars(args),
             "history": history,
@@ -326,6 +414,7 @@ def load_resume(
     fake_optimizer: torch.optim.Optimizer,
     include_first_unit: bool,
     external_anchor_alternative: bool,
+    rollout_aware_v3: bool,
 ) -> tuple[int, list[dict[str, object]]]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if "student" not in payload or "fake" not in payload:
@@ -333,6 +422,7 @@ def load_resume(
     expected_schedule, _ = protocol_metadata(
         include_first_unit=include_first_unit,
         external_anchor_alternative=external_anchor_alternative,
+        rollout_aware_v3=rollout_aware_v3,
     )
     actual_schedule = payload.get("schedule")
     if actual_schedule != expected_schedule:
@@ -383,6 +473,23 @@ def parse_args() -> argparse.Namespace:
             "as causal history; deployment supplies an external first frame."
         ),
     )
+    parser.add_argument(
+        "--rollout-aware-v3",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the external-anchor V3 curriculum that gradually replaces stored "
+            "teacher history and current states with deployed one-step student rollout states."
+        ),
+    )
+    parser.add_argument("--history-warmup-steps", type=int, default=1000)
+    parser.add_argument("--history-midpoint-step", type=int, default=4000)
+    parser.add_argument("--history-final-step", type=int, default=10000)
+    parser.add_argument("--history-midpoint-probability", type=float, default=0.5)
+    parser.add_argument("--history-final-probability", type=float, default=0.75)
+    parser.add_argument("--cauchy-final-weight", type=float, default=0.1)
+    parser.add_argument("--cauchy-decay-steps", type=int, default=4000)
+    parser.add_argument("--motion-residual-weight", type=float, default=0.05)
     parser.add_argument("--teacher-first-guidance", type=float, default=7.0)
     parser.add_argument("--teacher-video-guidance", type=float, default=5.0)
     parser.add_argument("--clip-grad-norm", type=float, default=1.0)
@@ -414,7 +521,23 @@ def main() -> None:
     schedule, objective_name = protocol_metadata(
         include_first_unit=args.include_first_unit,
         external_anchor_alternative=args.external_anchor_alternative,
+        rollout_aware_v3=args.rollout_aware_v3,
     )
+    if args.rollout_aware_v3:
+        rollout_history_probability(
+            1,
+            warmup_steps=args.history_warmup_steps,
+            midpoint_step=args.history_midpoint_step,
+            final_step=args.history_final_step,
+            midpoint_probability=args.history_midpoint_probability,
+            final_probability=args.history_final_probability,
+        )
+        linear_weight_decay(
+            1,
+            initial=args.cauchy_weight,
+            final=args.cauchy_final_weight,
+            decay_steps=args.cauchy_decay_steps,
+        )
     ctx = setup_distributed()
     try:
         torch.manual_seed(args.seed + ctx.rank)
@@ -476,6 +599,7 @@ def main() -> None:
                     fake_optimizer=fake_optimizer,
                     include_first_unit=args.include_first_unit,
                     external_anchor_alternative=args.external_anchor_alternative,
+                    rollout_aware_v3=args.rollout_aware_v3,
                 )
                 rank0_print(ctx, f"Resumed Pyramidal-DMD at step={start_step} from {requested}")
 
@@ -493,6 +617,8 @@ def main() -> None:
 
         scheduler = models["scheduler"]
         iterator = cycle_loader(loader, sampler)
+        rollout_generator = torch.Generator(device=ctx.device)
+        rollout_generator.manual_seed(args.seed + 100_003 + ctx.rank)
         progress = tqdm(
             range(start_step, args.steps),
             disable=not ctx.is_main,
@@ -506,9 +632,8 @@ def main() -> None:
             if clean_video.shape[2] != 7:
                 raise RuntimeError(f"Expected [B,C,7,H,W] teacher latents, got {tuple(clean_video.shape)}")
 
-            # Every rank takes the same native position.  Unit zero is a real
-            # T2V training target here because our synthetic data was created
-            # with image=None, not an external first-frame anchor.
+            # Every rank takes the same native position. External-anchor
+            # protocols reserve stored unit zero as causal first-frame history.
             unit, stage = select_native_unit_stage(
                 step,
                 include_first_unit=args.include_first_unit,
@@ -516,12 +641,18 @@ def main() -> None:
             video_pyramid = pyramid_latents(clean_video, num_stages=3)
             clean_endpoint = video_pyramid[stage][:, :, unit : unit + 1]
             history_frames = [clean_video[:, :, index : index + 1] for index in range(unit)]
-            past_conditions = tuple(
+            teacher_past_conditions = tuple(
                 prepare_past_conditions(history_frames, num_stages=3)[stage]
             )
-            noise = torch.randn_like(clean_endpoint)
-            pair = build_stage_pair(clean=clean_endpoint, scheduler=scheduler, stage=stage, noise=noise)
-            start_timestep = stage_timestep(scheduler, stage=stage, local_sigma=1.0, device=ctx.device)
+            pair = build_stage_pair(
+                clean=clean_endpoint,
+                scheduler=scheduler,
+                stage=stage,
+                noise=torch.randn_like(clean_endpoint),
+            )
+            start_timestep = stage_timestep(
+                scheduler, stage=stage, local_sigma=1.0, device=ctx.device
+            )
 
             # Match the released teacher's first/video CFG convention.  The
             # student and fake remain conditional-only, as in Pyramidal DMD.
@@ -546,6 +677,44 @@ def main() -> None:
                     guidance_scale=0.0,
                 )
 
+            student_history_probability = 0.0
+            use_student_history = False
+            rollout_calls = 0
+            past_conditions = teacher_past_conditions
+            stage_start = pair.start
+            if args.rollout_aware_v3:
+                student_history_probability = rollout_history_probability(
+                    step,
+                    warmup_steps=args.history_warmup_steps,
+                    midpoint_step=args.history_midpoint_step,
+                    final_step=args.history_final_step,
+                    midpoint_probability=args.history_midpoint_probability,
+                    final_probability=args.history_final_probability,
+                )
+                decision_rng = random.Random(args.seed + 1_000_003 * step)
+                use_student_history = (
+                    decision_rng.random() < student_history_probability
+                )
+            if use_student_history:
+                full_noise = torch.randn(
+                    clean_video.shape,
+                    device=ctx.device,
+                    dtype=dtype,
+                    generator=rollout_generator,
+                )
+                stage_start, past_conditions, rollout_calls = (
+                    rollout_student_state_to_position(
+                        student=student,
+                        scheduler=scheduler,
+                        anchor=clean_video[:, :, :1],
+                        full_noise=full_noise,
+                        condition=student_condition,
+                        target_unit=unit,
+                        target_stage=stage,
+                        generator=rollout_generator,
+                    )
+                )
+
             # The fake model tracks the moving endpoint distribution. Its target
             # is Pyramidal Flow Matching on detached current student endpoints.
             set_requires_grad(unwrap(student), False)
@@ -554,12 +723,12 @@ def main() -> None:
             with torch.no_grad():
                 student_at_start = predict_flow(
                     dit=student,
-                    current=pair.start,
+                    current=stage_start,
                     history=past_conditions,
                     condition=student_condition,
                     timestep=start_timestep,
                 )
-                detached_endpoint = (pair.start - student_at_start).detach()
+                detached_endpoint = (stage_start - student_at_start).detach()
             for _ in range(args.fake_updates):
                 fake_optimizer.zero_grad(set_to_none=True)
                 fake_tau = torch.rand((), device=ctx.device).item()
@@ -597,12 +766,12 @@ def main() -> None:
             student_optimizer.zero_grad(set_to_none=True)
             student_prediction = predict_flow(
                 dit=student,
-                current=pair.start,
+                current=stage_start,
                 history=past_conditions,
                 condition=student_condition,
                 timestep=start_timestep,
             )
-            student_endpoint = pair.start - student_prediction
+            student_endpoint = stage_start - student_prediction
             # Rotate the four fixed student probes after a complete shared
             # unit/stage pass.  The corrected native-T2V protocol has 7 x 3
             # positions; the legacy external-anchor ablation has 6 x 3.
@@ -646,7 +815,53 @@ def main() -> None:
                 sample_weight=weights,
             )
             cauchy_loss = cauchy_endpoint_loss(student_endpoint, clean_endpoint)
-            loss = args.dmd_weight * dmd_loss + args.cauchy_weight * cauchy_loss
+            scheduled_cauchy_weight = (
+                linear_weight_decay(
+                    step,
+                    initial=args.cauchy_weight,
+                    final=args.cauchy_final_weight,
+                    decay_steps=args.cauchy_decay_steps,
+                )
+                if args.rollout_aware_v3
+                else args.cauchy_weight
+            )
+            effective_cauchy_weight = (
+                0.0 if use_student_history else scheduled_cauchy_weight
+            )
+            motion_loss = student_endpoint.new_zeros((), dtype=torch.float32)
+            effective_motion_weight = 0.0
+            if args.rollout_aware_v3 and not use_student_history:
+                previous_endpoint = video_pyramid[stage][
+                    :, :, unit - 1 : unit
+                ]
+                motion_loss = motion_residual_anchor_loss(
+                    student_endpoint,
+                    clean_endpoint,
+                    previous_endpoint,
+                )
+                effective_motion_weight = args.motion_residual_weight
+            loss = (
+                args.dmd_weight * dmd_loss
+                + effective_cauchy_weight * cauchy_loss
+                + effective_motion_weight * motion_loss
+            )
+            dmd_endpoint_grad = torch.autograd.grad(
+                args.dmd_weight * dmd_loss,
+                student_endpoint,
+                retain_graph=True,
+            )[0]
+            auxiliary_loss = (
+                effective_cauchy_weight * cauchy_loss
+                + effective_motion_weight * motion_loss
+            )
+            if effective_cauchy_weight > 0.0 or effective_motion_weight > 0.0:
+                auxiliary_endpoint_grad = torch.autograd.grad(
+                    auxiliary_loss,
+                    student_endpoint,
+                    retain_graph=True,
+                )[0]
+            else:
+                auxiliary_endpoint_grad = torch.zeros_like(student_endpoint)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(unwrap(student).parameters(), args.clip_grad_norm)
             student_optimizer.step()
@@ -656,6 +871,22 @@ def main() -> None:
             teacher_pf_error = torch.nn.functional.mse_loss(
                 teacher_flow.float(), (probe_start - probe_end).float()
             )
+            dmd_grad_rms = dmd_endpoint_grad.float().square().mean().sqrt()
+            auxiliary_grad_rms = auxiliary_endpoint_grad.float().square().mean().sqrt()
+            dmd_aux_grad_ratio = dmd_grad_rms / auxiliary_grad_rms.clamp_min(1e-12)
+            history_relative_l2 = clean_endpoint.new_zeros((), dtype=torch.float32)
+            if use_student_history:
+                history_error = sum(
+                    (student_value.float() - teacher_value.float()).square().sum()
+                    for student_value, teacher_value in zip(
+                        past_conditions, teacher_past_conditions
+                    )
+                )
+                history_reference = sum(
+                    teacher_value.float().square().sum()
+                    for teacher_value in teacher_past_conditions
+                )
+                history_relative_l2 = history_error / history_reference.clamp_min(1e-12)
             metrics = {
                 "step": step,
                 "unit": unit,
@@ -664,11 +895,21 @@ def main() -> None:
                 "loss": scalar_mean(loss, ctx),
                 "dmd_surrogate": scalar_mean(dmd_loss, ctx),
                 "cauchy": scalar_mean(cauchy_loss, ctx),
+                "cauchy_weight": float(effective_cauchy_weight),
+                "motion_residual": scalar_mean(motion_loss, ctx),
+                "motion_weight": float(effective_motion_weight),
                 "endpoint_mse": scalar_mean(endpoint_mse, ctx),
                 "direction_rms": scalar_mean(direction_rms, ctx),
                 "fake_mse": scalar_mean(torch.stack(fake_losses).mean(), ctx),
                 "teacher_pf_error": scalar_mean(teacher_pf_error, ctx),
                 "mean_sample_weight": scalar_mean(weights.mean(), ctx),
+                "history_source": "student_rollout" if use_student_history else "teacher",
+                "student_history_probability": float(student_history_probability),
+                "history_relative_l2": scalar_mean(history_relative_l2, ctx),
+                "rollout_calls": int(rollout_calls),
+                "dmd_endpoint_grad_rms": scalar_mean(dmd_grad_rms, ctx),
+                "auxiliary_endpoint_grad_rms": scalar_mean(auxiliary_grad_rms, ctx),
+                "dmd_aux_grad_ratio": scalar_mean(dmd_aux_grad_ratio, ctx),
             }
             if step % args.log_every == 0 or step == args.steps:
                 history.append(metrics)
@@ -679,6 +920,8 @@ def main() -> None:
                     dmd=f"{metrics['dmd_surrogate']:.3f}",
                     fake=f"{metrics['fake_mse']:.3f}",
                     endpoint=f"{metrics['endpoint_mse']:.3f}",
+                    history="student" if use_student_history else "teacher",
+                    cweight=f"{effective_cauchy_weight:.2f}",
                 )
             if step % args.save_every == 0 or step == args.steps:
                 save_checkpoint(
@@ -693,6 +936,7 @@ def main() -> None:
                     models=models,
                     archive=(
                         step % args.archive_every == 0
+                        or (args.rollout_aware_v3 and step in {1000, 2000})
                         or (args.archive_final and step == args.steps)
                     ),
                     ctx=ctx,

@@ -456,6 +456,8 @@ def load_models(
     if payload.get("schedule") not in {
         "hybrid_1-1-1_video_units_only",
         "pyramidal_1-1-1_all_native_units",
+        "pyramidal_1-1-1_external_anchor_video_units",
+        "pyramidal_1-1-1_external_anchor_rollout_aware_video_units",
     }:
         raise ValueError(f"Not a Pyramidal-DMD checkpoint: {checkpoint}")
     checkpoint_step = int(payload.get("step", -1))
