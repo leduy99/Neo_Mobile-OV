@@ -18,6 +18,7 @@ import json
 import random
 import sys
 from pathlib import Path
+from typing import Iterable
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -124,6 +125,55 @@ def assert_fp32_trainable_parameters(module: torch.nn.Module, *, name: str) -> N
         raise RuntimeError(
             f"{name} must use FP32 master parameters for DMD optimization; got {preview}"
         )
+
+
+def resolve_optimizer_backend(requested: str, *, world_size: int) -> str:
+    """Select replicated AdamW or ZeRO-1 optimizer-state sharding."""
+
+    requested = str(requested).lower()
+    if requested not in {"auto", "adamw", "zero1"}:
+        raise ValueError(f"Unsupported optimizer backend: {requested!r}")
+    if requested == "auto":
+        return "zero1" if world_size > 1 else "adamw"
+    if requested == "zero1" and world_size <= 1:
+        raise ValueError("ZeRO-1 optimizer sharding requires world_size > 1")
+    return requested
+
+
+def build_optimizer(
+    parameters: Iterable[torch.nn.Parameter],
+    *,
+    lr: float,
+    weight_decay: float,
+    backend: str,
+) -> torch.optim.Optimizer:
+    parameters = list(parameters)
+    defaults = {
+        "lr": float(lr),
+        "weight_decay": float(weight_decay),
+        # Foreach holds additional tensor lists during the update. The scalar
+        # path is slower but keeps the 40 GB A100 peak predictable.
+        "foreach": False,
+    }
+    if backend == "adamw":
+        return torch.optim.AdamW(parameters, **defaults)
+    if backend == "zero1":
+        from torch.distributed.optim import ZeroRedundancyOptimizer
+
+        return ZeroRedundancyOptimizer(
+            parameters,
+            optimizer_class=torch.optim.AdamW,
+            **defaults,
+        )
+    raise ValueError(f"Unsupported optimizer backend: {backend!r}")
+
+
+def consolidate_optimizer_state(optimizer: torch.optim.Optimizer, *, destination_rank: int) -> None:
+    """Gather a ZeRO-1 optimizer state before writing a resumable checkpoint."""
+
+    consolidate = getattr(optimizer, "consolidate_state_dict", None)
+    if callable(consolidate):
+        consolidate(to=destination_rank)
 
 
 def atomic_save(payload: dict[str, object], destination: Path) -> None:
@@ -355,6 +405,11 @@ def save_checkpoint(
     archive: bool,
     ctx,
 ) -> None:
+    # ZeRO-1 consolidation is collective, so every rank must enter it even
+    # though only rank zero writes the resulting checkpoint.
+    if args.save_resume:
+        consolidate_optimizer_state(student_optimizer, destination_rank=0)
+        consolidate_optimizer_state(fake_optimizer, destination_rank=0)
     if ctx.is_main:
         schedule, objective_name = protocol_metadata(
             include_first_unit=args.include_first_unit,
@@ -549,6 +604,15 @@ def parse_args() -> argparse.Namespace:
             "AdamW updates are not rounded away; --dtype still controls autocast."
         ),
     )
+    parser.add_argument(
+        "--optimizer-state-sharding",
+        choices=("auto", "adamw", "zero1"),
+        default="auto",
+        help=(
+            "Shard AdamW state across distributed ranks with ZeRO-1. 'auto' uses "
+            "ZeRO-1 for world_size > 1 and regular AdamW for single-GPU smoke tests."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=20260812)
     return parser.parse_args()
 
@@ -628,16 +692,40 @@ def main() -> None:
         student = models["student"]
         fake = models["fake"]
         if ctx.is_distributed:
-            student = DDP(student, device_ids=[ctx.local_rank], output_device=ctx.local_rank, broadcast_buffers=False)
-            fake = DDP(fake, device_ids=[ctx.local_rank], output_device=ctx.local_rank, broadcast_buffers=False)
+            student = DDP(
+                student,
+                device_ids=[ctx.local_rank],
+                output_device=ctx.local_rank,
+                broadcast_buffers=False,
+                gradient_as_bucket_view=True,
+            )
+            fake = DDP(
+                fake,
+                device_ids=[ctx.local_rank],
+                output_device=ctx.local_rank,
+                broadcast_buffers=False,
+                gradient_as_bucket_view=True,
+            )
 
         assert_fp32_trainable_parameters(student, name="student")
         assert_fp32_trainable_parameters(fake, name="fake")
 
-        student_optimizer = torch.optim.AdamW(
-            student.parameters(), lr=args.student_lr, weight_decay=args.weight_decay
+        optimizer_backend = resolve_optimizer_backend(
+            args.optimizer_state_sharding,
+            world_size=ctx.world_size,
         )
-        fake_optimizer = torch.optim.AdamW(fake.parameters(), lr=args.fake_lr, weight_decay=args.weight_decay)
+        student_optimizer = build_optimizer(
+            student.parameters(),
+            lr=args.student_lr,
+            weight_decay=args.weight_decay,
+            backend=optimizer_backend,
+        )
+        fake_optimizer = build_optimizer(
+            fake.parameters(),
+            lr=args.fake_lr,
+            weight_decay=args.weight_decay,
+            backend=optimizer_backend,
+        )
         start_step = 0
         history: list[dict[str, object]] = []
         resume_path = output_dir / "neodragon_pyramidal_dmd_resume.pt"
@@ -666,6 +754,7 @@ def main() -> None:
             f"student:fake=1:{args.fake_updates} units="
             f"{'0-6' if args.include_first_unit else '1-6'} dtype={dtype} "
             f"trainable_dtype={trainable_dtype} "
+            f"optimizer={optimizer_backend} "
             f"schedule={schedule} objective={objective_name}",
         )
 
@@ -814,6 +903,7 @@ def main() -> None:
                 torch.nn.utils.clip_grad_norm_(unwrap(fake).parameters(), args.clip_grad_norm)
                 fake_optimizer.step()
                 fake_losses.append(fake_loss.detach())
+                fake_optimizer.zero_grad(set_to_none=True)
 
             # The student sees one conditional model call. Teacher and fake are
             # evaluated at the same re-noised endpoint and contribute only their
@@ -924,6 +1014,7 @@ def main() -> None:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(unwrap(student).parameters(), args.clip_grad_norm)
             student_optimizer.step()
+            student_optimizer.zero_grad(set_to_none=True)
             set_requires_grad(unwrap(fake), True)
 
             endpoint_mse = torch.nn.functional.mse_loss(student_endpoint.float(), clean_endpoint.float())

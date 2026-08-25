@@ -47,7 +47,7 @@ echo "MANIFEST=${MANIFEST} OUT=${OUT} RUN_NAME=${RUN_NAME} RESUME=${RESUME:-none
 echo "STEPS=${STEPS:-10000} GLOBAL_BATCH=$((NPROC_PER_NODE * ${BATCH_SIZE:-1})) student:fake=1:${FAKE_UPDATES:-2}"
 echo "History: teacher through ${HISTORY_WARMUP_STEPS:-1000} -> student p=${HISTORY_MIDPOINT_PROBABILITY:-0.5} at ${HISTORY_MIDPOINT_STEP:-4000} -> p=${HISTORY_FINAL_PROBABILITY:-0.75} at ${HISTORY_FINAL_STEP:-10000}"
 echo "Cauchy: ${CAUCHY_WEIGHT:-0.5} -> ${CAUCHY_FINAL_WEIGHT:-0.1} by ${CAUCHY_DECAY_STEPS:-4000}; disabled on student-rollout states; motion residual=${MOTION_RESIDUAL_WEIGHT:-0.05} on teacher states"
-echo "Precision: FP32 student/fake master parameters with ${DTYPE:-bf16} autocast forward"
+echo "Precision: FP32 student/fake master parameters with ${DTYPE:-bf16} autocast forward; optimizer=${OPTIMIZER_STATE_SHARDING:-zero1}"
 nvidia-smi || true
 
 "${TORCHRUN_BIN}" \
@@ -86,6 +86,7 @@ nvidia-smi || true
   --log-every "${LOG_EVERY:-25}" \
   --dtype "${DTYPE:-bf16}" \
   --trainable-dtype fp32 \
+  --optimizer-state-sharding "${OPTIMIZER_STATE_SHARDING:-zero1}" \
   ${EXTRA_ARGS:-}
 
 find "${OUT}" -maxdepth 1 -type f -print -exec ls -lh {} \;

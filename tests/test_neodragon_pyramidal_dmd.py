@@ -25,6 +25,7 @@ from tools.train_neodragon_pyramidal_dmd import (
     ROLLOUT_AWARE_V3_SCHEDULE,
     assert_fp32_trainable_parameters,
     protocol_metadata,
+    resolve_optimizer_backend,
     rollout_student_state_to_position,
     select_native_unit_stage,
 )
@@ -106,6 +107,15 @@ def test_dmd_requires_fp32_master_parameters() -> None:
             torch.nn.Linear(2, 2).bfloat16(),
             name="student",
         )
+
+
+def test_optimizer_backend_shards_distributed_fp32_adam_state() -> None:
+    assert resolve_optimizer_backend("auto", world_size=1) == "adamw"
+    assert resolve_optimizer_backend("auto", world_size=8) == "zero1"
+    assert resolve_optimizer_backend("adamw", world_size=8) == "adamw"
+    assert resolve_optimizer_backend("zero1", world_size=8) == "zero1"
+    with pytest.raises(ValueError, match="world_size > 1"):
+        resolve_optimizer_backend("zero1", world_size=1)
 
 
 def test_anchor_alternative_has_a_distinct_checkpoint_contract() -> None:
@@ -239,3 +249,4 @@ def test_v3_submit_is_fresh_rollout_aware_and_storage_bounded() -> None:
     assert '--archive-every "${ARCHIVE_EVERY:-5000}"' in script
     assert "--no-save-resume" in script
     assert "--trainable-dtype fp32" in script
+    assert '--optimizer-state-sharding "${OPTIMIZER_STATE_SHARDING:-zero1}"' in script
