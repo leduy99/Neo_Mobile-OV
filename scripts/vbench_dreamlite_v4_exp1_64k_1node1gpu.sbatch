@@ -92,13 +92,15 @@ download_checkpoint() {
     flock -x 9
     if [[ -f "${target}" && -n "${expected_step}" ]]; then
       local actual_step
-      actual_step=$("${PYTHON_BIN}" - "${target}" <<'PY'
+      if ! actual_step=$("${PYTHON_BIN}" - "${target}" <<'PY'
 import sys, torch
 payload = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
 print(int(payload.get("step", -1)))
 PY
-      )
-      if [[ "${actual_step}" != "${expected_step}" ]]; then
+      ); then
+        echo "Replacing unreadable checkpoint ${target}"
+        rm -f "${target}"
+      elif [[ "${actual_step}" != "${expected_step}" ]]; then
         echo "Replacing stale checkpoint ${target}: step=${actual_step}, expected=${expected_step}"
         rm -f "${target}"
       fi
@@ -109,7 +111,9 @@ from huggingface_hub import hf_hub_download
 from pathlib import Path
 import os, shutil, sys
 repo, filename, target = sys.argv[1:]
-source = Path(hf_hub_download(repo_id=repo, filename=filename))
+# A prior interrupted concurrent download may have poisoned the shared cache.
+# Once the validated target is absent, fetch fresh bytes rather than trusting it.
+source = Path(hf_hub_download(repo_id=repo, filename=filename, force_download=True))
 destination = Path(target)
 destination.parent.mkdir(parents=True, exist_ok=True)
 temporary = destination.with_suffix(destination.suffix + f".tmp.{os.getpid()}")
