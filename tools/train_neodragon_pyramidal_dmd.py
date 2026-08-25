@@ -103,6 +103,29 @@ def dtype_from_name(name: str) -> torch.dtype:
     return torch.float32
 
 
+def autocast_trainable(device: torch.device, forward_dtype: torch.dtype):
+    """Run FP32-master student/fake modules with the requested forward dtype."""
+
+    return torch.autocast(
+        device_type=device.type,
+        dtype=forward_dtype,
+        enabled=device.type == "cuda" and forward_dtype != torch.float32,
+    )
+
+
+def assert_fp32_trainable_parameters(module: torch.nn.Module, *, name: str) -> None:
+    mismatched = [
+        (parameter_name, parameter.dtype)
+        for parameter_name, parameter in unwrap(module).named_parameters()
+        if parameter.requires_grad and parameter.dtype != torch.float32
+    ]
+    if mismatched:
+        preview = ", ".join(f"{key}={dtype}" for key, dtype in mismatched[:5])
+        raise RuntimeError(
+            f"{name} must use FP32 master parameters for DMD optimization; got {preview}"
+        )
+
+
 def atomic_save(payload: dict[str, object], destination: Path) -> None:
     temporary = destination.with_name(f".{destination.name}.tmp")
     torch.save(payload, temporary)
@@ -265,7 +288,13 @@ def native_condition(
     )
 
 
-def load_models(cfg, *, device: torch.device, dtype: torch.dtype):
+def load_models(
+    cfg,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    trainable_dtype: torch.dtype,
+):
     repo_path, _, local_model_path = ensure_neodragon_assets(
         repo_path=cfg.backend.extra.get("repo_path"),
         cache_dir=cfg.backend.extra.get("cache_dir"),
@@ -291,10 +320,10 @@ def load_models(cfg, *, device: torch.device, dtype: torch.dtype):
         f"{local_model_path}/{MULTISTEP_DIT_ID}", torch_dtype=dtype
     ).to(device).eval()
     student = PyramidMMDiT.from_pretrained(
-        f"{local_model_path}/{MULTISTEP_DIT_ID}", torch_dtype=dtype
+        f"{local_model_path}/{MULTISTEP_DIT_ID}", torch_dtype=trainable_dtype
     ).to(device).train()
     fake = PyramidMMDiT.from_pretrained(
-        f"{local_model_path}/{MULTISTEP_DIT_ID}", torch_dtype=dtype
+        f"{local_model_path}/{MULTISTEP_DIT_ID}", torch_dtype=trainable_dtype
     ).to(device).train()
     for module in (text_bundle, context_adapter, teacher):
         module.requires_grad_(False)
@@ -356,6 +385,8 @@ def save_checkpoint(
                 "cauchy_final_weight": args.cauchy_final_weight,
                 "cauchy_decay_steps": args.cauchy_decay_steps,
                 "motion_residual_weight": args.motion_residual_weight,
+                "forward_dtype": args.dtype,
+                "trainable_master_dtype": args.trainable_dtype,
                 "unit_zero_policy": (
                     "optimized_as_native_t2v_unit"
                     if args.include_first_unit
@@ -510,6 +541,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--resume", default="auto", help="auto, none, or a resumable checkpoint path")
     parser.add_argument("--dtype", default="bf16")
+    parser.add_argument(
+        "--trainable-dtype",
+        default="fp32",
+        help=(
+            "Master parameter dtype for student and fake. DMD requires fp32 so "
+            "AdamW updates are not rounded away; --dtype still controls autocast."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=20260812)
     return parser.parse_args()
 
@@ -548,6 +587,12 @@ def main() -> None:
 
         cfg = load_config(args.config)
         dtype = dtype_from_name(args.dtype)
+        trainable_dtype = dtype_from_name(args.trainable_dtype)
+        if trainable_dtype != torch.float32:
+            raise ValueError(
+                "DMD student/fake master parameters must be fp32. "
+                "Use --dtype bf16 for autocast, not BF16 trainable weights."
+            )
         output_dir = Path(args.output_dir)
         if ctx.is_main:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -573,13 +618,21 @@ def main() -> None:
         if not len(loader):
             raise ValueError("DMD loader has no complete batches; reduce batch size or add data")
 
-        models = load_models(cfg, device=ctx.device, dtype=dtype)
+        models = load_models(
+            cfg,
+            device=ctx.device,
+            dtype=dtype,
+            trainable_dtype=trainable_dtype,
+        )
         teacher = models["teacher"]
         student = models["student"]
         fake = models["fake"]
         if ctx.is_distributed:
             student = DDP(student, device_ids=[ctx.local_rank], output_device=ctx.local_rank, broadcast_buffers=False)
             fake = DDP(fake, device_ids=[ctx.local_rank], output_device=ctx.local_rank, broadcast_buffers=False)
+
+        assert_fp32_trainable_parameters(student, name="student")
+        assert_fp32_trainable_parameters(fake, name="fake")
 
         student_optimizer = torch.optim.AdamW(
             student.parameters(), lr=args.student_lr, weight_decay=args.weight_decay
@@ -612,6 +665,7 @@ def main() -> None:
             f"steps={start_step}->{args.steps} student_params={parameters:,} "
             f"student:fake=1:{args.fake_updates} units="
             f"{'0-6' if args.include_first_unit else '1-6'} dtype={dtype} "
+            f"trainable_dtype={trainable_dtype} "
             f"schedule={schedule} objective={objective_name}",
         )
 
@@ -702,18 +756,19 @@ def main() -> None:
                     dtype=dtype,
                     generator=rollout_generator,
                 )
-                stage_start, past_conditions, rollout_calls = (
-                    rollout_student_state_to_position(
-                        student=student,
-                        scheduler=scheduler,
-                        anchor=clean_video[:, :, :1],
-                        full_noise=full_noise,
-                        condition=student_condition,
-                        target_unit=unit,
-                        target_stage=stage,
-                        generator=rollout_generator,
+                with autocast_trainable(ctx.device, dtype):
+                    stage_start, past_conditions, rollout_calls = (
+                        rollout_student_state_to_position(
+                            student=student,
+                            scheduler=scheduler,
+                            anchor=clean_video[:, :, :1],
+                            full_noise=full_noise,
+                            condition=student_condition,
+                            target_unit=unit,
+                            target_stage=stage,
+                            generator=rollout_generator,
+                        )
                     )
-                )
 
             # The fake model tracks the moving endpoint distribution. Its target
             # is Pyramidal Flow Matching on detached current student endpoints.
@@ -721,13 +776,14 @@ def main() -> None:
             set_requires_grad(unwrap(fake), True)
             fake_losses: list[torch.Tensor] = []
             with torch.no_grad():
-                student_at_start = predict_flow(
-                    dit=student,
-                    current=stage_start,
-                    history=past_conditions,
-                    condition=student_condition,
-                    timestep=start_timestep,
-                )
+                with autocast_trainable(ctx.device, dtype):
+                    student_at_start = predict_flow(
+                        dit=student,
+                        current=stage_start,
+                        history=past_conditions,
+                        condition=student_condition,
+                        timestep=start_timestep,
+                    )
                 detached_endpoint = (stage_start - student_at_start).detach()
             for _ in range(args.fake_updates):
                 fake_optimizer.zero_grad(set_to_none=True)
@@ -743,13 +799,14 @@ def main() -> None:
                 fake_timestep = stage_timestep(
                     scheduler, stage=stage, local_sigma=fake_tau, device=ctx.device
                 )
-                fake_prediction = predict_flow(
-                    dit=fake,
-                    current=fake_probe,
-                    history=past_conditions,
-                    condition=student_condition,
-                    timestep=fake_timestep,
-                )
+                with autocast_trainable(ctx.device, dtype):
+                    fake_prediction = predict_flow(
+                        dit=fake,
+                        current=fake_probe,
+                        history=past_conditions,
+                        condition=student_condition,
+                        timestep=fake_timestep,
+                    )
                 fake_loss = torch.nn.functional.mse_loss(
                     fake_prediction.float(), (fake_start - fake_end).float()
                 )
@@ -764,13 +821,14 @@ def main() -> None:
             set_requires_grad(unwrap(student), True)
             set_requires_grad(unwrap(fake), False)
             student_optimizer.zero_grad(set_to_none=True)
-            student_prediction = predict_flow(
-                dit=student,
-                current=stage_start,
-                history=past_conditions,
-                condition=student_condition,
-                timestep=start_timestep,
-            )
+            with autocast_trainable(ctx.device, dtype):
+                student_prediction = predict_flow(
+                    dit=student,
+                    current=stage_start,
+                    history=past_conditions,
+                    condition=student_condition,
+                    timestep=start_timestep,
+                )
             student_endpoint = stage_start - student_prediction
             # Rotate the four fixed student probes after a complete shared
             # unit/stage pass.  The corrected native-T2V protocol has 7 x 3
@@ -789,20 +847,21 @@ def main() -> None:
             )
             probe_timestep = stage_timestep(scheduler, stage=stage, local_sigma=tau, device=ctx.device)
             with torch.no_grad():
-                teacher_flow = predict_flow(
-                    dit=teacher,
-                    current=probe.detach(),
-                    history=tuple(value.detach() for value in past_conditions),
-                    condition=teacher_condition,
-                    timestep=probe_timestep,
-                )
-                fake_flow = predict_flow(
-                    dit=fake,
-                    current=probe.detach(),
-                    history=tuple(value.detach() for value in past_conditions),
-                    condition=student_condition,
-                    timestep=probe_timestep,
-                )
+                with autocast_trainable(ctx.device, dtype):
+                    teacher_flow = predict_flow(
+                        dit=teacher,
+                        current=probe.detach(),
+                        history=tuple(value.detach() for value in past_conditions),
+                        condition=teacher_condition,
+                        timestep=probe_timestep,
+                    )
+                    fake_flow = predict_flow(
+                        dit=fake,
+                        current=probe.detach(),
+                        history=tuple(value.detach() for value in past_conditions),
+                        condition=student_condition,
+                        timestep=probe_timestep,
+                    )
             weights = dmd_sample_weight(
                 teacher_flow=teacher_flow,
                 stage_flow_target=probe_start - probe_end,
@@ -936,7 +995,6 @@ def main() -> None:
                     models=models,
                     archive=(
                         step % args.archive_every == 0
-                        or (args.rollout_aware_v3 and step in {1000, 2000})
                         or (args.archive_final and step == args.steps)
                     ),
                     ctx=ctx,

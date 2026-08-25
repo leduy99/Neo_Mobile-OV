@@ -20,7 +20,7 @@ CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-${CONDA_ENV}/bin/torchrun}"
 CONFIG="${CONFIG:-configs/mobile_ov_neodragon.yaml}"
 MANIFEST="${MANIFEST:-data/neodragon_pyramidal_dmd_320p/manifest_partial.csv}"
-RUN_NAME="${RUN_NAME:-dmd_v3_rollout_aware_external_anchor_10k}"
+RUN_NAME="${RUN_NAME:-dmd_v3_rollout_aware_fp32_master_10k}"
 OUT="${OUT:-output/neodragon_pyramidal_dmd_v3/${RUN_NAME}}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 
@@ -47,6 +47,7 @@ echo "MANIFEST=${MANIFEST} OUT=${OUT} RUN_NAME=${RUN_NAME} RESUME=${RESUME:-none
 echo "STEPS=${STEPS:-10000} GLOBAL_BATCH=$((NPROC_PER_NODE * ${BATCH_SIZE:-1})) student:fake=1:${FAKE_UPDATES:-2}"
 echo "History: teacher through ${HISTORY_WARMUP_STEPS:-1000} -> student p=${HISTORY_MIDPOINT_PROBABILITY:-0.5} at ${HISTORY_MIDPOINT_STEP:-4000} -> p=${HISTORY_FINAL_PROBABILITY:-0.75} at ${HISTORY_FINAL_STEP:-10000}"
 echo "Cauchy: ${CAUCHY_WEIGHT:-0.5} -> ${CAUCHY_FINAL_WEIGHT:-0.1} by ${CAUCHY_DECAY_STEPS:-4000}; disabled on student-rollout states; motion residual=${MOTION_RESIDUAL_WEIGHT:-0.05} on teacher states"
+echo "Precision: FP32 student/fake master parameters with ${DTYPE:-bf16} autocast forward"
 nvidia-smi || true
 
 "${TORCHRUN_BIN}" \
@@ -79,10 +80,12 @@ nvidia-smi || true
   --external-anchor-alternative \
   --rollout-aware-v3 \
   --teacher-video-guidance "${TEACHER_VIDEO_GUIDANCE:-5.0}" \
-  --save-every "${SAVE_EVERY:-500}" \
+  --save-every "${SAVE_EVERY:-1000}" \
   --archive-every "${ARCHIVE_EVERY:-5000}" \
+  --no-save-resume \
   --log-every "${LOG_EVERY:-25}" \
   --dtype "${DTYPE:-bf16}" \
+  --trainable-dtype fp32 \
   ${EXTRA_ARGS:-}
 
 find "${OUT}" -maxdepth 1 -type f -print -exec ls -lh {} \;

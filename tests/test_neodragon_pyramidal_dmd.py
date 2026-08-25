@@ -23,6 +23,7 @@ from tools.train_neodragon_pyramidal_dmd import (
     ANCHOR_ALT_SCHEDULE,
     LEGACY_VIDEO_ONLY_SCHEDULE,
     ROLLOUT_AWARE_V3_SCHEDULE,
+    assert_fp32_trainable_parameters,
     protocol_metadata,
     rollout_student_state_to_position,
     select_native_unit_stage,
@@ -96,6 +97,15 @@ def test_dmd_surrogate_has_endpoint_gradient_and_cauchy_is_positive() -> None:
     assert endpoint.grad is not None
     assert torch.isfinite(endpoint.grad).all()
     assert direction_rms.item() > 0
+
+
+def test_dmd_requires_fp32_master_parameters() -> None:
+    assert_fp32_trainable_parameters(torch.nn.Linear(2, 2).float(), name="student")
+    with pytest.raises(RuntimeError, match="FP32 master parameters"):
+        assert_fp32_trainable_parameters(
+            torch.nn.Linear(2, 2).bfloat16(),
+            name="student",
+        )
 
 
 def test_anchor_alternative_has_a_distinct_checkpoint_contract() -> None:
@@ -225,5 +235,7 @@ def test_v3_submit_is_fresh_rollout_aware_and_storage_bounded() -> None:
     assert '--history-final-probability "${HISTORY_FINAL_PROBABILITY:-0.75}"' in script
     assert '--cauchy-final-weight "${CAUCHY_FINAL_WEIGHT:-0.1}"' in script
     assert '--motion-residual-weight "${MOTION_RESIDUAL_WEIGHT:-0.05}"' in script
-    assert '--save-every "${SAVE_EVERY:-500}"' in script
+    assert '--save-every "${SAVE_EVERY:-1000}"' in script
     assert '--archive-every "${ARCHIVE_EVERY:-5000}"' in script
+    assert "--no-save-resume" in script
+    assert "--trainable-dtype fp32" in script
