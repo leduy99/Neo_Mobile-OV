@@ -26,6 +26,9 @@ export VBENCH_CACHE_DIR=/proj/cvl/users/x_fahkh2/caches/vbench
 export TOKENIZERS_PARALLELISM=false
 export PYTHONNOUSERSITE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# The shared Berzilius Xet cache is not reliable under concurrent checkpoint
+# downloads. Direct HTTP plus a per-target lock keeps paired VBench jobs safe.
+export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 
 ROOT="${ROOT:-$(pwd -P)}"
 CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
@@ -83,35 +86,40 @@ download_checkpoint() {
   local target="$1"
   local filename="$2"
   local expected_step="${3:-}"
-  if [[ -f "${target}" && -n "${expected_step}" ]]; then
-    local actual_step
-    actual_step=$("${PYTHON_BIN}" - "${target}" <<'PY'
+  local lock_path="${target}.download.lock"
+  mkdir -p "$(dirname "${target}")"
+  (
+    flock -x 9
+    if [[ -f "${target}" && -n "${expected_step}" ]]; then
+      local actual_step
+      actual_step=$("${PYTHON_BIN}" - "${target}" <<'PY'
 import sys, torch
 payload = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
 print(int(payload.get("step", -1)))
 PY
-)
-    if [[ "${actual_step}" != "${expected_step}" ]]; then
-      echo "Replacing stale checkpoint ${target}: step=${actual_step}, expected=${expected_step}"
-      rm -f "${target}"
+      )
+      if [[ "${actual_step}" != "${expected_step}" ]]; then
+        echo "Replacing stale checkpoint ${target}: step=${actual_step}, expected=${expected_step}"
+        rm -f "${target}"
+      fi
     fi
-  fi
-  [[ -f "${target}" ]] && return 0
-  "${PYTHON_BIN}" - "${HF_REPO}" "${filename}" "${target}" <<'PY'
+    if [[ ! -f "${target}" ]]; then
+      "${PYTHON_BIN}" - "${HF_REPO}" "${filename}" "${target}" <<'PY'
 from huggingface_hub import hf_hub_download
 from pathlib import Path
-import shutil, sys
+import os, shutil, sys
 repo, filename, target = sys.argv[1:]
 source = Path(hf_hub_download(repo_id=repo, filename=filename))
 destination = Path(target)
 destination.parent.mkdir(parents=True, exist_ok=True)
-temporary = destination.with_suffix(destination.suffix + ".tmp")
+temporary = destination.with_suffix(destination.suffix + f".tmp.{os.getpid()}")
 shutil.copy2(source, temporary)
 temporary.replace(destination)
 print(f"Downloaded {repo}/{filename} -> {destination}")
 PY
-  if [[ -n "${expected_step}" ]]; then
-    "${PYTHON_BIN}" - "${target}" "${expected_step}" <<'PY'
+    fi
+    if [[ -n "${expected_step}" ]]; then
+      "${PYTHON_BIN}" - "${target}" "${expected_step}" <<'PY'
 import sys, torch
 payload = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
 actual = int(payload.get("step", -1))
@@ -119,7 +127,8 @@ expected = int(sys.argv[2])
 if actual != expected:
     raise SystemExit(f"Checkpoint step mismatch: got {actual}, expected {expected}")
 PY
-  fi
+    fi
+  ) 9>"${lock_path}"
 }
 if [[ "${IMAGE_CONDITION}" == "bridge" ]]; then
   download_checkpoint "${IMAGE_CKPT}" "${IMAGE_HF_FILE}" "${IMAGE_EXPECTED_STEP}"
