@@ -404,7 +404,15 @@ def test_grounding_cascade_finalize_excludes_qwen_rejections_and_errors(tmp_path
     accepted = tmp_path / "accepted.csv"
     write_manifest(
         accepted,
-        [{"record_id": "r0", "caption": rows[0]["caption"], "qwen36_confidence": "0.95"}],
+        [
+            {
+                "record_id": "r0",
+                "caption": rows[0]["caption"],
+                "siglip_score": "",
+                "siglip_logit": "",
+                "qwen36_confidence": "0.95",
+            }
+        ],
     )
     candidate = tmp_path / "candidate.csv"
     high = tmp_path / "high.csv"
@@ -445,6 +453,8 @@ def test_grounding_cascade_finalize_excludes_qwen_rejections_and_errors(tmp_path
     assert "r0" in high_ids
     r0 = next(row for row in high_rows if row["record_id"] == "r0")
     assert r0["verification_source"] == "qwen36"
+    assert r0["siglip_score"] == rows[0]["siglip_score"]
+    assert r0["siglip_logit"] == rows[0]["siglip_logit"]
 
 
 def test_siglip_batch_scoring_isolates_unreadable_images(tmp_path) -> None:

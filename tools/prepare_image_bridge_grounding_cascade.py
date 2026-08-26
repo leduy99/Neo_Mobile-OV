@@ -172,7 +172,13 @@ def finalize(args: argparse.Namespace) -> None:
             continue
         row["capability_bucket"] = capability_bucket(row)
         if state == "accepted":
-            row.update(qwen_rows.get(record_id, {}))
+            row.update(
+                {
+                    key: value
+                    for key, value in qwen_rows.get(record_id, {}).items()
+                    if value not in (None, "")
+                }
+            )
             row["grounding_status"] = "qwen36_verified"
             row["grounding_tier"] = "qwen_verified"
             row["verification_source"] = "qwen36"
