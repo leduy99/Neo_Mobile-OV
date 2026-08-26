@@ -795,17 +795,17 @@ def build_image_bridge_data_v1(
                 "generation_prompt_manifests": [
                     "manifests/d1_broad_train.csv",
                     "manifests/d2_compositional_train.csv",
-                    "manifests/d2_grounded_qwen_verified.csv",
+                    "manifests/d2_grounded_high_precision_50k.csv",
                 ],
-                "generation_source_names": ["broad", "compositional", "grounded_qwen"],
+                "generation_source_names": ["broad", "compositional", "grounded_cascade"],
                 "generation_source_weights": [7.0 / 9.0, 2.0 / 9.0, 0.0],
-                "grounded_source_names": ["grounded_qwen"],
+                "grounded_source_names": ["grounded_cascade"],
                 "grounded_batch_probability": 0.10,
                 "semantic_prompt_probability": 0.0,
             },
             "note": (
-                "The grounded CSV is produced by the separate Qwen3.6 verification step. "
-                "Do not substitute the unverified candidate CSV in a paper run."
+                "The grounded CSV is produced by the separate SigLIP2-ranking and "
+                "Qwen3.6-adjudication cascade. Do not substitute the raw candidate CSV."
             ),
         }
         summary = {
@@ -837,8 +837,8 @@ def build_image_bridge_data_v1(
             "# ImageBridge-Data-v1\n\n"
             "This immutable catalog preserves source captions and creates mutually exclusive "
             "broad, compositional, and grounded-candidate views. No prompt is freely generated. "
-            "Grounded candidates must pass the separate Qwen3.6 visual-verification gate before "
-            "they are used by DreamLite V12.\n",
+            "Grounded candidates must pass the separate SigLIP2-ranking and Qwen3.6-adjudication "
+            "cascade before they are used by DreamLite V12.\n",
             encoding="utf-8",
         )
     except BaseException:

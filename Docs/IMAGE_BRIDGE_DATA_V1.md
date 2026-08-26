@@ -17,7 +17,7 @@ artifacts, invented facts, and an untraceable prompt distribution.
 |---|---:|---|
 | D1 broad | 70% | Preserve general image quality, coverage, and the stable V8 behavior. |
 | D2 compositional | 20% | Increase count, color binding, multiple objects, spatial relations, scenes, actions, and rendered text. |
-| D2 grounded | 10% | Use real image-caption pairs whose central claims pass Qwen3.6 visual verification. |
+| D2 grounded | 10% | Use real image-caption pairs selected by the auditable SigLIP2 + Qwen3.6 cascade. |
 
 The builder assigns each deduplicated caption to exactly one pool. A grounded
 record takes precedence over compositional and broad records, while
@@ -41,7 +41,7 @@ No LAION/COYO download is required for this first controlled V12 experiment.
 The catalog stores source path, source key, source role, source file metadata,
 and optionally the SHA-256 of every input manifest.
 
-## Build And Verify
+## Eight-Hour Build And Verify
 
 Run from the `Neo_Mobile-OV` repository on Berzilius.
 
@@ -52,46 +52,59 @@ Run from the `Neo_Mobile-OV` repository on Berzilius.
    sbatch scripts/setup_image_bridge_data_env_1node1gpu.sbatch
    ```
 
-2. Build the immutable catalog and candidate views.
+2. Submit the complete two-GPU cascade. It builds the immutable catalog when
+   needed, scores at most 160K grounded candidates with SigLIP2, sends a balanced
+   12K hard subset to Qwen3.6, and freezes the final manifests.
 
    ```bash
-   sbatch scripts/build_image_bridge_data_v1_1node1gpu.sbatch
+   sbatch scripts/build_image_bridge_grounding_cascade_8h_1node2gpu.sbatch
    ```
 
-3. Run the 20k Qwen3.6 pilot.
+   The job requests two GPUs because Qwen3.6-35B does not fit safely on one
+   40GB A100 without CPU offload. It prints the allocated GPU model at startup,
+   uses GPU 0 for batched SigLIP2 scoring, then lets Qwen use both GPUs. Qwen is
+   bounded to three hours. SigLIP scoring is also bounded to three hours and
+   must produce at least 110K valid output rows. This reserves up to two hours
+   for selection, model loading, merging, validation, and final writes before
+   the eight-hour SLURM limit.
+
+3. Existing pilot work is not discarded. The cascade bootstraps valid rows from
+   `qwen36_pilot.jsonl`, reuses accepted records, and retries records whose latest
+   Qwen result is an error. There is no second 20K pilot.
+
+4. Qwen uses a compact factual-verification schema:
+
+   ```json
+   {"caption_supported": true, "confidence": 0.0, "failed_claims": []}
+   ```
+
+   It verifies only balanced hard/ambiguous records and previous errors. It does
+   not rewrite captions. SigLIP2 ranks the remaining records but is never treated
+   as a factual annotation model.
+
+5. Create a deterministic 100-accepted/100-rejected human audit sheet when the
+   Qwen run finishes.
 
    ```bash
-   RUN_MODE=pilot sbatch scripts/verify_image_bridge_data_v1_qwen36_1node1gpu.sbatch
+     /proj/cvl/users/x_fahkh2/envs/neo_mobileov/bin/python tools/sample_image_bridge_qwen_audit.py \
+     --input-jsonl data/image_bridge_v1/annotations/qwen36_cascade.jsonl \
+     --output-csv data/image_bridge_v1/annotations/qwen36_cascade_human_audit.csv
    ```
 
-4. Create a deterministic 100-accepted/100-rejected human audit sheet.
-
-   ```bash
-   /proj/cvl/users/x_fahkh2/envs/neo_mobileov/bin/python tools/sample_image_bridge_qwen_audit.py \
-     --input-jsonl data/image_bridge_v1/annotations/qwen36_pilot.jsonl \
-     --output-csv data/image_bridge_v1/annotations/qwen36_pilot_human_audit.csv
-   ```
-
-5. Fill `human_supported` with `true` or `false`, then require at least 95%
+6. Fill `human_supported` with `true` or `false`, then require at least 95%
    agreement before launching the full gate.
 
    ```bash
-   /proj/cvl/users/x_fahkh2/envs/neo_mobileov/bin/python tools/sample_image_bridge_qwen_audit.py \
-     --input-jsonl data/image_bridge_v1/annotations/qwen36_pilot.jsonl \
-     --output-csv data/image_bridge_v1/annotations/qwen36_pilot_human_audit.csv \
+     /proj/cvl/users/x_fahkh2/envs/neo_mobileov/bin/python tools/sample_image_bridge_qwen_audit.py \
+     --input-jsonl data/image_bridge_v1/annotations/qwen36_cascade.jsonl \
+     --output-csv data/image_bridge_v1/annotations/qwen36_cascade_human_audit.csv \
      --score-filled-sheet
    ```
 
-6. If the audit passes, verify the full grounded candidate pool.
-
-   ```bash
-   RUN_MODE=full sbatch scripts/verify_image_bridge_data_v1_qwen36_1node1gpu.sbatch
-   ```
-
-All SLURM scripts retain one active GPU heartbeat and write logs under `logs/`.
-`MODEL_ID` and `MODEL_REVISION` can point to a local checkpoint or a pinned
-Hugging Face revision. The verifier records the resolved model revision and
-runtime package versions in its summary.
+The scorer and verifier are resumable. Rerunning the same command skips completed
+SigLIP IDs and valid Qwen decisions. Both automatically split a batch after CUDA
+OOM. `MODEL_ID`/revision overrides are recorded in summaries, while output
+manifests include model scores and verification provenance.
 
 ## Outputs
 
@@ -101,14 +114,19 @@ The builder writes to `data/image_bridge_v1/` atomically:
 - `manifests/d1_broad_train.csv`;
 - `manifests/d2_compositional_train.csv`;
 - `manifests/d2_grounded_candidates.csv`;
+- `manifests/d2_grounded_siglip2_scored.csv`;
+- `manifests/d2_grounded_qwen_adjudication.csv`;
+- `manifests/d2_grounded_candidate_100k.csv`;
+- `manifests/d2_grounded_high_precision_50k.csv`;
 - `manifests/validation.csv` and `hard_validation.csv`;
 - `mixtures/v12_70_20_10.json`: exact trainer contract;
 - `source_registry.json` and `stats/summary.json`.
 
-The full verifier creates
-`manifests/d2_grounded_qwen_verified.csv`. This is the only grounded manifest
-allowed in a V12 paper run. The unverified candidate file must never be used as
-grounded supervision.
+`d2_grounded_candidate_100k.csv` is an expansion/audit pool and must not be used
+as the default training source. `d2_grounded_high_precision_50k.csv` is the V12
+grounded training manifest. It excludes unreadable pairs, benchmark leakage,
+valid Qwen rejections, and Qwen errors. Its exact hashes and capability counts
+are stored in `stats/grounding_cascade_summary.json`.
 
 ## Reproducibility Contract
 
@@ -117,7 +135,10 @@ grounded supervision.
 - Dataset split and subset ordering use a seeded SHA-256 key.
 - The three train pools are mutually exclusive.
 - Capability mining is transparent lexical routing, not a hidden label model.
-- Qwen labels and raw responses remain auditable in JSONL.
+- SigLIP2 is used only for high-throughput ranking; hard claims are routed to Qwen.
+- Qwen labels, failed claims, errors, and raw responses remain auditable in JSONL.
+- Exact and high lexical-overlap VBench prompts are removed before selection.
+- Selection uses fixed capability quotas and deterministic score/hash tie-breaking.
 - Existing output directories are never overwritten unless `FORCE=1` is set.
 - A failed build remains in `.partial` form and cannot be mistaken for a final dataset.
 

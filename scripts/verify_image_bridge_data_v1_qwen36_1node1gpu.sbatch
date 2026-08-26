@@ -3,7 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
-#SBATCH --time=24:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --output=logs/mov-imgverify-%j.out
 #SBATCH --error=logs/mov-imgverify-%j.out
 #SBATCH --account=berzelius-2026-196
@@ -40,6 +40,7 @@ case "${RUN_MODE}" in
     OUTPUT_JSONL="${OUTPUT_JSONL:-${DATA_ROOT}/annotations/qwen36_full.jsonl}"
     ACCEPTED_MANIFEST="${ACCEPTED_MANIFEST:-${DATA_ROOT}/manifests/d2_grounded_qwen_verified.csv}"
     MAX_SAMPLES="${MAX_SAMPLES:--1}"
+    TARGET_ACCEPTED="${TARGET_ACCEPTED:-100000}"
     ;;
   *)
     echo "RUN_MODE must be pilot or full" >&2
@@ -53,7 +54,7 @@ mkdir -p logs "$(dirname "${OUTPUT_JSONL}")" "$(dirname "${ACCEPTED_MANIFEST}")"
 
 rm -f "${STOP_FILE}"
 "${PYTHON_BIN}" tools/utils/gpu_heartbeat.py \
-  --devices 0 --interval 5 --tensor-mb 4 --work-seconds 1 \
+  --devices 0 --interval 30 --tensor-mb 4 --work-seconds 0.05 \
   --stop-file "${STOP_FILE}" \
   --label "image-bridge-qwen36-${RUN_MODE}-${SLURM_JOB_ID:-local}" &
 HEARTBEAT_PID=$!
@@ -72,13 +73,27 @@ ARGS=(
   --model-id "${MODEL_ID}"
   --model-revision "${MODEL_REVISION}"
   --dtype "${DTYPE:-bf16}"
-  --max-new-tokens "${MAX_NEW_TOKENS:-384}"
+  --max-new-tokens "${MAX_NEW_TOKENS:-256}"
+  --batch-size "${BATCH_SIZE:-4}"
+  --max-image-edge "${MAX_IMAGE_EDGE:-1024}"
   --min-confidence "${MIN_CONFIDENCE:-0.80}"
   --max-samples "${MAX_SAMPLES}"
+  --target-accepted "${TARGET_ACCEPTED:--1}"
   --log-every "${LOG_EVERY:-25}"
+  --flush-every "${FLUSH_EVERY:-25}"
 )
 if [[ "${RESUME:-1}" == "1" ]]; then
   ARGS+=(--resume)
+fi
+if [[ "${RUN_MODE}" == "full" ]]; then
+  PILOT_JSONL="${PILOT_JSONL:-${DATA_ROOT}/annotations/qwen36_pilot.jsonl}"
+  PILOT_ACCEPTED_MANIFEST="${PILOT_ACCEPTED_MANIFEST:-${DATA_ROOT}/manifests/d2_grounded_qwen_verified_pilot.csv}"
+  if [[ -s "${PILOT_JSONL}" ]]; then
+    ARGS+=(--bootstrap-jsonl "${PILOT_JSONL}")
+  fi
+  if [[ -s "${PILOT_ACCEPTED_MANIFEST}" ]]; then
+    ARGS+=(--bootstrap-accepted-manifest "${PILOT_ACCEPTED_MANIFEST}")
+  fi
 fi
 
 "${PYTHON_BIN}" tools/verify_image_bridge_grounding_qwen36.py "${ARGS[@]}"
