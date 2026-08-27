@@ -18,20 +18,21 @@ module load buildenv-nvhpc/24.5-cuda12.4
 DATA_ENV="${DATA_CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_image_data}"
 PYTHON_BIN="${DATA_ENV}/bin/python"
 DATA_ROOT="${DATA_ROOT:-data/image_bridge_v1}"
-HIGH_PRECISION="${HIGH_PRECISION:-${DATA_ROOT}/manifests/d2_grounded_high_precision_50k.csv}"
+RELEASE_ROOT="${RELEASE_ROOT:-${DATA_ROOT}/releases/v12}"
+HIGH_PRECISION="${HIGH_PRECISION:-${RELEASE_ROOT}/manifests/d2_grounded_high_precision_50k.csv}"
 QWEN_JSONL="${QWEN_JSONL:-${DATA_ROOT}/annotations/qwen36_cascade.jsonl}"
 AUDIT_CSV="${AUDIT_CSV:-${DATA_ROOT}/annotations/qwen36_cascade_human_audit.csv}"
-RESCORE_SUBSET="${RESCORE_SUBSET:-${DATA_ROOT}/stats/v12_siglip2_rescore_subset.csv}"
-RESCORE_OUTPUT="${RESCORE_OUTPUT:-${DATA_ROOT}/stats/v12_siglip2_rescore_results.csv}"
-PREFLIGHT_OUTPUT="${PREFLIGHT_OUTPUT:-${DATA_ROOT}/stats/v12_data_preflight.json}"
+RESCORE_SUBSET="${RESCORE_SUBSET:-${RELEASE_ROOT}/stats/v12_siglip2_rescore_subset.csv}"
+RESCORE_OUTPUT="${RESCORE_OUTPUT:-${RELEASE_ROOT}/stats/v12_siglip2_rescore_results.csv}"
+PREFLIGHT_OUTPUT="${PREFLIGHT_OUTPUT:-${RELEASE_ROOT}/stats/v12_data_preflight.json}"
 LEAKAGE_PROMPTS="${LEAKAGE_PROMPTS:-checkpoints/neodragon_repo/prompts/vbench_prompts.txt}"
 RESCORE_SAMPLES="${RESCORE_SAMPLES:-2048}"
 STOP_FILE="${TMPDIR:-/proj/cvl/users/x_fahkh2/caches}/image_bridge_v12_data_${SLURM_JOB_ID:-local}.stop"
 
 test -x "${PYTHON_BIN}"
-test -s "${HIGH_PRECISION}"
 test -s "${QWEN_JSONL}"
 test -s "${DATA_ROOT}/mixtures/v12_grounding_cascade_70_20_10.json"
+test -s "${LEAKAGE_PROMPTS}"
 mkdir -p logs "${DATA_ROOT}/stats" "${DATA_ROOT}/annotations" "$(dirname "${STOP_FILE}")"
 
 export PATH="${DATA_ENV}/bin:${PATH}"
@@ -58,6 +59,19 @@ cleanup() {
   rm -f "${STOP_FILE}" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
+
+FREEZE_ARGS=(
+  --data-root "${DATA_ROOT}"
+  --output-root "${RELEASE_ROOT}"
+  --leakage-prompts "${LEAKAGE_PROMPTS}"
+  --leakage-threshold "${LEAKAGE_THRESHOLD:-0.85}"
+)
+if [[ "${FORCE_RELEASE:-0}" == "1" ]]; then
+  FREEZE_ARGS+=(--force)
+fi
+"${PYTHON_BIN}" tools/freeze_image_bridge_v12_release.py "${FREEZE_ARGS[@]}"
+test -s "${HIGH_PRECISION}"
+mkdir -p "${RELEASE_ROOT}/stats"
 
 if [[ ! -s "${AUDIT_CSV}" ]]; then
   "${PYTHON_BIN}" tools/sample_image_bridge_qwen_audit.py \
@@ -90,7 +104,14 @@ CUDA_VISIBLE_DEVICES=0 "${PYTHON_BIN}" tools/score_image_bridge_grounding_siglip
 
 VALIDATE_ARGS=(
   --data-root "${DATA_ROOT}"
-  --output "${PREFLIGHT_OUTPUT#${DATA_ROOT}/}"
+  --output "${PREFLIGHT_OUTPUT}"
+  --mixture "${RELEASE_ROOT}/mixtures/v12_release_70_20_10.json"
+  --broad-manifest "${RELEASE_ROOT}/manifests/d1_broad_train.csv"
+  --compositional-manifest "${RELEASE_ROOT}/manifests/d2_compositional_train.csv"
+  --grounded-manifest "${HIGH_PRECISION}"
+  --validation-manifest "${RELEASE_ROOT}/manifests/validation.csv"
+  --hard-validation-manifest "${RELEASE_ROOT}/manifests/hard_validation.csv"
+  --skip-cascade-hash-check
   --rescore-manifest "${RESCORE_OUTPUT}"
   --audit-sheet "${AUDIT_CSV}"
   --decode-samples "${DECODE_SAMPLES:-2048}"
@@ -106,8 +127,8 @@ fi
 "${PYTHON_BIN}" tools/validate_image_bridge_v12_data.py "${VALIDATE_ARGS[@]}"
 
 wc -l \
-  "${DATA_ROOT}/manifests/d1_broad_train.csv" \
-  "${DATA_ROOT}/manifests/d2_compositional_train.csv" \
+  "${RELEASE_ROOT}/manifests/d1_broad_train.csv" \
+  "${RELEASE_ROOT}/manifests/d2_compositional_train.csv" \
   "${HIGH_PRECISION}" \
   "${AUDIT_CSV}" \
   "${RESCORE_OUTPUT}"

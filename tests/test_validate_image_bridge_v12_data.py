@@ -36,8 +36,8 @@ def test_v12_data_preflight_accepts_disjoint_grounded_contract(tmp_path: Path) -
         "capabilities": "color;attribute",
         "grounding_status": "qwen36_verified",
         "verification_source": "qwen36",
-        "siglip_status": "ok",
-        "siglip_logit": "5.0",
+        "siglip_status": "",
+        "siglip_logit": "",
     }
     write_csv(root / "manifests/d2_grounded_high_precision_50k.csv", [grounded])
     write_csv(root / "manifests/d2_grounded_candidate_100k.csv", [grounded])

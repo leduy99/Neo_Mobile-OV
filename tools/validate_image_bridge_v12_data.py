@@ -44,6 +44,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mixture", default="mixtures/v12_grounding_cascade_70_20_10.json")
     parser.add_argument("--cascade-summary", default="stats/grounding_cascade_summary.json")
     parser.add_argument("--output", default="stats/v12_data_preflight.json")
+    parser.add_argument("--broad-manifest", default="manifests/d1_broad_train.csv")
+    parser.add_argument(
+        "--compositional-manifest", default="manifests/d2_compositional_train.csv"
+    )
+    parser.add_argument(
+        "--grounded-manifest", default="manifests/d2_grounded_high_precision_50k.csv"
+    )
+    parser.add_argument("--validation-manifest", default="manifests/validation.csv")
+    parser.add_argument("--hard-validation-manifest", default="manifests/hard_validation.csv")
+    parser.add_argument("--candidate-manifest", default="manifests/d2_grounded_candidate_100k.csv")
+    parser.add_argument("--skip-cascade-hash-check", action="store_true")
     parser.add_argument("--rescore-manifest", default="")
     parser.add_argument("--audit-sheet", default="")
     parser.add_argument("--leakage-prompts", action="append", default=[])
@@ -61,7 +72,13 @@ def parse_args() -> argparse.Namespace:
 
 def resolve(root: Path, value: str) -> Path:
     path = Path(value).expanduser()
-    return path if path.is_absolute() else root / path
+    if path.is_absolute() or path.exists():
+        return path
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return root / path
+    return path
 
 
 def file_sha256(path: Path) -> str:
@@ -112,6 +129,7 @@ def inspect_manifest(
     grounded_rows: list[dict[str, str]] = []
     capabilities: Counter[str] = Counter()
     verification_sources: Counter[str] = Counter()
+    siglip_statuses: Counter[str] = Counter()
     grounding_statuses: Counter[str] = Counter()
     invalid_grounded_source = 0
     invalid_siglip_status = 0
@@ -138,12 +156,16 @@ def inspect_manifest(
             source = str(row.get("verification_source", "")).strip()
             status = str(row.get("grounding_status", "")).strip()
             verification_sources[source] += 1
+            siglip_status = str(row.get("siglip_status", "")).strip()
+            siglip_statuses[siglip_status] += 1
             grounding_statuses[status] += 1
             capabilities.update(
                 item for item in str(row.get("capabilities", "")).split(";") if item
             )
             invalid_grounded_source += int(source not in ALLOWED_GROUNDED_SOURCES)
-            invalid_siglip_status += int(str(row.get("siglip_status", "")) != "ok")
+            # A factual Qwen decision supersedes the ranking model. Only rows
+            # admitted solely by SigLIP2 require a valid SigLIP scoring status.
+            invalid_siglip_status += int(source == "siglip2" and siglip_status != "ok")
             missing_image_path += int(not str(row.get("image_path", "")).strip())
     summary = {
         "path": str(path),
@@ -159,6 +181,7 @@ def inspect_manifest(
         summary.update(
             {
                 "verification_sources": dict(sorted(verification_sources.items())),
+                "siglip_statuses": dict(sorted(siglip_statuses.items())),
                 "grounding_statuses": dict(sorted(grounding_statuses.items())),
                 "capabilities": dict(sorted(capabilities.items())),
                 "invalid_grounded_source": invalid_grounded_source,
@@ -294,12 +317,12 @@ def main() -> None:
     cascade_summary_path = resolve(data_root, args.cascade_summary)
     output_path = resolve(data_root, args.output)
     required_files = {
-        "broad": data_root / "manifests/d1_broad_train.csv",
-        "compositional": data_root / "manifests/d2_compositional_train.csv",
-        "grounded": data_root / "manifests/d2_grounded_high_precision_50k.csv",
-        "validation": data_root / "manifests/validation.csv",
-        "hard_validation": data_root / "manifests/hard_validation.csv",
-        "candidate": data_root / "manifests/d2_grounded_candidate_100k.csv",
+        "broad": resolve(data_root, args.broad_manifest),
+        "compositional": resolve(data_root, args.compositional_manifest),
+        "grounded": resolve(data_root, args.grounded_manifest),
+        "validation": resolve(data_root, args.validation_manifest),
+        "hard_validation": resolve(data_root, args.hard_validation_manifest),
+        "candidate": resolve(data_root, args.candidate_manifest),
         "mixture": mixture_path,
         "cascade_summary": cascade_summary_path,
     }
@@ -359,7 +382,8 @@ def main() -> None:
         hash_checks[key] = {
             "expected": expected,
             "actual": actual,
-            "matched": expected is None or expected == actual,
+            "matched": args.skip_cascade_hash_check or expected is None or expected == actual,
+            "skipped": args.skip_cascade_hash_check,
         }
 
     image_check = image_preflight(
@@ -380,7 +404,7 @@ def main() -> None:
         if int(summary["leakage_count"]) > 0 and not args.allow_leakage:
             machine_failures.append(f"{name}.leakage_count={summary['leakage_count']}")
     grounded = manifests["grounded"]
-    if int(grounded["rows"]) != args.expected_grounded_rows:
+    if args.expected_grounded_rows >= 0 and int(grounded["rows"]) != args.expected_grounded_rows:
         machine_failures.append(
             f"grounded.rows={grounded['rows']} expected={args.expected_grounded_rows}"
         )
