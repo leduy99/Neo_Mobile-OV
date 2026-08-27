@@ -146,3 +146,20 @@ This design deliberately separates **data construction**, **visual
 verification**, and **V12 optimization**. That separation makes the eventual
 paper ablation interpretable: improvements can be attributed to the data
 mixture rather than a simultaneous, undocumented change in captions or loss.
+
+## V12 Training
+
+After the machine preflight passes, launch the controlled from-scratch V12 run:
+
+```bash
+sbatch scripts/train_dreamlite_compact_v12_grounding_cascade_1node8gpu.sbatch
+```
+
+V12 preserves the V11-balanced content-aware and frozen-DreamLite functional
+distillation recipe. Its only intended experimental change is the frozen
+benchmark-clean 70/20/10 release. Synthetic semantic prompt injection is
+disabled because the explicit compositional pool now supplies that curriculum.
+The default run uses a global batch of 32 for 160K steps, updates the resumable
+latest checkpoint every 5K steps, and archives a checkpoint every 20K steps.
+The default is a true from-scratch run (`RESUME=none`). If SLURM interrupts the
+job, reuse its original `OUT` and submit with `RESUME=auto` to continue safely.
