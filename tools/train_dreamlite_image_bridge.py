@@ -421,6 +421,27 @@ def validate_representation_objective(args: argparse.Namespace) -> str:
     return objective
 
 
+def initialize_bridge_from_checkpoint(bridge, checkpoint_path: str | Path) -> dict[str, object]:
+    """Load bridge weights only, deliberately leaving optimizer and step fresh."""
+
+    path = Path(checkpoint_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing bridge initialization checkpoint: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    state = payload.get("bridge", payload)
+    if not isinstance(state, dict) or not state:
+        raise ValueError(f"Bridge initialization checkpoint has no state: {path}")
+    bridge.load_trainable_state_dict(state)
+    return {
+        "checkpoint": str(path),
+        "source_step": int(payload.get("step", -1)),
+        "source_training_version": payload.get("config", {}).get("training_version"),
+        "source_architecture": payload.get("architecture"),
+        "optimizer_reset": True,
+        "step_reset": True,
+    }
+
+
 def choose_resolution_bucket(
     buckets: list[DreamLiteResolutionBucket],
     *,
@@ -500,6 +521,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="output/dreamlite_image_bridge")
     parser.add_argument("--target-step", type=int, default=100000)
     parser.add_argument("--resume", default="auto")
+    parser.add_argument(
+        "--init-bridge-checkpoint",
+        default="",
+        help=(
+            "Initialize only bridge parameters from this checkpoint while resetting "
+            "optimizer state and training step. Mutually exclusive with --resume."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--max-samples", type=int, default=-1)
     parser.add_argument("--lr", type=float, default=4e-5)
@@ -626,6 +655,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.init_bridge_checkpoint and args.resume != "none":
+        raise ValueError(
+            "--init-bridge-checkpoint requires --resume none so optimizer and step "
+            "cannot be restored accidentally."
+        )
     args.resolved_representation_objective = validate_representation_objective(args)
     context = setup_distributed()
     torch.manual_seed(args.seed + context.rank)
@@ -955,16 +989,29 @@ def main() -> None:
         trainable, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01
     )
     current_step = 0
+    initialization: dict[str, object] | None = None
+    if args.init_bridge_checkpoint:
+        initialization = initialize_bridge_from_checkpoint(
+            bridge, args.init_bridge_checkpoint
+        )
+        rank0_print(
+            context,
+            "Initialized DreamLite bridge weights with fresh optimizer/step: "
+            + json.dumps(initialization),
+        )
     resume_path = (
         output_dir / "dreamlite_image_bridge_latest.pt"
         if args.resume == "auto"
         else Path(args.resume)
     )
+    if args.resume not in {"none", "auto"} and not resume_path.is_file():
+        raise FileNotFoundError(f"Missing explicit resume checkpoint: {resume_path}")
     if args.resume != "none" and resume_path.is_file():
         payload = torch.load(resume_path, map_location="cpu", weights_only=False)
         bridge.load_trainable_state_dict(payload["bridge"])
         optimizer.load_state_dict(payload["optimizer"])
         current_step = int(payload["step"])
+        initialization = payload.get("initialization")
         rank0_print(
             context,
             f"Resumed DreamLite bridge from {resume_path} at step={current_step}",
@@ -1542,9 +1589,13 @@ def main() -> None:
                         },
                         "optimizer": optimizer.state_dict(),
                         "config": vars(args),
+                        "initialization": initialization,
                         "architecture": (
                             "MobileOVDreamLiteSharedSmolVLM2ImageBridgeV1"
                             if shared_video_bridge is not None
+                            else
+                            "MobileOVDreamLiteCompactBridgeV12"
+                            if args.training_version.lower().startswith("v12")
                             else
                             "MobileOVDreamLiteCompactBridgeV11"
                             if args.training_version.lower().startswith("v11")
@@ -1587,6 +1638,7 @@ def main() -> None:
                             "frozen DreamLite-mobile UNet, native 4-call schedule, "
                             "mixed generated and real-image-derived same-state response distillation"
                             if args.training_version.lower().startswith("v11")
+                            or args.training_version.lower().startswith("v12")
                             or args.training_version.lower()
                             in {"v7", "v8", "v9", "v10", "shared_v1"}
                             else "frozen DreamLite-mobile UNet, native 4-call schedule, "
