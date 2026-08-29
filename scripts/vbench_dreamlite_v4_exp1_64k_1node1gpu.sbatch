@@ -48,6 +48,10 @@ IMAGE_HF_FILE="${IMAGE_HF_FILE:-dreamlite_compact_v4/17208709/dreamlite_image_br
 VIDEO_HF_FILE="${VIDEO_HF_FILE:-neo_exp1_bridge_functional/17108893/neodragon_text_bridge_latest.pt}"
 VIDEO_JOINT_CHECKPOINT="${VIDEO_JOINT_CHECKPOINT:-0}"
 IMAGE_EXPECTED_STEP="${IMAGE_EXPECTED_STEP:-}"
+IMAGE_EXPECTED_TRAINING_VERSION="${IMAGE_EXPECTED_TRAINING_VERSION:-}"
+IMAGE_EXPECTED_SOURCE_STEP="${IMAGE_EXPECTED_SOURCE_STEP:-}"
+IMAGE_EXPECTED_SOURCE_TRAINING_VERSION="${IMAGE_EXPECTED_SOURCE_TRAINING_VERSION:-}"
+IMAGE_EXPECTED_BRIDGE_TENSORS="${IMAGE_EXPECTED_BRIDGE_TENSORS:-}"
 VIDEO_EXPECTED_STEP="${VIDEO_EXPECTED_STEP:-}"
 IMAGE_CONDITION="${IMAGE_CONDITION:-bridge}"
 HF_REPO="${HF_REPO:-Amshaker/Mobile-OV}"
@@ -136,6 +140,54 @@ PY
 }
 if [[ "${IMAGE_CONDITION}" == "bridge" ]]; then
   download_checkpoint "${IMAGE_CKPT}" "${IMAGE_HF_FILE}" "${IMAGE_EXPECTED_STEP}"
+  "${PYTHON_BIN}" - \
+    "${IMAGE_CKPT}" \
+    "${IMAGE_EXPECTED_TRAINING_VERSION}" \
+    "${IMAGE_EXPECTED_SOURCE_STEP}" \
+    "${IMAGE_EXPECTED_SOURCE_TRAINING_VERSION}" \
+    "${IMAGE_EXPECTED_BRIDGE_TENSORS}" <<'PY'
+import sys
+
+import torch
+
+(
+    checkpoint,
+    expected_training_version,
+    expected_source_step,
+    expected_source_training_version,
+    expected_bridge_tensors,
+) = sys.argv[1:]
+payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+config = payload.get("config", {})
+initialization = payload.get("initialization") or {}
+checks = [
+    (
+        expected_training_version,
+        str(config.get("training_version")),
+        "training_version",
+    ),
+    (expected_source_step, str(initialization.get("source_step")), "source_step"),
+    (
+        expected_source_training_version,
+        str(initialization.get("source_training_version")),
+        "source_training_version",
+    ),
+    (expected_bridge_tensors, str(len(payload.get("bridge", {}))), "bridge_tensors"),
+]
+for expected, actual, name in checks:
+    if expected and actual != expected:
+        raise SystemExit(
+            f"Image checkpoint provenance mismatch for {name}: "
+            f"got {actual!r}, expected {expected!r}"
+        )
+print(
+    "Validated image checkpoint provenance: "
+    f"training_version={config.get('training_version')} "
+    f"source_step={initialization.get('source_step')} "
+    f"source_training_version={initialization.get('source_training_version')} "
+    f"bridge_tensors={len(payload.get('bridge', {}))}"
+)
+PY
 elif [[ "${IMAGE_CONDITION}" != "native_qwen" ]]; then
   echo "IMAGE_CONDITION must be bridge or native_qwen; got ${IMAGE_CONDITION}" >&2
   exit 2
