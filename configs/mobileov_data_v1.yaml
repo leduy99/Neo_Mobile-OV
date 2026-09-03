@@ -1,0 +1,58 @@
+release:
+  name: MobileOV-Data-v1
+  output_dir: data/mobileov_data_v1/releases/v1
+  seed: 20260904
+  validation_fraction: 0.002
+  leakage_threshold: 0.85
+
+benchmark_prompts:
+  - checkpoints/neodragon_repo/prompts/vbench_prompts.txt
+
+anchor_prompt_bank:
+  output: data/mobileov_data_v1/prompt_banks/anchor_teacher_100k.csv
+  target_records: 100000
+  seed: 20260904
+  min_words: 4
+  max_words: 80
+  sources:
+    - name: openvid_video_verified
+      path: data/mobileov_video_cascade_v1/video_high_precision.csv
+      weight: 0.80
+      hard_fraction: 0.50
+    - name: image_broad_action
+      path: data/image_bridge_v1/releases/v12/manifests/d1_broad_train.csv
+      weight: 0.10
+      hard_fraction: 0.50
+      require_any_capabilities: [action]
+    - name: image_compositional_action
+      path: data/image_bridge_v1/releases/v12/manifests/d2_compositional_train.csv
+      weight: 0.05
+      hard_fraction: 0.90
+      require_any_capabilities: [action]
+    - name: image_grounded_action
+      path: data/image_bridge_v1/releases/v12/manifests/d2_grounded_high_precision_50k.csv
+      weight: 0.05
+      hard_fraction: 0.90
+      require_any_capabilities: [action]
+
+sources:
+  - name: image_v12_broad
+    pool: image_broad
+    path: data/image_bridge_v1/releases/v12/manifests/d1_broad_train.csv
+    require_artifact: false
+  - name: image_v12_compositional
+    pool: image_compositional
+    path: data/image_bridge_v1/releases/v12/manifests/d2_compositional_train.csv
+    require_artifact: false
+  - name: image_v12_grounded_verified
+    pool: image_grounded
+    path: data/image_bridge_v1/releases/v12/manifests/d2_grounded_high_precision_50k.csv
+  - name: openvid_siglip_motion_verified
+    pool: video_real
+    path: data/mobileov_video_cascade_v1/video_high_precision.csv
+  - name: neodragon_native_t2v_teacher
+    pool: video_teacher_t2v
+    path: data/neodragon_pyramidal_dmd_320p/manifest_partial.csv
+  - name: dreamlite_v11_native_teacher_matched
+    pool: video_anchor_teacher
+    path: data/mobileov_anchor_teacher_v1/manifest.csv
