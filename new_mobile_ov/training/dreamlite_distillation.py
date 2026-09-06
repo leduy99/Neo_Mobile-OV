@@ -44,6 +44,17 @@ class DreamLiteClosedLoopResult:
     calls: int
 
 
+@dataclass
+class DreamLiteStepFollowingResult:
+    """All-call response KD measured on one native-teacher trajectory."""
+
+    prediction_mse: torch.Tensor
+    prediction_relative_mse: torch.Tensor
+    prediction_cosine: torch.Tensor
+    transition_relative_mse: torch.Tensor
+    calls: int
+
+
 @dataclass(frozen=True)
 class DreamLiteResolutionBucket:
     width: int
@@ -844,6 +855,135 @@ class DreamLiteFrozenController:
             transition_cosine=flat_cosine_distance(student_next, teacher_next),
             call_index=call_index,
             state_source=state_source,
+        )
+
+    def teacher_following_loss(
+        self,
+        student: DreamLiteCondition,
+        teacher: DreamLiteCondition,
+        *,
+        source_images: Sequence[Image.Image] | None,
+        height: int,
+        width: int,
+        time_id_height: int | None = None,
+        time_id_width: int | None = None,
+        batch_size: int,
+    ) -> DreamLiteStepFollowingResult:
+        """Match every DreamLite response while the native teacher advances state.
+
+        Teacher and student see the same latent at every call. Only the frozen
+        teacher prediction advances the trajectory, which isolates condition
+        error from rollout drift and mirrors step-following vision KD.
+        """
+
+        effect_batch = min(
+            batch_size,
+            student.prompt_embeds.shape[0],
+            teacher.prompt_embeds.shape[0],
+        )
+        if effect_batch < 1:
+            raise ValueError("Teacher-following loss requires a non-empty batch.")
+        student = DreamLiteCondition(
+            student.prompt_embeds[:effect_batch],
+            student.attention_mask[:effect_batch],
+        )
+        teacher = DreamLiteCondition(
+            teacher.prompt_embeds[:effect_batch],
+            teacher.attention_mask[:effect_batch],
+        )
+        images = None if source_images is None else list(source_images[:effect_batch])
+        initial = self.backend.random_latents(effect_batch, height, width)
+        source = self.source_latents(
+            images,
+            batch_size=effect_batch,
+            height=height,
+            width=width,
+        )
+        teacher_scheduler = self.backend.make_scheduler()
+        student_scheduler = self.backend.make_scheduler()
+        teacher_timesteps = self.backend.prepare_schedule(
+            teacher_scheduler,
+            initial,
+            num_steps=self.num_steps,
+        )
+        student_timesteps = self.backend.prepare_schedule(
+            student_scheduler,
+            initial,
+            num_steps=self.num_steps,
+        )
+        if len(student_timesteps) != len(teacher_timesteps):
+            raise RuntimeError(
+                "DreamLite teacher/student schedulers produced different call counts."
+            )
+
+        shared_state = initial.detach()
+        prediction_mse = initial.new_zeros((), dtype=torch.float32)
+        prediction_relative_mse = initial.new_zeros((), dtype=torch.float32)
+        prediction_cosine = initial.new_zeros((), dtype=torch.float32)
+        transition_relative_mse = initial.new_zeros((), dtype=torch.float32)
+        for teacher_timestep, student_timestep in zip(
+            teacher_timesteps, student_timesteps
+        ):
+            with torch.no_grad():
+                teacher_prediction = self.backend.predict(
+                    shared_state,
+                    teacher_timestep,
+                    teacher,
+                    source_latents=source,
+                    height=height,
+                    width=width,
+                    time_id_height=time_id_height,
+                    time_id_width=time_id_width,
+                )
+                teacher_next = teacher_scheduler.step(
+                    teacher_prediction,
+                    teacher_timestep,
+                    shared_state,
+                    return_dict=False,
+                )[0]
+            student_prediction = self.backend.predict(
+                shared_state,
+                student_timestep,
+                student,
+                source_latents=source,
+                height=height,
+                width=width,
+                time_id_height=time_id_height,
+                time_id_width=time_id_width,
+            )
+            # The plain response MSE is the optimized DistillT5-style target.
+            prediction_mse = prediction_mse + F.mse_loss(
+                student_prediction.float(), teacher_prediction.float()
+            )
+            prediction_relative_mse = prediction_relative_mse + relative_mse(
+                student_prediction, teacher_prediction
+            )
+            prediction_cosine = prediction_cosine + flat_cosine_distance(
+                student_prediction, teacher_prediction
+            )
+            # Advance this scheduler for contract parity, but do not retain an
+            # unnecessary gradient graph through a metric-only transition.
+            with torch.no_grad():
+                student_next = student_scheduler.step(
+                    student_prediction.detach(),
+                    student_timestep,
+                    shared_state,
+                    return_dict=False,
+                )[0]
+                transition_relative_mse = transition_relative_mse + relative_mse(
+                    student_next, teacher_next
+                )
+            shared_state = teacher_next.detach()
+
+        calls = len(teacher_timesteps)
+        if calls < 1:
+            raise RuntimeError("DreamLite produced an empty denoising schedule.")
+        return DreamLiteStepFollowingResult(
+            prediction_mse=prediction_mse / calls,
+            prediction_relative_mse=prediction_relative_mse / calls,
+            prediction_cosine=prediction_cosine / calls,
+            transition_relative_mse=transition_relative_mse / calls,
+            calls=calls,
         )
 
     def closed_loop_loss(

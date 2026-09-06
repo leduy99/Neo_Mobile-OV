@@ -39,6 +39,7 @@ from new_mobile_ov.training.dreamlite_distillation import (
     DreamLiteFrozenQwenTeacher,
     DreamLiteFunctionalResult,
     DreamLiteResolutionBucket,
+    DreamLiteStepFollowingResult,
     dreamlite_content_aware_representation_losses,
     dreamlite_direct_representation_losses,
     dreamlite_representation_losses,
@@ -609,6 +610,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--projected-content-scale", type=float, default=1.0)
     parser.add_argument("--representation-final-scale", type=float, default=0.25)
     parser.add_argument("--functional-weight", type=float, default=5.0)
+    parser.add_argument(
+        "--functional-objective",
+        choices=("sampled_call", "teacher_following"),
+        default="sampled_call",
+        help=(
+            "sampled_call preserves historical training. teacher_following compares "
+            "all DreamLite calls on one trajectory advanced only by the native teacher."
+        ),
+    )
+    parser.add_argument(
+        "--skip-representation-loss",
+        action="store_true",
+        help="Skip representation-loss computation for pure response distillation.",
+    )
     parser.add_argument("--functional-cos-weight", type=float, default=0.5)
     parser.add_argument("--functional-start-step", type=int, default=10001)
     parser.add_argument("--functional-ramp-steps", type=int, default=5000)
@@ -661,6 +676,29 @@ def main() -> None:
             "cannot be restored accidentally."
         )
     args.resolved_representation_objective = validate_representation_objective(args)
+    if args.skip_representation_loss and args.functional_objective != "teacher_following":
+        raise ValueError(
+            "--skip-representation-loss is only supported with "
+            "--functional-objective teacher_following."
+        )
+    if args.skip_representation_loss and args.functional_start_step > 1:
+        raise ValueError(
+            "Pure teacher-following training must start at step 1 because no "
+            "fallback representation objective is active."
+        )
+    if args.skip_representation_loss and args.functional_weight <= 0:
+        raise ValueError("Pure teacher-following training requires positive functional weight.")
+    if args.functional_objective == "teacher_following":
+        if args.edit_manifest:
+            raise ValueError("Teacher-following full runs are generation-only.")
+        if args.grounded_functional_probability or args.grounded_batch_probability:
+            raise ValueError(
+                "Teacher-following full runs cannot mix image-grounded latent states."
+            )
+        if args.closed_loop_weight:
+            raise ValueError(
+                "Teacher-following and closed-loop objectives are mutually exclusive."
+            )
     context = setup_distributed()
     torch.manual_seed(args.seed + context.rank)
     random.seed(args.seed + context.rank)
@@ -1029,7 +1067,9 @@ def main() -> None:
         f"semantic_rows={len(semantic_data)} semantic_probability={args.semantic_prompt_probability:g} "
         f"edit_rows={len(edit_loader.dataset) if edit_loader else 0} target_step={args.target_step} "
         f"shared_smolvlm2={bool(shared_video_bridge)} "
-        f"representation_objective={args.resolved_representation_objective}",
+        f"representation_objective={args.resolved_representation_objective} "
+        f"functional_objective={args.functional_objective} "
+        f"skip_representation={args.skip_representation_loss}",
     )
     rank0_print(
         context,
@@ -1267,10 +1307,14 @@ def main() -> None:
                     student = bridge(prompts, mode=mode, images=images)
                 teacher_condition = teacher.encode(prompts, mode=mode, images=images)
                 use_content_alignment = (
+                    not args.skip_representation_loss
+                    and
                     args.resolved_representation_objective == "content_aware"
                     and mode == "generate"
                 )
                 use_direct_alignment = (
+                    not args.skip_representation_loss
+                    and
                     args.resolved_representation_objective == "direct"
                     and mode == "generate"
                 )
@@ -1321,7 +1365,7 @@ def main() -> None:
                     )
                     repr_value = representation_total(repr_losses, args)
                     repr_value = repr_value + args.projected_weight * projected_value
-                else:
+                elif not args.skip_representation_loss:
                     repr_losses = dreamlite_representation_losses(
                         student, teacher_condition
                     )
@@ -1331,6 +1375,15 @@ def main() -> None:
                     )
                     repr_value = representation_total(repr_losses, args)
                     repr_value = repr_value + args.projected_weight * projected_value
+                else:
+                    zero = student.prompt_embeds.new_zeros((), dtype=torch.float32)
+                    repr_losses = {
+                        "token_cosine": zero,
+                        "pooled_cosine": zero,
+                    }
+                    projected_losses = None
+                    projected_value = zero
+                    repr_value = zero
                 if (
                     args.closed_loop_weight <= 0
                     or current_step < args.closed_loop_start_step
@@ -1354,6 +1407,13 @@ def main() -> None:
                     terminal_relative_mse=repr_value.new_zeros(()),
                     calls=0,
                 )
+                step_following = DreamLiteStepFollowingResult(
+                    prediction_mse=repr_value.new_zeros(()),
+                    prediction_relative_mse=repr_value.new_zeros(()),
+                    prediction_cosine=repr_value.new_zeros(()),
+                    transition_relative_mse=repr_value.new_zeros(()),
+                    calls=0,
+                )
                 functional_loss_multiplier = 1.0
                 functional_scale = linear_ramp(
                     current_step,
@@ -1372,7 +1432,22 @@ def main() -> None:
                     % args.closed_loop_every
                     == 0
                 )
-                if run_closed:
+                if (
+                    args.functional_objective == "teacher_following"
+                    and current_step >= args.functional_start_step
+                ):
+                    phase = "teacher_following"
+                    step_following = controller.teacher_following_loss(
+                        student,
+                        teacher_condition,
+                        source_images=images,
+                        height=resolution.height,
+                        width=resolution.width,
+                        time_id_height=resolution.time_id_height,
+                        time_id_width=resolution.time_id_width,
+                        batch_size=args.functional_batch_size,
+                    )
+                elif run_closed:
                     phase = "closed_loop"
                     closed = controller.closed_loop_loss(
                         student,
@@ -1414,12 +1489,19 @@ def main() -> None:
                 else:
                     phase = "representation"
                 loss = repr_scale * repr_value
-                loss = loss + functional_scale * functional_loss_multiplier * (
-                    args.functional_weight * functional.relative_mse
-                    + args.functional_cos_weight * functional.cosine
-                    + args.transition_weight * functional.transition_relative_mse
-                    + args.transition_cos_weight * functional.transition_cosine
-                )
+                if args.functional_objective == "teacher_following":
+                    loss = loss + (
+                        functional_scale
+                        * args.functional_weight
+                        * step_following.prediction_mse
+                    )
+                else:
+                    loss = loss + functional_scale * functional_loss_multiplier * (
+                        args.functional_weight * functional.relative_mse
+                        + args.functional_cos_weight * functional.cosine
+                        + args.transition_weight * functional.transition_relative_mse
+                        + args.transition_cos_weight * functional.transition_cosine
+                    )
                 loss = loss + closed_scale * args.closed_loop_weight * (
                     args.closed_loop_prediction_weight * closed.prediction_relative_mse
                     + args.closed_loop_cos_weight
@@ -1534,6 +1616,19 @@ def main() -> None:
                         functional.transition_relative_mse.detach(),
                         context,
                     ),
+                    "step_following_prediction_mse": scalar_mean(
+                        step_following.prediction_mse.detach(), context
+                    ),
+                    "step_following_prediction_relative_mse": scalar_mean(
+                        step_following.prediction_relative_mse.detach(), context
+                    ),
+                    "step_following_prediction_cosine": scalar_mean(
+                        step_following.prediction_cosine.detach(), context
+                    ),
+                    "step_following_transition_relative_mse": scalar_mean(
+                        step_following.transition_relative_mse.detach(), context
+                    ),
+                    "step_following_calls": step_following.calls,
                     "closed_terminal_relative_mse": scalar_mean(
                         closed.terminal_relative_mse.detach(), context
                     ),
@@ -1559,7 +1654,14 @@ def main() -> None:
                         "func": f"{item['functional_relative_mse']:.4f}",
                         "res": resolution.label,
                     }
-                    if args.resolved_representation_objective == "content_aware":
+                    if args.functional_objective == "teacher_following":
+                        postfix["func"] = (
+                            f"{item['step_following_prediction_mse']:.4f}"
+                        )
+                        postfix["trans"] = (
+                            f"{item['step_following_transition_relative_mse']:.4f}"
+                        )
+                    elif args.resolved_representation_objective == "content_aware":
                         postfix["trans"] = (
                             f"{item['functional_transition_relative_mse']:.4f}"
                         )
@@ -1591,7 +1693,9 @@ def main() -> None:
                         "config": vars(args),
                         "initialization": initialization,
                         "architecture": (
-                            "MobileOVDreamLiteSharedSmolVLM2ImageBridgeV1"
+                            "MobileOVDreamLiteCompactBridgeStepFollowingV1"
+                            if args.functional_objective == "teacher_following"
+                            else "MobileOVDreamLiteSharedSmolVLM2ImageBridgeV1"
                             if shared_video_bridge is not None
                             else
                             "MobileOVDreamLiteCompactBridgeV12"
@@ -1635,6 +1739,10 @@ def main() -> None:
                         },
                         "prompt_sources": generation_data.source_summary,
                         "functional_teacher": (
+                            "frozen DreamLite-mobile UNet, native 4-call schedule, "
+                            "plain prediction MSE on every native-teacher trajectory state"
+                            if args.functional_objective == "teacher_following"
+                            else
                             "frozen DreamLite-mobile UNet, native 4-call schedule, "
                             "mixed generated and real-image-derived same-state response distillation"
                             if args.training_version.lower().startswith("v11")

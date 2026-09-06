@@ -366,6 +366,45 @@ def test_functional_loss_can_use_detached_student_prefix_without_state_mismatch(
     assert student_tokens.grad is not None
 
 
+def test_teacher_following_loss_matches_all_calls_on_native_states() -> None:
+    controller = DreamLiteFrozenController.__new__(DreamLiteFrozenController)
+    controller.backend = FakeDreamLiteBackend()
+    controller.num_steps = 4
+    student_tokens = torch.full((1, 5, 8), 0.75, requires_grad=True)
+    teacher_tokens = torch.full((1, 5, 8), 0.5)
+    mask = torch.ones(1, 5, dtype=torch.long)
+
+    result = controller.teacher_following_loss(
+        DreamLiteCondition(student_tokens, mask),
+        DreamLiteCondition(teacher_tokens, mask),
+        source_images=None,
+        height=64,
+        width=96,
+        time_id_height=800,
+        time_id_width=1280,
+        batch_size=1,
+    )
+    result.prediction_mse.backward()
+
+    calls = controller.backend.calls
+    assert result.calls == 4
+    assert len(calls) == 8
+    for call_index in range(4):
+        teacher_call = calls[2 * call_index]
+        student_call = calls[2 * call_index + 1]
+        assert torch.equal(teacher_call["latents"], student_call["latents"])
+        assert student_call["time_id_height"] == 800
+        assert student_call["time_id_width"] == 1280
+    # The next shared state follows the teacher prediction (0.5), not the
+    # student's larger prediction (0.75).
+    assert torch.allclose(
+        calls[2]["latents"], torch.full_like(calls[2]["latents"], 0.5)
+    )
+    assert torch.allclose(result.prediction_mse, torch.tensor(0.0625))
+    assert student_tokens.grad is not None
+    assert torch.isfinite(student_tokens.grad).all()
+    assert student_tokens.grad.norm() > 0
+
 def test_grounded_functional_loss_uses_real_image_state_not_edit_condition() -> None:
     controller = DreamLiteFrozenController.__new__(DreamLiteFrozenController)
     controller.backend = FakeDreamLiteBackend()
