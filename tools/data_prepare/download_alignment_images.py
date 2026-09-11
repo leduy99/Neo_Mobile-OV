@@ -108,7 +108,10 @@ def resolve_plan(output: Path, *, repo_id: str, revision: str, count: int, seed:
 
 
 def download_shard(shard: Shard, *, output: Path, repo_id: str, revision: str, retries: int) -> Path:
+    if not safe_member(shard.path):
+        raise ValueError(f"Unsafe download path: {shard.path}")
     destination = output / "shards" / shard.path
+    destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.is_file() and destination.stat().st_size == shard.size:
         if sha256_file(destination) == shard.sha256:
             return destination

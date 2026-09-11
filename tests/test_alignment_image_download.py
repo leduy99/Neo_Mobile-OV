@@ -289,13 +289,14 @@ def test_index_reader_rejects_escape_and_corruption(tmp_path):
 
 
 @pytest.mark.parametrize("exit_code", [0, 23])
-def test_shell_propagates_download_status_and_stops_heartbeat(tmp_path, exit_code):
+@pytest.mark.parametrize("scope", ["images", "stage1"])
+def test_shell_propagates_download_status_and_stops_heartbeat(tmp_path, exit_code, scope):
     root = Path(__file__).resolve().parents[1]
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     fake_python = fake_bin / "python"
     fake_python.write_text(f"#!{sys.executable}\n" + """
-import os, pathlib, signal, sys, time
+import json, os, pathlib, signal, sys, time
 root = pathlib.Path(os.environ['TEST_ROOT'])
 if sys.argv[1] == '-c':
     sys.exit(0)
@@ -312,12 +313,14 @@ if sys.argv[1].endswith('gpu_heartbeat.py'):
         if stop_file.exists():
             stop()
         time.sleep(0.01)
+(root / 'download_command.json').write_text(json.dumps(sys.argv))
 time.sleep(0.1)
 sys.exit(int(os.environ['TEST_EXIT']))
 """)
     fake_python.chmod(0o755)
     srun = fake_bin / "srun"
-    srun.write_text('#!/bin/sh\nwhile [ "${1#--}" != "$1" ]; do shift; done\nexec "$@"\n')
+    srun.write_text('#!/bin/sh\ncase " $* " in *" --cpu-bind=none "*) ;; *) exit 91 ;; esac\n'
+                    'while [ "${1#--}" != "$1" ]; do shift; done\nexec "$@"\n')
     srun.chmod(0o755)
     sleep = fake_bin / "sleep"
     sleep.write_text('#!/bin/sh\n/bin/sleep 0.1\n')
@@ -325,7 +328,7 @@ sys.exit(int(os.environ['TEST_EXIT']))
     env = dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}", TEST_ROOT=str(tmp_path),
                TEST_EXIT=str(exit_code), PYTHON_BIN=str(fake_python), HF_HOME=str(tmp_path / "cache"),
                TMPDIR=str(tmp_path / "tmp"), DATASET_OUTPUT_DIR=str(tmp_path / "data"),
-               SLURM_JOB_ID="unit-test-no-real-gpu", DRY_RUN="0")
+               SLURM_JOB_ID="unit-test-no-real-gpu", DRY_RUN="0", ALIGNMENT_SCOPE=scope)
     result = subprocess.run(["bash", str(root / "scripts/run_alignment_image_download.sh")],
                             env=env, capture_output=True, text=True, timeout=10)
     assert result.returncode == exit_code, result.stderr + result.stdout
@@ -333,6 +336,9 @@ sys.exit(int(os.environ['TEST_EXIT']))
     assert (tmp_path / "heartbeat_stopped").exists()
     assert not (tmp_path / "heartbeat_forced").exists()
     assert not list((tmp_path / "tmp").glob("alignment-data-*"))
+    command = json.loads((tmp_path / "download_command.json").read_text())
+    expected = "prepare_stage1_alignment.py" if scope == "stage1" else "download_alignment_images.py"
+    assert command[1].endswith(expected)
 
 
 def test_rejection_gate_does_not_mark_dataset_complete(tmp_path, monkeypatch):
