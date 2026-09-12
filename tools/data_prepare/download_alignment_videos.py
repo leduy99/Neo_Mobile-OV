@@ -105,7 +105,9 @@ def load_captions(path: Path) -> dict[str, str]:
 
 def probe_video(payload: bytes, *, min_seconds: float, max_seconds: float,
                 min_side: int, min_frames: int) -> dict:
-    with av.open(io.BytesIO(payload)) as container:
+    # Legacy MP4 tags may not be UTF-8. These unused tags are not our annotation captions;
+    # tolerate their encoding only, while keeping frame decoding and validation strict.
+    with av.open(io.BytesIO(payload), metadata_errors="replace") as container:
         if len(container.streams.video) != 1:
             raise RejectedVideo("not_one_video_stream")
         stream = container.streams.video[0]

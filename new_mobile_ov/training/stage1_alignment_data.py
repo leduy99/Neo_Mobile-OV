@@ -55,7 +55,8 @@ def read_alignment_sample(record: dict, sources: dict[str, Path], *, num_video_f
         raise ValueError("T2V must sample distinct frames; do not repeat a still image")
     indices = [(index * (count - 1)) // (num_video_frames - 1) for index in range(num_video_frames)]
     selected, frames, times, decoded = set(indices), [], [], 0
-    with av.open(io.BytesIO(payload)) as container:
+    # Match preparation: tolerate unused legacy metadata, not damaged frames or captions.
+    with av.open(io.BytesIO(payload), metadata_errors="replace") as container:
         stream = container.streams.video[0]
         stream.codec_context.thread_count = 1
         for index, frame in enumerate(container.decode(stream)):

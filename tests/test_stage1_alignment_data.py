@@ -18,11 +18,15 @@ from tools.data_prepare import download_alignment_videos as videos
 from tools.data_prepare import prepare_stage1_alignment as pipeline
 
 
-def encoded_video(frames=60, width=64, height=48, fps=24):
+def encoded_video(frames=60, width=64, height=48, fps=24, metadata_location=None):
     output = io.BytesIO()
     with av.open(output, "w", format="mp4") as container:
         stream = container.add_stream("mpeg4", rate=fps)
         stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
+        if metadata_location == "container":
+            container.metadata["comment"] = "Module de gestion video"
+        elif metadata_location == "stream":
+            stream.metadata["handler_name"] = "Module de gestion video"
         for index in range(frames):
             image = Image.new("RGB", (width, height), (index * 3 % 255, 40, 80))
             for packet in stream.encode(av.VideoFrame.from_image(image)):
@@ -70,6 +74,37 @@ def test_video_probe_and_full_span_sampling(tmp_path):
         read_alignment_sample(record, {"video": tmp_path}, num_video_frames=1)
 
 
+@pytest.mark.parametrize("metadata_location", ["container", "stream"])
+def test_non_utf8_video_metadata_preserves_frames_and_caption(tmp_path, metadata_location):
+    clean = encoded_video(metadata_location=metadata_location)
+    marker = b"Module de gestion video"
+    assert clean.count(marker) == 1
+    # Same-size replacement corrupts only a metadata string, not MP4 structure or frames.
+    payload = clean.replace(marker, b"Module de gestion vid\x8eo")
+    with pytest.raises(UnicodeDecodeError):
+        with av.open(io.BytesIO(payload)):
+            pass
+    info = videos.probe_video(payload, **POLICY)
+    assert info == videos.probe_video(clean, **POLICY)
+    archive = tmp_path / "shards/video.tar"
+    shard = make_archive(archive, [("legacy.mp4", payload), ("clean.mp4", clean)])
+    captions = {"legacy.mp4": "A changing light.", "clean.mp4": "A changing light."}
+    receipt = videos.index_shard(archive, shard, tmp_path, captions,
+                                revision="pin", annotation_sha256="a" * 64, policy=POLICY)
+    assert receipt["valid_pairs"] == 2 and receipt["errors"] == {}
+    rows = [json.loads(line) for line in (tmp_path / receipt["index"]).read_text().splitlines()]
+    samples = [read_alignment_sample(
+        dict(task="t2v", prompt=row["caption"], target=build.media_reference(row, "video", "video")),
+        {"video": tmp_path}) for row in rows]
+    assert samples[0]["prompt"] == captions["legacy.mp4"]
+    assert samples[0]["frame_indices"] == samples[1]["frame_indices"]
+    assert samples[0]["frame_times"] == samples[1]["frame_times"]
+    assert len(samples[0]["target_frames"]) == 49
+    assert all(a.tobytes() == b.tobytes() for a, b in zip(
+        samples[0]["target_frames"], samples[1]["target_frames"]))
+    assert rows[0]["video_sha256"] == hashlib.sha256(payload).hexdigest()
+
+
 @pytest.mark.parametrize("changes,reason", [
     ({"min_seconds": 3}, "duration"), ({"max_seconds": 1}, "too_long"),
     ({"min_frames": 61}, "too_few_frames"), ({"min_side": 128}, "low_resolution"),
@@ -97,6 +132,9 @@ def test_caption_schema_and_duplicate_key_fail(tmp_path):
         videos.load_captions(path)
     path.write_text(json.dumps([dict(video="../000.mp4", text="a")]))
     with pytest.raises(ValueError):
+        videos.load_captions(path)
+    path.write_bytes(b'[{"video":"000.mp4","text":"bad \x8e caption"}]')
+    with pytest.raises(UnicodeDecodeError):
         videos.load_captions(path)
 
 
@@ -192,6 +230,68 @@ def test_video_download_index_and_offline_resume(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="incomplete"):
         videos.run(args)
     assert not (output / ".download_complete").exists()
+
+
+def test_metadata_failure_resume_reuses_downloads_and_good_indexes(tmp_path, monkeypatch):
+    clean = encoded_video()
+    legacy = encoded_video(metadata_location="stream").replace(
+        b"Module de gestion video", b"Module de gestion vid\x8eo")
+    paths = [tmp_path / "fixture/clean.tar", tmp_path / "fixture/legacy.tar"]
+    shards = [make_archive(path, [(name, payload)]) for path, name, payload in zip(
+        paths, ("clean.mp4", "legacy.mp4"), (clean, legacy))]
+    annotation = tmp_path / "fixture/annotation.json"
+    annotation.write_text(json.dumps([dict(video=name, text="A changing light.")
+                                     for name in ("clean.mp4", "legacy.mp4")]))
+    spec = images.Shard("annotation.json", annotation.stat().st_size, images.sha256_file(annotation))
+    output = tmp_path / "download"
+    args = videos.parse_args(["--output-dir", str(output), "--num-shards", "2", "--min-side", "32",
+                             "--disk-margin-gib", "0"])
+    plan = dict(revision="pin", annotation=asdict(spec), shards=[asdict(shard) for shard in shards],
+                expected_bytes=spec.size + sum(shard.size for shard in shards))
+    monkeypatch.setattr(videos, "resolve_plan", lambda *a, **kw: plan)
+    sources = {path.name: path for path in [*paths, annotation]}
+
+    def download(**kwargs):
+        target = Path(kwargs["local_dir"]) / kwargs["filename"]
+        shutil.copyfile(sources[kwargs["filename"]], target)
+        return str(target)
+
+    monkeypatch.setattr(images, "hf_hub_download", download)
+    probe = videos.probe_video
+
+    def strict_probe(payload, **kwargs):
+        with av.open(io.BytesIO(payload)):
+            pass
+        return probe(payload, **kwargs)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(videos, "probe_video", strict_probe)
+        with pytest.raises(RuntimeError, match="incomplete"):
+            videos.run(args)
+    summary = json.loads((output / "download_summary.json").read_text())
+    assert summary["shards_verified"] == 1
+    assert summary["failures"][0]["shard"] == "legacy.tar"
+    assert "UnicodeDecodeError" in summary["failures"][0]["error"]
+    assert not (output / ".download_complete").exists()
+    good_index = output / "indexes/clean.tar.jsonl"
+    good_receipt = good_index.with_suffix(".json")
+    before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in (good_index, good_receipt)]
+    probes = []
+
+    def resume_probe(payload, **kwargs):
+        assert payload == legacy, "Verified clean shard must reuse its index"
+        probes.append(payload)
+        return probe(payload, **kwargs)
+
+    monkeypatch.setattr(videos, "probe_video", resume_probe)
+    monkeypatch.setattr(images, "hf_hub_download", lambda **kw: pytest.fail("resume redownloaded a shard"))
+    summary = videos.run(args)
+    assert summary["status"] == "complete" and summary["shards_verified"] == 2
+    assert summary["valid_video_caption_pairs"] == 2 and summary["failures"] == []
+    assert summary["errors"] == {} and len(probes) == 1
+    assert (output / ".download_complete").exists()
+    assert before == [(path.read_bytes(), path.stat().st_mtime_ns) for path in (good_index, good_receipt)]
+    assert len((output / "samples.jsonl").read_text().splitlines()) == 2
 
 
 def source_release(root, rows, count_key):
