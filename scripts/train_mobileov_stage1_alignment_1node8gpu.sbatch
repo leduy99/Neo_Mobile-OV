@@ -29,18 +29,24 @@ test -s "${DATA_ROOT}/.stage1_data_complete"
 test -x "${CONDA_ENV}/bin/torchrun"
 mkdir -p logs "${TMPDIR}"
 RESUME_ARGS=()
+PHASE="${PHASE:-1}"
+if [[ "${PHASE}" == 2 ]]; then
+    test -s "${INIT_CONNECTOR:?Phase 2 requires INIT_CONNECTOR}"
+    RESUME_ARGS+=(--init-connector "${INIT_CONNECTOR}" --expected-init-step "${EXPECTED_INIT_STEP:-15000}")
+fi
 if [[ -n "${RESUME:-}" ]]; then
     test -s "${RESUME}"
     RESUME_ARGS+=(--resume "${RESUME}")
 fi
-echo "Stage1: SmolVLM2 + MCP + frozen multistep NeoDragon; no external image generator"
+echo "Phase=${PHASE}: SmolVLM2 + MCP + multistep NeoDragon; no external image generator"
 echo "DATA_ROOT=${DATA_ROOT} OUT=${OUT} STEPS=${STEPS:-15000} ACCUMULATION=${ACCUMULATION:-3}"
 "${CONDA_ENV}/bin/torchrun" --standalone --nnodes=1 --nproc_per_node=8 \
     tools/train_mobileov_stage1.py \
+    --phase "${PHASE}" \
     --config "${CONFIG:-configs/mobile_ov_neodragon.yaml}" \
     --data-root "${DATA_ROOT}" --output-dir "${OUT}" \
     --steps "${STEPS:-15000}" --accumulation "${ACCUMULATION:-3}" \
     --lr "${LR:-1e-4}" --warmup 50 \
     --save-every "${SAVE_EVERY:-1000}" --archive-every "${ARCHIVE_EVERY:-5000}" \
     --validate-every "${VALIDATE_EVERY:-500}" --validation-samples "${VALIDATION_SAMPLES:-2}" \
-    --workers "${WORKERS:-2}" "${RESUME_ARGS[@]}"
+    --workers "${WORKERS:-2}" --max-runtime-seconds "${MAX_RUNTIME_SECONDS:-0}" "${RESUME_ARGS[@]}"

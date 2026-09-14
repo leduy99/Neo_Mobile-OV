@@ -92,9 +92,14 @@ def prepare_sample(record, sources, short_side=320, long_side=512):
 
 class Stage1Dataset(Dataset):
     def __init__(self, root, *, steps, accumulation, rank, world_size, seed,
-                 start_step=0, short_side=320, long_side=512):
+                 start_step=0, short_side=320, long_side=512, tasks=TASKS):
+        self.tasks = tuple(tasks)
+        if not self.tasks or len(set(self.tasks)) != len(self.tasks) or not set(self.tasks) <= set(TASKS):
+            raise ValueError("Invalid training tasks")
+        if accumulation % len(self.tasks):
+            raise ValueError("Accumulation must contain complete task cycles")
         self.root, self.sources = Path(root), load_sources(Path(root))
-        self.records = {task: JsonlRecords(self.root / "train" / f"{task}.jsonl") for task in TASKS}
+        self.records = {task: JsonlRecords(self.root / "train" / f"{task}.jsonl") for task in self.tasks}
         self.steps, self.accumulation = steps, accumulation
         self.rank, self.world_size, self.seed = rank, world_size, seed
         self.start_step, self.short_side, self.long_side = start_step, short_side, long_side
@@ -104,8 +109,8 @@ class Stage1Dataset(Dataset):
 
     def __getitem__(self, index):
         micro = index + self.start_step * self.accumulation
-        task = TASKS[micro % len(TASKS)]
-        ordinal = (micro // len(TASKS)) * self.world_size + self.rank
+        task = self.tasks[micro % len(self.tasks)]
+        ordinal = (micro // len(self.tasks)) * self.world_size + self.rank
         records = self.records[task]
         position = permuted_index(ordinal, len(records), self.seed, task)
         sample = prepare_sample(records[position], self.sources, self.short_side, self.long_side)

@@ -25,22 +25,24 @@ def test_stateless_permutation_is_bijective_per_epoch(count):
     assert stage1.permuted_index(12, count, 42, "t2v") == stage1.permuted_index(12, count, 42, "t2v")
 
 
-def test_rank_partition_resume_and_task_coverage(tmp_path, monkeypatch):
+@pytest.mark.parametrize("tasks", [stage1.TASKS, ("t2i", "t2v")])
+def test_rank_partition_resume_and_task_coverage(tmp_path, monkeypatch, tasks):
     (tmp_path / "train").mkdir()
     (tmp_path / "sources.json").write_text("{}")
     for task in stage1.TASKS:
         (tmp_path / "train" / f"{task}.jsonl").write_text("".join(
             json.dumps(dict(task=task, sample_id=f"{task}:{i}")) + "\n" for i in range(100)))
     monkeypatch.setattr(stage1, "prepare_sample", lambda record, *args: record.copy())
-    common = dict(steps=10, accumulation=3, world_size=2, seed=42)
+    common = dict(steps=10, accumulation=len(tasks), world_size=2, seed=42, tasks=tasks)
     a = stage1.Stage1Dataset(tmp_path, rank=0, **common)
     b = stage1.Stage1Dataset(tmp_path, rank=1, **common)
     resumed = stage1.Stage1Dataset(tmp_path, rank=0, start_step=3, **common)
-    assert resumed[0] == a[9]
+    offset = 3 * len(tasks)
+    assert resumed[0] == a[offset]
     for i in range(len(resumed)):
-        assert resumed[i] == a[i + 9]
-    assert [a[i]["task"] for i in range(3)] == list(stage1.TASKS)
-    assert {a[i]["sample_id"] for i in range(30)}.isdisjoint({b[i]["sample_id"] for i in range(30)})
+        assert resumed[i] == a[i + offset]
+    assert [a[i]["task"] for i in range(len(tasks))] == list(tasks)
+    assert {a[i]["sample_id"] for i in range(len(a))}.isdisjoint({b[i]["sample_id"] for i in range(len(b))})
 
 
 def test_full_tokens_preserved_and_pooled_head_trainable():

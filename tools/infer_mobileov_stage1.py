@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from tools.train_mobileov_stage1 import FORMAT, load_stack, autocast
+from new_mobile_ov.training.stage2_alignment import FORMAT as STAGE2_FORMAT
 from new_mobile_ov.training.stage1_alignment import frozen_signatures, JsonlRecords, prepare_sample, TASKS
 from new_mobile_ov.training.stage1_alignment_data import load_sources
 from new_mobile_ov.generation.neodragon_compat import install_neodragon_generation_patches
@@ -28,6 +29,55 @@ def pad_condition(condition, length):
     if extra < 0:
         raise ValueError("CFG padding must not crop condition tokens")
     return F.pad(tokens, (0, 0, 0, extra)), F.pad(mask, (0, extra)), pooled
+
+
+def verify_inference_stack(cfg, encoder, dit, vae, contract):
+    if encoder.processor_sha256 != contract.get("processor_sha256"):
+        raise ValueError("Processor differs from training")
+    actual = frozen_signatures(dict(smolvlm2=encoder, dit=dit, vae=vae))
+    if actual != contract["frozen_weights_sha256"]:
+        raise ValueError("Frozen generator/VLM/VAE weights differ from training")
+    file_sha = sha256_file(Path(cfg.bridge.smolvlm2_ckpt_path))
+    repacked = file_sha != contract["smolvlm2_sha256"]
+    if repacked:
+        print("SmolVLM2 file SHA differs, but all loaded state tensors match training exactly; "
+              "accepting equivalent checkpoint packaging.", flush=True)
+    return dict(frozen_weights_verified=True, processor_verified=True,
+                smolvlm2_file_repacked=repacked, smolvlm2_file_sha256=file_sha,
+                training_smolvlm2_file_sha256=contract["smolvlm2_sha256"])
+
+
+@torch.no_grad()
+def generate_frames(dit, vae, scheduler, condition, *, device, seed, height=320, width=512,
+                    num_frames=49, first_steps=20, video_steps=10, guidance=7., video_guidance=5.):
+    from neodragon.utils.generation_utils import (
+        _prepare_latent_noise, _downsample_noise_2x, _prepare_past_condition_latents,
+        _generate_one_unit, _decode_latent,
+    )
+    install_neodragon_generation_patches(device=device)
+    # Reset after model/condition creation so paired runs use identical initial and pyramid noise.
+    torch.manual_seed(seed)
+    with autocast(device):
+        units = 1 + (num_frames - 1) // 8
+        latent = _prepare_latent_noise(1, dit.config.in_channels, units,
+                                       height // 8, width // 8, torch.bfloat16, device)
+        noise = _downsample_noise_2x(latent, 2)
+        generated, statistics = [], []
+        for unit in range(units):
+            history = _prepare_past_condition_latents(generated, 3, True)
+            generated.append(_generate_one_unit(
+                scheduler, dit, 3, noise[:, :, unit:unit + 1], history, *condition,
+                num_inference_steps=[first_steps if unit == 0 else video_steps] * 3,
+                device=device, dtype=torch.bfloat16, guidance_scale=guidance,
+                video_guidance_scale=video_guidance))
+            if not bool(torch.isfinite(generated[-1]).all()):
+                raise RuntimeError(f"Non-finite generated latent at unit {unit}")
+            statistics.append(dict(unit=unit, mean=float(generated[-1].float().mean()),
+                                   std=float(generated[-1].float().std())))
+        frames = _decode_latent(vae, torch.cat(generated, dim=2))
+    if len(frames) != num_frames:
+        raise RuntimeError("Decoded frame count mismatch")
+    return frames, statistics
 
 
 @torch.no_grad()
@@ -57,8 +107,8 @@ def main():
     if args.reconstruct_image and args.frames != 1:
         raise ValueError("Stage-1 reconstruction is an image task; use --frames 1")
     payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    if payload.get("format") != FORMAT:
-        raise ValueError("Not a Stage-1 connector checkpoint")
+    if payload.get("format") not in (FORMAT, STAGE2_FORMAT):
+        raise ValueError("Not a Stage-1/Stage-2 checkpoint")
     contract = payload["contract"]
     validation_sample = None
     if args.validation_task:
@@ -80,12 +130,15 @@ def main():
     device = torch.device("cuda", 0)
     torch.manual_seed(args.seed)
     cfg, encoder, connector, dit, vae, scheduler = load_stack(args, device)
-    if encoder.processor_sha256 != contract.get("processor_sha256"):
-        raise ValueError("Processor differs from training")
-    if frozen_signatures(dict(smolvlm2=encoder, dit=dit, vae=vae)) != contract["frozen_weights_sha256"]:
-        raise ValueError("Frozen generator/VLM/VAE weights differ from training")
-    if sha256_file(Path(cfg.bridge.smolvlm2_ckpt_path)) != contract["smolvlm2_sha256"]:
-        raise ValueError("SmolVLM2 weights differ from training")
+    base_contract = dict(contract)
+    if payload["format"] == STAGE2_FORMAT:
+        base_contract["frozen_weights_sha256"] = contract["initial_weights_sha256"]
+    weight_audit = verify_inference_stack(cfg, encoder, dit, vae, base_contract)
+    if payload["format"] == STAGE2_FORMAT:
+        if not all(bool(torch.isfinite(v).all()) for v in payload["dit"].values()):
+            raise ValueError("Non-finite trained DiT weights")
+        dit.load_state_dict(payload["dit"], strict=True)
+        weight_audit.update(trained_dit_loaded=True, checkpoint_step=payload["step"])
     connector.load_state_dict(payload["connector"], strict=True)
     connector.eval()
     del payload
@@ -99,31 +152,11 @@ def main():
         length = max(positive[0].shape[1], negative[0].shape[1])
         positive, negative = pad_condition(positive, length), pad_condition(negative, length)
         condition = [torch.cat([neg, pos]) for neg, pos in zip(negative, positive)]
-        from neodragon.utils.generation_utils import (
-            _prepare_latent_noise, _downsample_noise_2x, _prepare_past_condition_latents,
-            _generate_one_unit, _decode_latent,
-        )
-        install_neodragon_generation_patches(device=device)
-        units = 1 + (args.frames - 1) // 8
-        latent = _prepare_latent_noise(1, dit.config.in_channels, units,
-                                       args.height // 8, args.width // 8, torch.bfloat16, device)
-        noise = _downsample_noise_2x(latent, 2)
-        generated = []
-        unit_statistics = []
-        for unit in range(units):
-            history = _prepare_past_condition_latents(generated, 3, True)
-            generated.append(_generate_one_unit(
-                scheduler, dit, 3, noise[:, :, unit:unit + 1], history, *condition,
-                num_inference_steps=[args.first_steps if unit == 0 else args.video_steps] * 3,
-                device=device, dtype=torch.bfloat16, guidance_scale=args.guidance,
-                video_guidance_scale=args.video_guidance))
-            if not bool(torch.isfinite(generated[-1]).all()):
-                raise RuntimeError(f"Non-finite generated latent at unit {unit}")
-            unit_statistics.append(dict(unit=unit, mean=float(generated[-1].float().mean()),
-                                         std=float(generated[-1].float().std())))
-        frames = _decode_latent(vae, torch.cat(generated, dim=2))
-    if len(frames) != args.frames:
-        raise RuntimeError("Decoded frame count mismatch")
+    frames, unit_statistics = generate_frames(
+        dit, vae, scheduler, condition, device=device, seed=args.seed,
+        height=args.height, width=args.width, num_frames=args.frames,
+        first_steps=args.first_steps, video_steps=args.video_steps,
+        guidance=args.guidance, video_guidance=args.video_guidance)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if image is not None:
         image.save(args.output_dir / "reconstruction_input.png")
@@ -138,7 +171,7 @@ def main():
         external_anchor=False, validation_index=args.validation_index if args.validation_task else None,
         first_steps=args.first_steps, video_steps=args.video_steps,
         guidance=args.guidance, video_guidance=args.video_guidance, frames=len(frames),
-        unit_statistics=unit_statistics), indent=2))
+        unit_statistics=unit_statistics, weight_audit=weight_audit), indent=2))
 
 
 if __name__ == "__main__":
