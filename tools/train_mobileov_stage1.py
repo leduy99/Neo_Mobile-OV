@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -25,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 
 import torch
 import torch.distributed as dist
+from torch.distributed.elastic.multiprocessing.errors import record
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
@@ -37,6 +39,7 @@ from new_mobile_ov.training.stage1_alignment import (
 from tools.data_prepare.download_alignment_images import atomic_json, output_lock, sha256_file
 from tools.train_neodragon_dit_bridge import load_neodragon_train_modules, scale_vae_latents
 from new_mobile_ov.training import stage2_alignment as stage2
+from new_mobile_ov.training.stage1_vae import encode_posterior
 
 FORMAT = "mobileov_stage1_mcp_v1"
 
@@ -71,6 +74,10 @@ def parse_args(argv=None):
                         help="Gracefully pause at an update boundary; 0 disables the time budget")
     parser.add_argument("--verify-frozen", action="store_true", help="Full hashes before/after; intended for local smoke")
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--vae-window-size", type=int,
+                        help="Native causal encoding chunk: Phase 1 defaults to 16, Phase 2 to 8; no frame dropping")
+    parser.add_argument("--cuda-memory-limit-gib", type=float, default=0,
+                        help="Local memory regression test: cap the PyTorch allocator; 0 leaves it unrestricted")
     args = parser.parse_args(argv)
     args.tasks = TASKS if args.phase == 1 else stage2.TASKS
     if args.steps is None:
@@ -83,6 +90,12 @@ def parse_args(argv=None):
         args.accumulation = len(args.tasks)
     if args.lr is None:
         args.lr = 1e-4 if args.phase == 1 else 2e-5
+    if args.vae_window_size is None:
+        args.vae_window_size = 16 if args.phase == 1 else 8
+    if args.vae_window_size < 8 or args.vae_window_size % 8:
+        parser.error("VAE window must be a positive multiple of 8")
+    if not math.isfinite(args.cuda_memory_limit_gib) or args.cuda_memory_limit_gib < 0:
+        parser.error("Invalid CUDA memory limit")
     if (args.phase == 2) != (args.init_connector is not None):
         parser.error("Phase 2 requires --init-connector; Phase 1 always starts randomly or resumes its own run")
     if args.max_runtime_seconds < 0 or args.expected_init_step < 1:
@@ -116,12 +129,12 @@ def load_stack(args, device):
     return cfg, encoder, connector, dit, vae, scheduler
 
 
-def encode_sample(encoder, vae, sample, device, generator, dropout):
+def encode_sample(encoder, vae, sample, device, generator, dropout, *, window_size=16):
     drop = bool(torch.rand((), device=device, generator=generator) < dropout)
     layers, mask = encoder(sample["prompt"], sample["image"], drop_condition=drop)
     with torch.no_grad(), autocast(device):
         video = sample["video"].unsqueeze(0).to(device=device, dtype=torch.bfloat16)
-        posterior = vae.encode(video, temporal_chunk=video.shape[2] > 1).latent_dist
+        posterior = encode_posterior(vae, video, window_size=window_size)
         latent = scale_vae_latents(posterior.sample(generator=generator)).to(torch.bfloat16)
     expected = 1 if sample["task"] != "t2v" else 7
     if latent.shape[2] != expected or not bool(torch.isfinite(latent).all()):
@@ -146,7 +159,8 @@ def validate(args, ctx, encoder, connector, dit, vae, scheduler, dataset):
                 index = (item * ctx.world_size + ctx.rank) % len(records)
                 sample = prepare_sample(records[index], dataset.sources, args.short_side, args.long_side)
                 rng = generator_for(ctx.device, args.seed + 888888, index, 0)
-                layers, mask, latent, _ = encode_sample(encoder, vae, sample, ctx.device, rng, 0)
+                layers, mask, latent, _ = encode_sample(encoder, vae, sample, ctx.device, rng, 0,
+                                                       window_size=args.vae_window_size)
                 units = [0] if task != "t2v" else [0, latent.shape[2] - 1]
                 for stage in range(3):
                     for unit in units:
@@ -204,6 +218,22 @@ def runtime_expired(args, ctx, started):
     return bool(flag)
 
 
+def memory_report(ctx):
+    if ctx.device.type != "cuda":
+        return {}
+    keys = ("allocated_gib", "reserved_gib", "peak_allocated_gib", "peak_reserved_gib")
+    local = torch.tensor([torch.cuda.memory_allocated(ctx.device), torch.cuda.memory_reserved(ctx.device),
+                          torch.cuda.max_memory_allocated(ctx.device), torch.cuda.max_memory_reserved(ctx.device)],
+                         device=ctx.device, dtype=torch.float64) / 1024**3
+    rows = [torch.empty_like(local) for _ in range(ctx.world_size)]
+    if ctx.is_distributed:
+        dist.all_gather(rows, local)
+    else:
+        rows[0] = local
+    return {str(rank): dict(zip(keys, row.tolist())) for rank, row in enumerate(rows)}
+
+
+@record
 def main(argv=None):
     args = parse_args(argv)
     # Fail before touching CUDA on the login node.
@@ -215,6 +245,13 @@ def main(argv=None):
     try:
         if ctx.device.type != "cuda":
             raise RuntimeError("This trainer requires a SLURM GPU allocation")
+        if args.cuda_memory_limit_gib:
+            capacity = torch.cuda.get_device_properties(ctx.device).total_memory / 1024**3
+            if args.cuda_memory_limit_gib > capacity:
+                raise ValueError("Requested allocator limit exceeds physical GPU capacity")
+            torch.cuda.set_per_process_memory_fraction(args.cuda_memory_limit_gib / capacity, ctx.device)
+            print(f"[rank{ctx.rank}] PyTorch allocator capped at {args.cuda_memory_limit_gib} GiB; "
+                  "this does not emulate GPU kernels or cap NCCL allocations", flush=True)
         with output_lock(args.output_dir) if ctx.is_main else nullcontext():
             train(args, ctx)
     finally:
@@ -253,6 +290,9 @@ def train(args, ctx):
                     reconstruction="image_only_MLLM_input; no_DiT_clean_target_condition",
                     video_units="all_including_first; uniform_unit_stage_sampling; teacher_forced_causal_history",
                     task_ratio=[1, 1, 1], initialization="random_connector", optimizer="AdamW_fp32_master_eps1e-8")
+    # Keep old default Stage-1 resume contracts valid; record nondefault encoding explicitly.
+    if args.phase == 2 or args.vae_window_size != 16:
+        contract["vae_window_size"] = args.vae_window_size
     if args.phase == 2:
         payload = torch.load(args.init_connector, map_location="cpu", weights_only=False)
         stage2.initialize_from_alignment(
@@ -307,7 +347,8 @@ def train(args, ctx):
         print(f"Stage{args.phase}: steps={start}->{args.steps} world={ctx.world_size} global_batch={ctx.world_size * args.accumulation} "
               f"trainable_connector={sum(p.numel() for p in connector.parameters()):,} "
               f"trainable_dit={sum(p.numel() for p in dit.parameters() if p.requires_grad):,} "
-              f"tasks={args.tasks} counts={ {k: len(v) for k, v in dataset.records.items()} }", flush=True)
+              f"tasks={args.tasks} counts={ {k: len(v) for k, v in dataset.records.items()} } "
+              f"vae_window_size={args.vae_window_size}", flush=True)
     metrics = validate(args, ctx, encoder, connector, dit, vae, scheduler, dataset)
     if ctx.is_main:
         atomic_json(args.output_dir / f"validation_step{start:06d}.json", metrics)
@@ -323,7 +364,8 @@ def train(args, ctx):
         for micro in range(args.accumulation):
             sample = next(batches)
             rng = generator_for(ctx.device, args.seed, sample["micro"], ctx.rank)
-            layers, mask, latent, dropped = encode_sample(encoder, vae, sample, ctx.device, rng, args.condition_dropout)
+            layers, mask, latent, dropped = encode_sample(encoder, vae, sample, ctx.device, rng, args.condition_dropout,
+                                                         window_size=args.vae_window_size)
             # Independent draws avoid coupling image/video source order to a fixed stage.
             stage = int(torch.randint(3, (), device=ctx.device, generator=rng))
             unit = int(torch.randint(latent.shape[2], (), device=ctx.device, generator=rng))
@@ -342,6 +384,7 @@ def train(args, ctx):
                                      tokens=mask.shape[1], sample_id=sample["sample_id"],
                                      source_duration_seconds=sample.get("source_duration_seconds"),
                                      effective_sample_fps=sample.get("effective_sample_fps")))
+            del layers, mask, latent, loss
         component_norms = dict(connector=stage2.gradient_norm(connector))
         if args.phase == 2:
             component_norms["dit"] = stage2.gradient_norm(dit)
@@ -351,6 +394,7 @@ def train(args, ctx):
         if any(p.grad is not None for module in frozen.values() for p in module.parameters()):
             raise RuntimeError("Frozen backbone received gradients")
         optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
         if runtime_expired(args, ctx, launched):
             end = step
         if step == start + 1 or step % args.log_every == 0 or step == end:
@@ -358,7 +402,8 @@ def train(args, ctx):
                           component_grad_norm={key: scalar_mean(value, ctx) for key, value in component_norms.items()},
                           loss={task: scalar_mean(torch.stack(values).mean(), ctx) for task, values in losses.items()},
                           elapsed_seconds=time.monotonic() - started, rank0_samples=observations,
-                          peak_memory_gib=torch.cuda.max_memory_allocated(ctx.device) / 1024**3)
+                          peak_memory_gib=torch.cuda.max_memory_allocated(ctx.device) / 1024**3,
+                          memory_by_rank=memory_report(ctx))
             if ctx.is_main:
                 print(json.dumps(report), flush=True)
                 with (args.output_dir / "history.jsonl").open("a") as stream:
@@ -376,6 +421,10 @@ def train(args, ctx):
             barrier()
         if step == end:
             break
+    memory = memory_report(ctx)
+    if ctx.is_main:
+        atomic_json(args.output_dir / "memory_summary.json",
+                    dict(allocator_limit_gib=args.cuda_memory_limit_gib, by_rank=memory))
     if args.verify_frozen:
         after = frozen_signatures(frozen)
         if before != after:

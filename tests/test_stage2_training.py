@@ -50,10 +50,12 @@ def batch(rank, step, micro):
 def test_phase_defaults_and_invalid_initialization():
     phase1 = parse_args(["--output-dir", "unused", "--steps", "100000"])
     assert phase1.phase == 1 and phase1.accumulation == 3 and phase1.lr == 1e-4
+    assert phase1.vae_window_size == 16
     phase2 = parse_args(["--phase", "2", "--init-connector", "init.pt", "--output-dir", "unused"])
     assert phase2.steps == 100000 and phase2.accumulation == 2 and phase2.lr == 2e-5
     assert phase2.save_every == phase2.archive_every == 10000
     assert phase2.tasks == ("t2i", "t2v")
+    assert phase2.vae_window_size == 8
     for extra in (["--phase", "2"], ["--init-connector", "init.pt"], ["--max-runtime-seconds", "-1"]):
         with pytest.raises(SystemExit):
             parse_args(["--output-dir", "unused", *extra])
@@ -297,7 +299,7 @@ def test_training_loop_pause_resume_is_exact_for_both_phases(tmp_path, monkeypat
             micro = self.start * self.accumulation + index
             return dict(micro=micro, task=self.tasks[micro % len(self.tasks)], sample_id=str(micro))
 
-    def encode(encoder, vae, sample, device, rng, dropout):
+    def encode(encoder, vae, sample, device, rng, dropout, *, window_size):
         layers = [torch.randn(1, 9, 8, generator=rng) for _ in range(3)]
         latent = torch.randn(1, 4, 7 if sample["task"] == "t2v" else 1, 16, 24, generator=rng)
         return layers, torch.ones(1, 9), latent, False
@@ -335,3 +337,17 @@ def test_training_loop_pause_resume_is_exact_for_both_phases(tmp_path, monkeypat
         assert all(torch.equal(v, b[component][k]) for k, v in a[component].items())
     rows = [json.loads(line) for line in (partial / "history.jsonl").read_text().splitlines()]
     assert all(set(row["loss"]) == {"t2i", "t2v"} for row in rows)
+
+
+def test_entrypoint_records_root_exception_without_cuda(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    error_file = tmp_path / "worker_error.json"
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", TORCHELASTIC_ERROR_FILE=str(error_file))
+    env.pop("SLURM_JOB_ID", None)
+    result = subprocess.run([sys.executable, "-s", str(root / "tools/train_mobileov_stage1.py"),
+                             "--output-dir", str(tmp_path / "unused")], cwd=root, env=env,
+                            capture_output=True, text=True)
+    assert result.returncode == 1
+    error = json.loads(error_file.read_text())
+    assert "GPU training must run inside srun/sbatch" in error["message"]["message"]
+    assert "RuntimeError" in error["message"]["extraInfo"]["py_callstack"]
