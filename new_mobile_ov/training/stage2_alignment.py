@@ -1,6 +1,9 @@
 """Joint T2I/T2V adaptation after connector alignment, not DMD or joint VLM training."""
 from __future__ import annotations
 
+import math
+
+from PIL import Image
 import torch
 from torch import nn
 
@@ -8,6 +11,35 @@ from new_mobile_ov.training.stage1_alignment import flow_loss
 
 FORMAT = "mobileov_stage2_mcp_dit_v1"
 TASKS = ("t2i", "t2v")
+RECONSTRUCTION_SEED_OFFSET = 444444
+
+
+def reconstruction_contract(weight):
+    if not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight <= 0:
+        raise ValueError("Reconstruction weight must be finite and positive")
+    return dict(weight=float(weight), source="paired_t2i_target_same_vae_sample",
+                condition="image_only_MLLM_no_caption_no_dropout_no_clean_DiT_condition",
+                loss="pyramid_flow_mse_unit0_uniform_stage",
+                normalization="mean_text_flow_plus_weight_times_mean_reconstruction",
+                rng_seed_offset=RECONSTRUCTION_SEED_OFFSET)
+
+
+@torch.no_grad()
+def reconstruction_condition(encoder, sample):
+    video = sample["video"]
+    if sample["task"] != "t2i" or video.ndim != 4 or video.shape[:2] != (3, 1):
+        raise ValueError("Auxiliary reconstruction requires a single RGB T2I target")
+    # Recover the exact resized uint8 target without decoding the source/VAE again.
+    pixels = ((video[:, 0].detach().cpu().float() + 1) * 127.5).round().clamp(0, 255)
+    image = Image.fromarray(pixels.to(torch.uint8).permute(1, 2, 0).contiguous().numpy())
+    return encoder("", image, drop_condition=False)
+
+
+def reconstruction_coefficient(weight, accumulation):
+    if accumulation < 2 or accumulation % len(TASKS):
+        raise ValueError("Reconstruction requires complete T2I/T2V cycles")
+    # One auxiliary pass per T2I microbatch; never dilute the existing text losses.
+    return weight / (accumulation // len(TASKS))
 
 
 def initialize_from_alignment(payload, connector, dit, *, expected_step, signatures,

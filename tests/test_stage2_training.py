@@ -131,7 +131,7 @@ def test_checkpoint_contents_hardlink_and_exact_optimizer_resume(tmp_path):
     assert torch.load(latest, weights_only=True)["step"] == 10001
 
 
-def ddp_worker(rank, directory):
+def ddp_worker(rank, directory, reconstruction_weight):
     torch.set_num_threads(1)
     install_history()
     dist.init_process_group("gloo", init_method=f"file://{directory}/init", rank=rank, world_size=2)
@@ -148,14 +148,19 @@ def ddp_worker(rank, directory):
                     loss = model(*batch(rank, step, micro), scheduler(), stage=(step + micro + rank) % 3,
                                  unit=6 if micro else 0, generator=torch.Generator().manual_seed(700 + micro + rank))
                     (loss / 2).backward()
+                    if reconstruction_weight and micro == 0:
+                        rec = model(*batch(rank, step, 0), scheduler(), stage=2, unit=0,
+                                    generator=torch.Generator().manual_seed(1700 + rank))
+                        (rec * reconstruction_weight).backward()
             optimizer.step()
         torch.save(module.state_dict(), Path(directory) / f"rank{rank}.pt")
     finally:
         dist.destroy_process_group()
 
 
-def test_joint_ddp_accumulation_matches_global_batch(tmp_path, monkeypatch):
-    mp.spawn(ddp_worker, args=(str(tmp_path),), nprocs=2, join=True)
+@pytest.mark.parametrize("reconstruction_weight", [0, 0.1])
+def test_joint_ddp_accumulation_matches_global_batch(tmp_path, monkeypatch, reconstruction_weight):
+    mp.spawn(ddp_worker, args=(str(tmp_path), reconstruction_weight), nprocs=2, join=True)
     monkeypatch.setitem(sys.modules, "neodragon.utils.generation_utils", SimpleNamespace(
         _prepare_past_condition_latents=lambda past, stages, cfg: [past] * stages))
     torch.manual_seed(42)
@@ -168,6 +173,10 @@ def test_joint_ddp_accumulation_matches_global_batch(tmp_path, monkeypatch):
                 loss = reference(*batch(rank, step, micro), scheduler(), stage=(step + micro + rank) % 3,
                                  unit=6 if micro else 0, generator=torch.Generator().manual_seed(700 + micro + rank))
                 (loss / 4).backward()
+                if reconstruction_weight and micro == 0:
+                    rec = reference(*batch(rank, step, 0), scheduler(), stage=2, unit=0,
+                                    generator=torch.Generator().manual_seed(1700 + rank))
+                    (rec * reconstruction_weight / 2).backward()
         optimizer.step()
     a = torch.load(tmp_path / "rank0.pt", weights_only=True)
     b = torch.load(tmp_path / "rank1.pt", weights_only=True)
@@ -370,6 +379,38 @@ def test_training_loop_pause_resume_is_exact_for_both_phases(tmp_path, monkeypat
     extended_rows = [json.loads(line) for line in (extended / "history.jsonl").read_text().splitlines()]
     assert [row["step"] for row in extended_rows] == [5, 6]
     assert extended_rows[0]["lr"] == pytest.approx(2e-5 * 5 / 50)
+
+    def image_condition(encoder, sample):
+        rng = torch.Generator().manual_seed(400 + sample["micro"])
+        return [torch.randn(1, 13, 8, generator=rng) for _ in range(3)], torch.ones(1, 13)
+
+    monkeypatch.setattr(stage2, "reconstruction_condition", image_condition)
+    rec_args = [*resume_args, "--steps", "8", "--extend-steps", "--reconstruction-weight", "0.1",
+                "--enable-reconstruction-on-resume"]
+    with pytest.raises(ValueError, match="Resume contract mismatch"):
+        train("reconstruction_rejected", [*rec_args[:-1]])
+    with pytest.raises(ValueError, match="new output directory"):
+        train("joint", rec_args)
+    uninterrupted = train("rec_full", rec_args)
+    interrupted = train("rec_pause", [*rec_args, "--stop-after", "6"])
+    train("rec_pause", [*rec_args, "--resume", str(interrupted / "stage2_resume.pt"), "--expected-resume-step", "6"])
+    same(torch.load(uninterrupted / "stage2_resume.pt", weights_only=True),
+         torch.load(interrupted / "stage2_resume.pt", weights_only=True))
+    rec_rows = [json.loads(line) for line in (uninterrupted / "history.jsonl").read_text().splitlines()]
+    for row in rec_rows:
+        assert set(row["loss"]) == {"t2i", "t2v", "image_reconstruction"}
+        assert row["weighted_loss"] == pytest.approx(.5 * row["loss"]["t2i"] + .5 * row["loss"]["t2v"]
+                                                    + .1 * row["loss"]["image_reconstruction"])
+        rec_observation = next(x for x in row["rank0_samples"] if x["task"] == "image_reconstruction")
+        assert rec_observation["unit"] == 0 and rec_observation["dropped"] is False
+    assert rec_rows[0]["loss"]["t2i"] == extended_rows[0]["loss"]["t2i"]
+    assert [x for x in rec_rows[0]["rank0_samples"] if x["task"] != "image_reconstruction"] == extended_rows[0]["rank0_samples"]
+    provenance = json.loads((uninterrupted / "resume_from_step000004.json").read_text())
+    assert provenance["changed_contract_fields"] == ["auxiliary_reconstruction", "steps"]
+    rec_payload = torch.load(uninterrupted / "stage2_resume.pt", weights_only=True)
+    assert rec_payload["contract"]["auxiliary_reconstruction"]["weight"] == .1
+    assert any(not torch.equal(v, left["connector"][k]) for k, v in rec_payload["connector"].items())
+    assert (uninterrupted / "frozen_weight_audit.json").exists()
 
 
 def test_entrypoint_records_root_exception_without_cuda(tmp_path):

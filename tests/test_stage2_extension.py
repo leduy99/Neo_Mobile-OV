@@ -9,6 +9,7 @@ import torch
 
 from new_mobile_ov.training import stage1_alignment as data
 from new_mobile_ov.training.stage2_alignment import FORMAT
+from new_mobile_ov.training import stage2_alignment as stage2
 from tools.train_mobileov_stage1 import generator_for, parse_args, validate_resume
 
 
@@ -174,3 +175,69 @@ def test_local_extension_smoke_is_slurm_only_and_syntactically_valid():
     assert "#SBATCH --gres=gpu:2" in text
     assert "--expected-resume-step 12 --extend-steps --stop-after 14" in text
     assert "--expected-resume-step 14" in text
+
+
+@pytest.mark.parametrize("extra", [["--reconstruction-weight", "-1"], ["--reconstruction-weight", "nan"],
+                                  ["--reconstruction-weight", "inf"], ["--enable-reconstruction-on-resume"],
+                                  ["--reconstruction-weight", ".1", "--enable-reconstruction-on-resume"]])
+def test_invalid_reconstruction_arguments(extra):
+    with pytest.raises(SystemExit):
+        parse_args(["--phase", "2", "--init-connector", "init.pt", "--output-dir", "out", *extra])
+
+
+def test_reconstruction_is_opt_in_and_does_not_change_sampling_defaults():
+    with pytest.raises(SystemExit):
+        parse_args(["--output-dir", "out", "--reconstruction-weight", ".1"])
+    args = parse_args(["--phase", "2", "--init-connector", "init.pt", "--output-dir", "out",
+                       "--reconstruction-weight", ".1"])
+    assert args.tasks == ("t2i", "t2v") and args.accumulation == 2 and args.lr == 2e-5
+    assert not args.enable_reconstruction_on_resume
+    plain = parse_args(["--phase", "2", "--init-connector", "init.pt", "--output-dir", "out"])
+    assert plain.reconstruction_weight == 0
+
+
+def test_reconstruction_migration_preserves_every_other_contract_field():
+    saved, target = fixture_payload()
+    target["auxiliary_reconstruction"] = stage2.reconstruction_contract(.1)
+    with pytest.raises(ValueError, match="Resume contract mismatch"):
+        validate_resume(saved, target, saved["connector_spec"], extend_steps=True)
+    kwargs = dict(extend_steps=True, enable_reconstruction=True, expected_step=100000)
+    assert validate_resume(saved, target, saved["connector_spec"], **kwargs) == 100000
+    for change in (dict(lr=1e-5), dict(accumulation=3), dict(world_size=2), dict(data_summary_sha256="changed")):
+        with pytest.raises(ValueError, match="Resume contract mismatch"):
+            validate_resume(saved, dict(target, **change), saved["connector_spec"], **kwargs)
+    saved["contract"] = copy.deepcopy(target)
+    saved["step"] = 110000
+    assert validate_resume(saved, target, saved["connector_spec"], expected_step=110000) == 110000
+    changed_weight = dict(target, auxiliary_reconstruction=stage2.reconstruction_contract(.2))
+    with pytest.raises(ValueError, match="Resume contract mismatch"):
+        validate_resume(saved, changed_weight, saved["connector_spec"], enable_reconstruction=True)
+    target.pop("auxiliary_reconstruction")
+    with pytest.raises(ValueError, match="Resume contract mismatch"):
+        validate_resume(saved, target, saved["connector_spec"], enable_reconstruction=True)
+
+
+@pytest.mark.parametrize("accumulation", [2, 4, 6])
+def test_reconstruction_weight_is_not_divided_by_the_video_batches(accumulation):
+    coefficient = stage2.reconstruction_coefficient(.1, accumulation)
+    assert coefficient * (accumulation // 2) == pytest.approx(.1)
+    assert 1 / accumulation * (accumulation // 2) == .5
+
+
+def test_reconstruction_launcher_passes_weight_and_resubmits_its_own_recipe(tmp_path):
+    env, _ = launcher_env(tmp_path)
+    script = Path(__file__).resolve().parents[1] / "scripts/train_mobileov_stage2_reconstruction150k_1node8gpu.sbatch"
+    subprocess.run(["bash", "-n", str(script)], check=True)
+    subprocess.run(["bash", str(script)], env=env, check=True, capture_output=True)
+    calls = Path(env["CALLS"])
+    text = calls.read_text()
+    for arg in ("--phase 2", "--steps 150000", "--accumulation 2", "--lr 2e-5", "--reconstruction-weight 0.1",
+                "--enable-reconstruction-on-resume", "--expected-resume-step 100000", "--extend-steps"):
+        assert arg in text
+    out = Path(env["OUT"])
+    (out / "training_paused.json").write_text('{"step": 123456}')
+    (out / "stage2_resume.pt").write_text("checkpoint")
+    calls.unlink()
+    subprocess.run(["bash", str(script)], env=env, check=True, capture_output=True)
+    assert "CONTINUE --dependency=afterok:999 --export=ALL scripts/train_mobileov_stage2_reconstruction150k_1node8gpu.sbatch" in calls.read_text()
+    assert "STEP=123456" in calls.read_text()

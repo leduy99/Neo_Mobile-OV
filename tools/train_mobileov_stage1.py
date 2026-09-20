@@ -5,6 +5,7 @@ This is not an exact UniVideo reproduction: public data, MCP connector, pooled
 head, native pyramid schedule, equal task weights, and 1/49-frame targets.
 Phase 1 freezes the DiT. Phase 2 updates connector + DiT from Phase-1 weights.
 Neither phase uses a native text teacher, DreamLite, an external anchor, or DMD.
+Phase 2 can optionally add paired T2I image reconstruction as an auxiliary loss.
 UniVideo section 2.4 includes T2V but Table 7 lists one frame for Stage 1;
 including video here follows our explicit three-task scope, not that table.
 """
@@ -58,6 +59,10 @@ def parse_args(argv=None):
     parser.add_argument("--lr", type=float)
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--condition-dropout", type=float, default=0.1)
+    parser.add_argument("--reconstruction-weight", type=float, default=0,
+                        help="Phase-2 auxiliary image flow loss on each T2I target; 0 preserves the text-only recipe")
+    parser.add_argument("--enable-reconstruction-on-resume", action="store_true",
+                        help="Explicitly fork a text-only Stage-2 checkpoint into the reconstruction recipe")
     parser.add_argument("--short-side", type=int, default=320)
     parser.add_argument("--long-side", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=2048)
@@ -104,6 +109,12 @@ def parse_args(argv=None):
         parser.error("Phase 2 requires --init-connector; Phase 1 always starts randomly or resumes its own run")
     if args.max_runtime_seconds < 0 or args.expected_init_step < 1:
         parser.error("Invalid runtime limit or initialization step")
+    if not math.isfinite(args.reconstruction_weight) or args.reconstruction_weight < 0:
+        parser.error("Reconstruction weight must be finite and nonnegative")
+    if args.reconstruction_weight and args.phase != 2:
+        parser.error("Auxiliary reconstruction is only for Phase 2; Phase 1 already has its reconstruction task")
+    if args.enable_reconstruction_on_resume and (args.resume is None or args.reconstruction_weight == 0):
+        parser.error("--enable-reconstruction-on-resume requires --resume and a positive reconstruction weight")
     if (args.extend_steps or args.expected_resume_step is not None) and args.resume is None:
         parser.error("--extend-steps and --expected-resume-step require --resume")
     if args.expected_resume_step is not None and not 0 <= args.expected_resume_step < args.steps:
@@ -193,16 +204,25 @@ def atomic_torch_save(payload, path):
     temporary.replace(path)
 
 
-def validate_resume(saved, contract, connector_spec, *, extend_steps=False, expected_step=None):
+def validate_resume(saved, contract, connector_spec, *, extend_steps=False, expected_step=None,
+                    enable_reconstruction=False):
     if saved.get("format") != contract["format"]:
         raise ValueError("Resume checkpoint format mismatch")
     previous = saved.get("contract", {})
     changed = sorted(key for key in set(previous) | set(contract)
                      if previous.get(key) != contract.get(key))
-    if changed and not (extend_steps and changed == ["steps"]
-                        and isinstance(previous.get("steps"), int)
-                        and contract["steps"] > previous["steps"]):
-        raise ValueError(f"Resume contract mismatch: {changed}. Only increasing steps is allowed with --extend-steps")
+    allowed = set()
+    if (extend_steps and isinstance(previous.get("steps"), int)
+            and contract["steps"] > previous["steps"]):
+        allowed.add("steps")
+    aux = contract.get("auxiliary_reconstruction")
+    if (enable_reconstruction and contract["format"] == stage2.FORMAT
+            and "auxiliary_reconstruction" not in previous and isinstance(aux, dict)
+            and aux == stage2.reconstruction_contract(aux.get("weight"))):
+        allowed.add("auxiliary_reconstruction")
+    if set(changed) - allowed:
+        raise ValueError(f"Resume contract mismatch: {changed}. Only an explicit step extension or "
+                         "enabling auxiliary reconstruction is allowed; other settings must match")
     step = saved.get("step")
     if type(step) is not int or not 0 <= step <= previous["steps"] or step >= contract["steps"]:
         raise ValueError("Resume checkpoint already complete for this target or has an invalid step")
@@ -341,6 +361,8 @@ def train(args, ctx):
                         frozen_components=["smolvlm2", "vae"], trainable_components=["connector", "dit"],
                         ema=False, scope="T2I_T2V_public_data_adaptation; not_exact_UniVideo_stage2")
         del payload
+    if args.reconstruction_weight:
+        contract["auxiliary_reconstruction"] = stage2.reconstruction_contract(args.reconstruction_weight)
     trainable = connector if args.phase == 1 else stage2.JointFlowModel(connector, dit)
     optimizer = torch.optim.AdamW(trainable.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-8,
                                   weight_decay=0, foreach=False)
@@ -348,7 +370,11 @@ def train(args, ctx):
     if args.resume:
         saved = torch.load(args.resume, map_location="cpu", weights_only=False)
         start = validate_resume(saved, contract, connector.spec, extend_steps=args.extend_steps,
-                                expected_step=args.expected_resume_step)
+                                expected_step=args.expected_resume_step,
+                                enable_reconstruction=args.enable_reconstruction_on_resume)
+        if "auxiliary_reconstruction" in contract and "auxiliary_reconstruction" not in saved["contract"]:
+            if args.output_dir.resolve() == args.resume.resolve().parent or (args.output_dir / "run_contract.json").exists():
+                raise ValueError("Enabling reconstruction requires a new output directory; preserve the text-only baseline")
         connector.load_state_dict(saved["connector"], strict=True)
         if args.phase == 2:
             dit.load_state_dict(saved["dit"], strict=True)
@@ -358,7 +384,8 @@ def train(args, ctx):
                         dict(checkpoint=str(args.resume.resolve()), checkpoint_step=start,
                              previous_target_steps=saved["contract"]["steps"], target_steps=args.steps,
                              optimizer_restored=True, previous_contract=saved["contract"],
-                             changed_contract_fields=["steps"] if saved["contract"] != contract else []))
+                             changed_contract_fields=sorted(key for key in set(saved["contract"]) | set(contract)
+                                                           if saved["contract"].get(key) != contract.get(key))))
             print(f"Resumed optimizer + trained weights at step={start}; target={args.steps}; "
                   "sample sequence and warmup continue from the absolute step.", flush=True)
         del saved
@@ -388,6 +415,9 @@ def train(args, ctx):
               f"trainable_dit={sum(p.numel() for p in dit.parameters() if p.requires_grad):,} "
               f"tasks={args.tasks} counts={ {k: len(v) for k, v in dataset.records.items()} } "
               f"vae_window_size={args.vae_window_size}", flush=True)
+        if args.reconstruction_weight:
+            print(f"Auxiliary reconstruction: L=mean(T2I,T2V)+{args.reconstruction_weight}*mean(image_reconstruction); "
+                  "paired T2I image, no caption/clean-latent condition, no extra VAE encoding.", flush=True)
     metrics = validate(args, ctx, encoder, connector, dit, vae, scheduler, dataset)
     if ctx.is_main:
         atomic_json(args.output_dir / f"validation_step{start:06d}.json", metrics)
@@ -399,6 +429,8 @@ def train(args, ctx):
         for group in optimizer.param_groups:
             group["lr"] = lr
         losses = {task: [] for task in args.tasks}
+        if args.reconstruction_weight:
+            losses["image_reconstruction"] = []
         observations = []
         for micro in range(args.accumulation):
             sample = next(batches)
@@ -418,6 +450,21 @@ def train(args, ctx):
                 if not bool(torch.isfinite(loss)):
                     raise RuntimeError(f"Non-finite loss at step={step} task={sample['task']} id={sample['sample_id']}")
                 (loss / args.accumulation).backward()
+                if args.reconstruction_weight and sample["task"] == "t2i":
+                    # Separate RNG and backward pass preserve text sampling and bound activation memory.
+                    rec_rng = generator_for(ctx.device, args.seed + stage2.RECONSTRUCTION_SEED_OFFSET,
+                                            sample["micro"], ctx.rank)
+                    rec_layers, rec_mask = stage2.reconstruction_condition(encoder, sample)
+                    rec_stage = int(torch.randint(3, (), device=ctx.device, generator=rec_rng))
+                    rec_loss = model(rec_layers, rec_mask, latent, scheduler, stage=rec_stage, unit=0, generator=rec_rng)
+                    if not bool(torch.isfinite(rec_loss)):
+                        raise RuntimeError(f"Non-finite reconstruction loss at step={step} id={sample['sample_id']}")
+                    (rec_loss * stage2.reconstruction_coefficient(args.reconstruction_weight, args.accumulation)).backward()
+                    losses["image_reconstruction"].append(rec_loss.detach())
+                    observations.append(dict(task="image_reconstruction", paired_with="t2i", unit=0,
+                                             stage=rec_stage, dropped=False, tokens=rec_mask.shape[1],
+                                             sample_id=sample["sample_id"]))
+                    del rec_layers, rec_mask, rec_loss
             losses[sample["task"]].append(loss.detach())
             observations.append(dict(task=sample["task"], unit=unit, stage=stage, dropped=dropped,
                                      tokens=mask.shape[1], sample_id=sample["sample_id"],
@@ -443,6 +490,10 @@ def train(args, ctx):
                           elapsed_seconds=time.monotonic() - started, rank0_samples=observations,
                           peak_memory_gib=torch.cuda.max_memory_allocated(ctx.device) / 1024**3,
                           memory_by_rank=memory_report(ctx))
+            if args.reconstruction_weight:
+                report["loss_weights"] = dict(t2i=0.5, t2v=0.5, image_reconstruction=args.reconstruction_weight)
+                report["weighted_loss"] = sum(report["loss"][task] * weight
+                                              for task, weight in report["loss_weights"].items())
             if ctx.is_main:
                 print(json.dumps(report), flush=True)
                 with (args.output_dir / "history.jsonl").open("a") as stream:

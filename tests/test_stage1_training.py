@@ -153,6 +153,26 @@ def test_reconstruction_is_image_only_and_cfg_drops_the_image():
     assert encoder.backbone.training is False
 
 
+def test_stage2_auxiliary_reconstruction_uses_exact_t2i_image_without_caption_or_dropout():
+    from new_mobile_ov.training.stage2_alignment import reconstruction_condition
+    encoder = fake_encoder()
+    pixels = torch.arange(3 * 16 * 16).reshape(3, 1, 16, 16).remainder(256).to(torch.uint8)
+    sample = dict(task="t2i", prompt="This caption must not reach the image encoder",
+                  video=pixels.float() / 127.5 - 1, image=None)
+    before = sample["video"].clone()
+    layers, mask = reconstruction_condition(encoder, sample)
+    assert encoder.processor.messages[0]["content"] == [{"type": "image"}]
+    assert "pixel_values" in encoder.backbone.inputs
+    image = encoder.processor.kwargs["images"][0][0]
+    assert image.tobytes() == pixels[:, 0].permute(1, 2, 0).contiguous().numpy().tobytes()
+    assert torch.equal(sample["video"], before)
+    assert not any(layer.requires_grad for layer in layers)
+    with pytest.raises(ValueError, match="single RGB T2I target"):
+        reconstruction_condition(encoder, dict(sample, task="t2v"))
+    with pytest.raises(ValueError, match="single RGB T2I target"):
+        reconstruction_condition(encoder, dict(sample, video=sample["video"].repeat(1, 2, 1, 1)))
+
+
 def test_t2v_is_text_only_and_does_not_silently_truncate():
     encoder = fake_encoder()
     encoder("A dog runs.")
