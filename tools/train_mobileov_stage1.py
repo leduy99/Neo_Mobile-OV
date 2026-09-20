@@ -69,6 +69,10 @@ def parse_args(argv=None):
     parser.add_argument("--validation-samples", type=int, default=2, help="Per task per rank; 3 stages, first/last video units")
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--extend-steps", action="store_true",
+                        help="Allow only an increase in the resume contract's total steps; preserve the recipe")
+    parser.add_argument("--expected-resume-step", type=int,
+                        help="Fail if the resume checkpoint is not at this optimizer step")
     parser.add_argument("--stop-after", type=int, help="Pause at this optimizer step to test exact resume; not a new recipe")
     parser.add_argument("--max-runtime-seconds", type=float, default=0,
                         help="Gracefully pause at an update boundary; 0 disables the time budget")
@@ -100,6 +104,10 @@ def parse_args(argv=None):
         parser.error("Phase 2 requires --init-connector; Phase 1 always starts randomly or resumes its own run")
     if args.max_runtime_seconds < 0 or args.expected_init_step < 1:
         parser.error("Invalid runtime limit or initialization step")
+    if (args.extend_steps or args.expected_resume_step is not None) and args.resume is None:
+        parser.error("--extend-steps and --expected-resume-step require --resume")
+    if args.expected_resume_step is not None and not 0 <= args.expected_resume_step < args.steps:
+        parser.error("Expected resume step must be nonnegative and earlier than the target")
     if min(args.steps, args.accumulation, args.save_every, args.archive_every,
            args.validate_every, args.validation_samples, args.log_every, args.max_tokens) < 1:
         parser.error("Counts must be positive")
@@ -183,6 +191,32 @@ def atomic_torch_save(payload, path):
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
     temporary.replace(path)
+
+
+def validate_resume(saved, contract, connector_spec, *, extend_steps=False, expected_step=None):
+    if saved.get("format") != contract["format"]:
+        raise ValueError("Resume checkpoint format mismatch")
+    previous = saved.get("contract", {})
+    changed = sorted(key for key in set(previous) | set(contract)
+                     if previous.get(key) != contract.get(key))
+    if changed and not (extend_steps and changed == ["steps"]
+                        and isinstance(previous.get("steps"), int)
+                        and contract["steps"] > previous["steps"]):
+        raise ValueError(f"Resume contract mismatch: {changed}. Only increasing steps is allowed with --extend-steps")
+    step = saved.get("step")
+    if type(step) is not int or not 0 <= step <= previous["steps"] or step >= contract["steps"]:
+        raise ValueError("Resume checkpoint already complete for this target or has an invalid step")
+    if expected_step is not None and step != expected_step:
+        raise ValueError(f"Expected resume step={expected_step}, found step={step}")
+    if saved.get("connector_spec") != connector_spec:
+        raise ValueError("Resume connector architecture mismatch")
+    required = ("connector", "dit") if contract["format"] == stage2.FORMAT else ("connector",)
+    if any(not saved.get(key) for key in required):
+        raise ValueError(f"Resume checkpoint must contain trained weights: {required}")
+    optimizer = saved.get("optimizer")
+    if not isinstance(optimizer, dict) or not optimizer.get("param_groups") or (step and not optimizer.get("state")):
+        raise ValueError("Resume requires optimizer state. Use stage2_resume.pt (or stage1_resume.pt), not an inference checkpoint")
+    return step
 
 
 def save(args, step, connector, optimizer, contract, *, final=False, dit=None):
@@ -313,15 +347,20 @@ def train(args, ctx):
     start = 0
     if args.resume:
         saved = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if saved.get("format") != contract["format"] or saved["contract"] != contract:
-            raise ValueError("Resume contract mismatch; do not mix data, precision, world size or recipes")
+        start = validate_resume(saved, contract, connector.spec, extend_steps=args.extend_steps,
+                                expected_step=args.expected_resume_step)
         connector.load_state_dict(saved["connector"], strict=True)
         if args.phase == 2:
             dit.load_state_dict(saved["dit"], strict=True)
         optimizer.load_state_dict(saved["optimizer"])
-        start = saved["step"]
-        if not 0 <= start < args.steps:
-            raise ValueError("Resume checkpoint already complete or invalid")
+        if ctx.is_main:
+            atomic_json(args.output_dir / f"resume_from_step{start:06d}.json",
+                        dict(checkpoint=str(args.resume.resolve()), checkpoint_step=start,
+                             previous_target_steps=saved["contract"]["steps"], target_steps=args.steps,
+                             optimizer_restored=True, previous_contract=saved["contract"],
+                             changed_contract_fields=["steps"] if saved["contract"] != contract else []))
+            print(f"Resumed optimizer + trained weights at step={start}; target={args.steps}; "
+                  "sample sequence and warmup continue from the absolute step.", flush=True)
         del saved
     end = args.stop_after if args.stop_after is not None else args.steps
     if end <= start:

@@ -38,6 +38,12 @@ if [[ -n "${RESUME:-}" ]]; then
     test -s "${RESUME}"
     RESUME_ARGS+=(--resume "${RESUME}")
 fi
+if [[ "${EXTEND_STEPS:-0}" == 1 ]]; then
+    RESUME_ARGS+=(--extend-steps)
+fi
+if [[ -n "${EXPECTED_RESUME_STEP:-}" ]]; then
+    RESUME_ARGS+=(--expected-resume-step "${EXPECTED_RESUME_STEP}")
+fi
 echo "Phase=${PHASE}: SmolVLM2 + MCP + multistep NeoDragon; no external image generator"
 echo "DATA_ROOT=${DATA_ROOT} OUT=${OUT} STEPS=${STEPS:-15000} ACCUMULATION=${ACCUMULATION:-3}"
 "${CONDA_ENV}/bin/torchrun" --standalone --nnodes=1 --nproc_per_node=8 \

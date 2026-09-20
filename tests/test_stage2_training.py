@@ -338,6 +338,39 @@ def test_training_loop_pause_resume_is_exact_for_both_phases(tmp_path, monkeypat
     rows = [json.loads(line) for line in (partial / "history.jsonl").read_text().splitlines()]
     assert all(set(row["loss"]) == {"t2i", "t2v"} for row in rows)
 
+    # A completed run can grow its budget without resetting Adam, warmup or sample order.
+    resume_args = [*joint_args, "--steps", "6", "--resume", str(partial / "stage2_resume.pt"),
+                   "--expected-resume-step", "4"]
+    with pytest.raises(ValueError, match="Resume contract mismatch"):
+        train("extension_rejected", resume_args)
+    extended = train("extended", [*resume_args, "--extend-steps"])
+    reference = train("reference6", [*joint_args, "--steps", "6"])
+    left = torch.load(extended / "stage2_resume.pt", weights_only=True)
+    right = torch.load(reference / "stage2_resume.pt", weights_only=True)
+
+    def same(a, b):
+        if isinstance(a, torch.Tensor):
+            assert torch.equal(a, b)
+        elif isinstance(a, dict):
+            assert a.keys() == b.keys()
+            for key in a:
+                same(a[key], b[key])
+        elif isinstance(a, (list, tuple)):
+            assert len(a) == len(b)
+            for x, y in zip(a, b):
+                same(x, y)
+        else:
+            assert a == b
+
+    same(left, right)
+    assert torch.load(partial / "stage2_resume.pt", weights_only=True)["step"] == 4
+    provenance = json.loads((extended / "resume_from_step000004.json").read_text())
+    assert provenance["changed_contract_fields"] == ["steps"] and provenance["optimizer_restored"]
+    assert provenance["previous_target_steps"] == 4 and provenance["target_steps"] == 6
+    extended_rows = [json.loads(line) for line in (extended / "history.jsonl").read_text().splitlines()]
+    assert [row["step"] for row in extended_rows] == [5, 6]
+    assert extended_rows[0]["lr"] == pytest.approx(2e-5 * 5 / 50)
+
 
 def test_entrypoint_records_root_exception_without_cuda(tmp_path):
     root = Path(__file__).resolve().parents[1]
