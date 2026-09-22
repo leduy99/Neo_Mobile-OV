@@ -90,6 +90,41 @@ def test_existing_wrong_checkpoint_not_silently_replaced(tmp_path):
     assert run.sha256_file(path) == before
 
 
+@pytest.mark.parametrize("digest", ["abc", "0" * 63, "g" * 64])
+def test_invalid_checkpoint_digest_rejected(digest):
+    with pytest.raises(SystemExit):
+        run.parse_args(["--vbench-info", "info.json", "--output-dir", "out", "--expected-sha256", digest])
+
+
+def test_correct_step_but_wrong_variant_rejected_by_sha_without_overwrite(tmp_path):
+    path = tmp_path / "model.pt"
+    value = payload()
+    value["step"] = 150000
+    torch.save(value, path)
+    digest = run.sha256_file(path)
+    args = SimpleNamespace(checkpoint=path, expected_step=150000, expected_sha256="0" * 64)
+    with pytest.raises(ValueError, match="SHA256 mismatch"):
+        run.load_checkpoint(args)
+    assert run.sha256_file(path) == digest
+    args.expected_sha256 = digest
+    loaded, actual = run.load_checkpoint(args)
+    assert actual == digest and loaded["step"] == 150000
+
+
+def test_wrong_download_hash_never_installed(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    source = tmp_path / "hub.pt"
+    torch.save(payload(), source)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **kwargs: str(source))
+    target = tmp_path / "new" / "model.pt"
+    args = SimpleNamespace(checkpoint=target, expected_step=100000, expected_sha256="0" * 64,
+                           hf_repo="owner/repo", hf_file="model.pt", hf_revision="pinned")
+    with pytest.raises(ValueError, match="SHA256 mismatch"):
+        run.load_checkpoint(args)
+    assert not target.exists() and not list(target.parent.glob("*.tmp.*"))
+
+
 @pytest.mark.parametrize("valid", [True, False])
 def test_download_validates_before_atomic_install(tmp_path, monkeypatch, valid):
     import huggingface_hub

@@ -122,6 +122,7 @@ def load_checkpoint(args):
             temporary = path.with_name(path.name + f".tmp.{os.getpid()}")
             try:
                 shutil.copyfile(source, temporary)
+                check_checkpoint_digest(temporary, getattr(args, "expected_sha256", None))
                 candidate = torch.load(temporary, map_location="cpu", weights_only=True)
                 check_payload(candidate, args.expected_step)
                 del candidate
@@ -129,9 +130,18 @@ def load_checkpoint(args):
             finally:
                 temporary.unlink(missing_ok=True)
         # Do not delete an unreadable user checkpoint or silently replace a wrong run.
+        digest = check_checkpoint_digest(path, getattr(args, "expected_sha256", None))
         payload = torch.load(path, map_location="cpu", weights_only=True)
         check_payload(payload, args.expected_step)
-        return payload, sha256_file(path)
+        return payload, digest
+
+
+def check_checkpoint_digest(path, expected):
+    actual = sha256_file(path)
+    if expected is not None and actual != expected:
+        raise ValueError(f"Checkpoint SHA256 mismatch for {path}: {actual}; expected {expected}. "
+                         "Check the training variant; the existing file is not overwritten.")
+    return actual
 
 
 def decode_check(path, *, frames, width, height, fps):
@@ -305,6 +315,7 @@ def parse_args(argv=None):
     parser.add_argument("--hf-file", default=HF_FILE)
     parser.add_argument("--hf-revision", default="main")
     parser.add_argument("--expected-step", type=int, default=100000)
+    parser.add_argument("--expected-sha256", help="Pin exact weights, including when using a local checkpoint")
     parser.add_argument("--config", type=Path, default=Path("configs/mobile_ov_neodragon.yaml"))
     parser.add_argument("--vbench-info", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -321,6 +332,10 @@ def parse_args(argv=None):
     parser.add_argument("--guidance", type=float, default=7.)
     parser.add_argument("--video-guidance", type=float, default=5.)
     args = parser.parse_args(argv)
+    if args.expected_sha256 is not None:
+        args.expected_sha256 = args.expected_sha256.lower()
+        if len(args.expected_sha256) != 64 or any(c not in "0123456789abcdef" for c in args.expected_sha256):
+            parser.error("Expected SHA256 must contain exactly 64 hexadecimal characters")
     if min(args.expected_step, args.samples_per_prompt, args.height, args.width,
            args.first_steps, args.video_steps, args.fps) <= 0 or args.max_prompts < 0 or args.seed < 0:
         parser.error("Steps, samples, size and fps must be positive; max-prompts/seed cannot be negative")

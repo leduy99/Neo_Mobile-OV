@@ -68,7 +68,7 @@ VBENCH_INFO="$(realpath "${VBENCH_INFO}")"
 VBENCH_ENV="$(cd "${VBENCH_ENV}" && pwd -P)"
 VBENCH_REPO="$(cd "${VBENCH_REPO}" && pwd -P)"
 PYTHON_BIN="$(realpath -s "${PYTHON_BIN}")"
-HF_FILE="mobileov_stage2_from_alignment15k/17519025/stage2_dit_connector_latest.pt"
+HF_FILE="${HF_FILE:-mobileov_stage2_from_alignment15k/17519025/stage2_dit_connector_latest.pt}"
 if [[ -z "${CHECKPOINT:-}" ]]; then
     CHECKPOINT="output/${HF_FILE}"
     if [[ ! -s "${CHECKPOINT}" ]]; then
@@ -76,6 +76,11 @@ if [[ -z "${CHECKPOINT:-}" ]]; then
     fi
 fi
 echo "Stage 2 checkpoint=${CHECKPOINT}; expected_step=${EXPECTED_STEP:-100000}"
+CHECKPOINT_ARGS=()
+if [[ -n "${EXPECTED_SHA256:-}" ]]; then
+    CHECKPOINT_ARGS+=(--expected-sha256 "${EXPECTED_SHA256}")
+    echo "Pinned checkpoint SHA256=${EXPECTED_SHA256}"
+fi
 echo "RUN_ROOT=${RUN_ROOT}; full monolithic; trained empty negative; CFG=7/5; 49 frames 320x512 at 24fps"
 echo "SAMPLES_PER_PROMPT=${SAMPLES_PER_PROMPT}; MAX_PROMPTS=${MAX_PROMPTS}"
 if [[ "${SAMPLES_PER_PROMPT}" -lt 5 ]]; then
@@ -86,6 +91,7 @@ trap - EXIT
 
 "${PYTHON_BIN}" tools/generate_vbench_mobileov_stage2.py \
     --checkpoint "${CHECKPOINT}" --expected-step "${EXPECTED_STEP:-100000}" \
+    "${CHECKPOINT_ARGS[@]}" \
     --hf-repo "${HF_REPO:-Amshaker/Mobile-OV}" --hf-file "${HF_FILE}" --hf-revision "${HF_REVISION:-main}" \
     --config "${CONFIG:-configs/mobile_ov_neodragon.yaml}" \
     --vbench-info "${VBENCH_INFO}" --output-dir "${RUN_ROOT}" \
