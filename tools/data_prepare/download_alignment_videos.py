@@ -48,13 +48,26 @@ def select_shards(shards: list[Shard], count: int, seed: int) -> list[Shard]:
     return sorted(selected, key=lambda item: item.path)
 
 
-def resolve_plan(output: Path, *, revision: str, count: int, seed: int) -> dict:
+def resolve_plan(output: Path, *, revision: str, count: int, seed: int,
+                 exclude_plan: Path | None = None) -> dict:
     settings = dict(repo_id=REPO_ID, requested_revision=revision, num_shards=count, seed=seed)
+    excluded = None
+    if exclude_plan is not None:
+        excluded = json.loads(exclude_plan.read_text())
+        if excluded["settings"]["repo_id"] != REPO_ID or excluded["revision"] != revision:
+            raise ValueError("Expansion must use the original video repository and pinned revision")
+        settings["excluded_plan_sha256"] = sha256_file(exclude_plan)
     path = output / "download_plan.json"
     if path.exists():
         plan = json.loads(path.read_text())
         if plan.get("settings") != settings:
             raise ValueError("Video plan differs. Use a new output directory instead of mixing releases.")
+        if excluded is not None:
+            selected = {item["path"] for item in plan["shards"]}
+            original = {item["path"] for item in excluded["shards"]}
+            if (selected & original or len(selected) != count or len(plan["shards"]) != count
+                    or plan["revision"] != revision or plan["annotation"] != excluded["annotation"]):
+                raise ValueError("Saved expansion plan overlaps or differs from the original source")
         return plan
     api = HfApi()
     pinned = api.dataset_info(REPO_ID, revision=revision).sha
@@ -74,8 +87,18 @@ def resolve_plan(output: Path, *, revision: str, count: int, seed: int) -> dict:
             candidates.append(spec)
     if annotation is None:
         raise RuntimeError("Vchitect annotation.json is missing")
+    available = len(candidates)
+    if excluded is not None:
+        catalog = {item.path: asdict(item) for item in candidates}
+        if asdict(annotation) != excluded["annotation"]:
+            raise ValueError("Expansion annotation differs from the original source")
+        for item in excluded["shards"]:
+            if catalog.get(item["path"]) != item:
+                raise ValueError(f"Original shard differs from pinned catalog: {item['path']}")
+        excluded_paths = {item["path"] for item in excluded["shards"]}
+        candidates = [item for item in candidates if item.path not in excluded_paths]
     chosen = select_shards(candidates, count, seed)
-    return dict(settings=settings, revision=pinned, available_shards=len(candidates),
+    return dict(settings=settings, revision=pinned, available_shards=available,
                 selection="seeded proportional sampling by archive directory, not semantic balancing",
                 selected_groups=dict(Counter(str(PurePosixPath(item.path).parent) for item in chosen)),
                 annotation=asdict(annotation), shards=[asdict(item) for item in chosen],
@@ -218,7 +241,8 @@ def run(args: argparse.Namespace) -> dict:
         raise ValueError("Invalid storage limits")
     output = args.output_dir.expanduser().resolve()
     with output_lock(output):
-        plan = resolve_plan(output, revision=args.revision, count=args.num_shards, seed=args.seed)
+        plan = resolve_plan(output, revision=args.revision, count=args.num_shards, seed=args.seed,
+                            exclude_plan=args.exclude_plan)
         if plan["expected_bytes"] > args.max_download_gib * 1024**3:
             raise RuntimeError("Video selection exceeds --max-download-gib")
         print(json.dumps({key: value for key, value in plan.items() if key != "shards"}, indent=2), flush=True)
@@ -297,6 +321,8 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path, default=Path("download_data/data/univideo_alignment_videos"))
     parser.add_argument("--revision", default="main")
     parser.add_argument("--num-shards", type=int, default=100)
+    parser.add_argument("--exclude-plan", type=Path,
+                        help="Download only shards absent from this immutable, same-revision plan")
     parser.add_argument("--seed", type=int, default=20260911)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--retries", type=int, default=8)

@@ -5,7 +5,9 @@ set -Eeuo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 PYTHON_BIN="${PYTHON_BIN:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov/bin/python}"
-if [[ "${ALIGNMENT_SCOPE:-images}" == "stage1" ]]; then
+if [[ "${ALIGNMENT_SCOPE:-images}" == "stage1-expand" ]]; then
+    DATASET_OUTPUT_DIR="${DATASET_OUTPUT_DIR:-download_data/data/univideo_stage1_expanded650}"
+elif [[ "${ALIGNMENT_SCOPE:-images}" == "stage1" ]]; then
     DATASET_OUTPUT_DIR="${DATASET_OUTPUT_DIR:-download_data/data/univideo_stage1}"
 else
     DATASET_OUTPUT_DIR="${DATASET_OUTPUT_DIR:-download_data/data/univideo_alignment_images}"
@@ -94,6 +96,24 @@ if [[ "${ALIGNMENT_SCOPE:-images}" == "stage1" ]]; then
     if [[ -n "${EXCLUDE_PROMPTS:-}" ]]; then
         ARGS+=(--exclude-prompts "${EXCLUDE_PROMPTS}")
     fi
+elif [[ "${ALIGNMENT_SCOPE:-images}" == "stage1-expand" ]]; then
+    "${PYTHON_BIN}" -c 'import av; print("Video decoder: PyAV=" + av.__version__)'
+    TOOL=tools/data_prepare/expand_stage1_video_data.py
+    ARGS=(
+        --base-root "${BASE_DATA_ROOT:-download_data/data/univideo_stage1}"
+        --video-root "${VIDEO_OUTPUT_DIR:-download_data/data/univideo_alignment_videos}"
+        --extra-video-root "${EXTRA_VIDEO_ROOT:-download_data/data/univideo_alignment_videos_added650}"
+        --output-dir "${DATASET_OUTPUT_DIR}"
+        --total-video-shards "${TOTAL_VIDEO_SHARDS:-650}"
+        --min-train-videos "${MIN_TRAIN_VIDEOS:-500000}"
+        --max-total-video-gib "${MAX_TOTAL_VIDEO_GIB:-2500}"
+        --disk-margin-gib "${DISK_MARGIN_GIB:-100}"
+        --workers "${DOWNLOAD_WORKERS:-8}" --retries "${DOWNLOAD_RETRIES:-8}"
+        --reader-check-samples "${READER_CHECK_SAMPLES:-8}"
+    )
+    if [[ -n "${EXCLUDE_PROMPTS:-}" ]]; then
+        ARGS+=(--exclude-prompts "${EXCLUDE_PROMPTS}")
+    fi
 elif [[ "${ALIGNMENT_SCOPE:-images}" != "images" ]]; then
     echo "Unknown ALIGNMENT_SCOPE: ${ALIGNMENT_SCOPE}" >&2
     exit 1
@@ -137,7 +157,7 @@ else
     exit "${rc}"
 fi
 echo "Download and raw-data checks completed. No VAE latents have been encoded and no training was launched."
-if [[ "${ALIGNMENT_SCOPE:-images}" == "stage1" ]]; then
+if [[ "${ALIGNMENT_SCOPE:-images}" == "stage1" || "${ALIGNMENT_SCOPE:-images}" == "stage1-expand" ]]; then
     echo "Summary: ${DATASET_OUTPUT_DIR}/stage1_summary.json"
     echo "Tasks: train/{t2i,t2v,image_reconstruction}.jsonl and validation equivalents."
 else
