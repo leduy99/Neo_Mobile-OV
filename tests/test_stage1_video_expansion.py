@@ -287,13 +287,23 @@ def test_deduplication_includes_old_validation_and_new_rows(corpus):
 def test_original_scripts_remain_valid_and_new_job_has_safe_defaults():
     root = Path(__file__).resolve().parents[1]
     for name in ("expand_univideo_stage1_videos_1node1gpu.sbatch", "run_alignment_image_download.sh",
+                 "expand_univideo_stage1_videos_1nodecpu.sbatch",
+                 "download_univideo_alignment_images_1node1gpu.sbatch",
                  "prepare_univideo_stage1_data_1node1gpu.sbatch"):
         subprocess.run(["bash", "-n", str(root / "scripts" / name)], check=True)
+        script = (root / "scripts" / name).read_text()
+        if name.endswith(".sbatch"):
+            directives = [line for line in script.splitlines() if line.startswith("#SBATCH")]
+            assert "#SBATCH --partition=berzelius-cpu" in directives
+            assert not any("--gres" in line or "--gpu" in line for line in directives)
+        assert "gpu_heartbeat.py" not in script and "module load" not in script
     args = expand.parse_args([])
     assert args.total_video_shards == 650 and args.min_train_videos == 500000
     assert args.extra_video_root != args.video_root and args.output_dir != args.base_root
-    script = (root / "scripts/expand_univideo_stage1_videos_1node1gpu.sbatch").read_text()
-    assert "#SBATCH --gres=gpu:1" in script and "stage1-expand" in script
+    script = (root / "scripts/expand_univideo_stage1_videos_1nodecpu.sbatch").read_text()
+    assert "stage1-expand" in script
+    legacy = (root / "scripts/expand_univideo_stage1_videos_1node1gpu.sbatch").read_text()
+    assert "exec bash scripts/expand_univideo_stage1_videos_1nodecpu.sbatch" in legacy
 
 
 @pytest.mark.parametrize("scope,tool,flag,value", [
@@ -323,19 +333,18 @@ def test_shell_routes_and_no_gpu_during_dry_run(tmp_path, scope, tool, flag, val
         assert command[command.index("--workers") + 1] == "8"
 
 
-def test_sbatch_wrapper_forwards_expansion_overrides(tmp_path):
+@pytest.mark.parametrize("launcher", ["expand_univideo_stage1_videos_1node1gpu.sbatch",
+                                      "expand_univideo_stage1_videos_1nodecpu.sbatch"])
+def test_sbatch_wrapper_forwards_expansion_overrides(tmp_path, launcher):
     root = Path(__file__).resolve().parents[1]
     stub = tmp_path / "python_stub"
     stub.write_text(f"#!{sys.executable}\nimport json,sys\nprint('STUB_ARGS=' + json.dumps(sys.argv[1:]))\n")
     stub.chmod(0o755)
-    module = tmp_path / "module"
-    module.write_text("#!/bin/bash\nexit 0\n")
-    module.chmod(0o755)
     env = {**os.environ, "DRY_RUN": "1", "PYTHON_BIN": str(stub), "SLURM_SUBMIT_DIR": str(root),
            "PATH": f"{tmp_path}:{os.environ['PATH']}", "HF_HOME": str(tmp_path / "hf"),
            "TMPDIR": str(tmp_path / "tmp"), "DATASET_OUTPUT_DIR": str(tmp_path / "output"),
            "TOTAL_VIDEO_SHARDS": "800", "MIN_TRAIN_VIDEOS": "600000", "DOWNLOAD_WORKERS": "12"}
-    result = subprocess.run(["bash", str(root / "scripts/expand_univideo_stage1_videos_1node1gpu.sbatch")],
+    result = subprocess.run(["bash", str(root / "scripts" / launcher)],
                             env=env, capture_output=True, text=True, check=True)
     command = [json.loads(line.split("=", 1)[1]) for line in result.stdout.splitlines()
                if line.startswith("STUB_ARGS=")][-1]

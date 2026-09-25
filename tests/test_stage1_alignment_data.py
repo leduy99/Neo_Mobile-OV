@@ -2,10 +2,14 @@ from dataclasses import asdict
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
+import sys
 import tarfile
+import time
 
 import av
 import pytest
@@ -149,6 +153,90 @@ def test_index_resume_and_policy_invalidation(tmp_path, monkeypatch):
     revised = videos.index_shard(archive, shard, tmp_path, {"1.mp4": "A light."},
                                 **{**kwargs, "policy": {**POLICY, "min_side": 1000}})
     assert revised["valid_pairs"] == 0 and revised["rejected"] == {"low_resolution": 1}
+
+
+@pytest.mark.parametrize("stop_signal", [signal.SIGTERM, signal.SIGKILL])
+def test_interrupted_decode_resumes_without_losing_completed_shards(tmp_path, monkeypatch, stop_signal):
+    output = tmp_path / "download"
+    good, pending = output / "shards/good.tar", output / "shards/pending.tar"
+    good_payload, pending_payload = encoded_video(), encoded_video(frames=61)
+    shards = [make_archive(good, [("good.mp4", good_payload)]),
+              make_archive(pending, [("a.mp4", pending_payload), ("b.mp4", pending_payload)])]
+    captions = {name: "A changing light." for name in ("good.mp4", "a.mp4", "b.mp4")}
+    annotation = output / "shards/annotation.json"
+    annotation.write_text(json.dumps([dict(video=name, text=text) for name, text in captions.items()]))
+    spec = images.Shard("annotation.json", annotation.stat().st_size, images.sha256_file(annotation))
+    args_list = ["--output-dir", str(output), "--num-shards", "2", "--min-side", "32",
+                 "--workers", "1", "--disk-margin-gib", "0"]
+    args = videos.parse_args(args_list)
+    images.atomic_json(output / "download_plan.json", dict(
+        settings=dict(repo_id=videos.REPO_ID, requested_revision=args.revision,
+                      num_shards=2, seed=args.seed), revision="pin", annotation=asdict(spec),
+        shards=[asdict(shard) for shard in shards],
+        expected_bytes=spec.size + sum(shard.size for shard in shards)))
+    videos.index_shard(good, shards[0], output, captions, revision="pin",
+                       annotation_sha256=spec.sha256, policy=POLICY)
+    good_paths = [output / "indexes/good.tar.jsonl", output / "indexes/good.tar.json"]
+    before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in good_paths]
+    child = """
+import pathlib, sys, time
+from tools.data_prepare import download_alignment_images as images
+from tools.data_prepare import download_alignment_videos as videos
+def no_download(**kwargs):
+    raise AssertionError('Existing archives must not be downloaded again')
+images.hf_hub_download = no_download
+args = videos.parse_args(sys.argv[1:])
+probe = videos.probe_video
+calls = 0
+def interruptible_probe(payload, **kwargs):
+    global calls
+    calls += 1
+    if calls == 2:
+        (args.output_dir / 'decode_waiting').touch()
+        while True:
+            time.sleep(0.01)
+    return probe(payload, **kwargs)
+videos.probe_video = interruptible_probe
+videos.run(args)
+"""
+    process = subprocess.Popen([sys.executable, "-c", child, *args_list],
+                               cwd=Path(__file__).resolve().parents[1],
+                               env=dict(os.environ, CUDA_VISIBLE_DEVICES=""),
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 15
+        while not (output / "decode_waiting").exists() and time.monotonic() < deadline:
+            assert process.poll() is None
+            time.sleep(0.02)
+        assert (output / "decode_waiting").exists()
+        process.send_signal(stop_signal)
+        stdout, stderr = process.communicate(timeout=5)
+        assert process.returncode == -stop_signal, stdout + stderr
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=5)
+    assert (output / "indexes/pending.tar.jsonl.tmp").exists()
+    assert not (output / "indexes/pending.tar.json").exists()
+    assert not (output / ".download_complete").exists()
+    monkeypatch.setattr(images, "hf_hub_download", lambda **kw: pytest.fail("resume redownloaded media"))
+    probe = videos.probe_video
+    probes = []
+
+    def resume_probe(payload, **kwargs):
+        assert payload == pending_payload, "Completed shard should reuse its verified index"
+        probes.append(payload)
+        return probe(payload, **kwargs)
+
+    monkeypatch.setattr(videos, "probe_video", resume_probe)
+    summary = videos.run(args)
+    assert summary["status"] == "complete" and summary["valid_video_caption_pairs"] == 3
+    assert summary["shards_verified"] == 2 and summary["errors"] == {}
+    assert len(probes) == 2
+    assert before == [(path.read_bytes(), path.stat().st_mtime_ns) for path in good_paths]
+    assert not (output / "indexes/pending.tar.jsonl.tmp").exists()
+    assert (output / ".download_complete").exists()
+    assert len((output / "samples.jsonl").read_text().splitlines()) == 3
 
 
 def test_errors_are_separate_from_intentional_filters(tmp_path):

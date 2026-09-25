@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 
 import pytest
 from PIL import Image
@@ -267,7 +268,7 @@ def test_dry_run_and_budget_do_not_download(tmp_path, monkeypatch):
         data.run(args)
 
 
-def test_shell_syntax_and_no_gpu_outside_slurm(tmp_path):
+def test_shell_syntax_and_no_download_outside_slurm(tmp_path):
     root = Path(__file__).resolve().parents[1]
     script = root / "scripts/run_alignment_image_download.sh"
     for shell_file in (script, root / "scripts/download_univideo_alignment_images_1node1gpu.sbatch"):
@@ -288,10 +289,8 @@ def test_index_reader_rejects_escape_and_corruption(tmp_path):
                                           "image_sha256": hashlib.sha256(b"good").hexdigest()})
 
 
-@pytest.mark.parametrize("exit_code", [0, 23])
-@pytest.mark.parametrize("scope", ["images", "stage1"])
-def test_shell_propagates_download_status_and_stops_heartbeat(tmp_path, exit_code, scope):
-    root = Path(__file__).resolve().parents[1]
+@pytest.fixture
+def cpu_download_env(tmp_path):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     fake_python = fake_bin / "python"
@@ -300,45 +299,96 @@ import json, os, pathlib, signal, sys, time
 root = pathlib.Path(os.environ['TEST_ROOT'])
 if sys.argv[1] == '-c':
     sys.exit(0)
-if sys.argv[1].endswith('gpu_heartbeat.py'):
-    (root / 'heartbeat_started').touch()
-    stop_file = pathlib.Path(sys.argv[sys.argv.index('--stop-file') + 1])
-    def stop(*args):
-        if args:
-            (root / 'heartbeat_forced').touch()
-        (root / 'heartbeat_stopped').touch()
-        sys.exit(0)
-    signal.signal(signal.SIGTERM, stop)
-    while True:
-        if stop_file.exists():
-            stop()
-        time.sleep(0.01)
+assert 'gpu_heartbeat.py' not in sys.argv[1]
+assert os.environ['CUDA_VISIBLE_DEVICES'] == ''
 (root / 'download_command.json').write_text(json.dumps(sys.argv))
+if os.environ.get('TEST_BLOCK') == '1':
+    def stop(*args):
+        (root / 'download_stopped').touch()
+        sys.exit(143)
+    signal.signal(signal.SIGTERM, stop)
+    (root / 'download_started').touch()
+    while True:
+        time.sleep(0.01)
 time.sleep(0.1)
 sys.exit(int(os.environ['TEST_EXIT']))
 """)
     fake_python.chmod(0o755)
     srun = fake_bin / "srun"
-    srun.write_text('#!/bin/sh\ncase " $* " in *" --cpu-bind=none "*) ;; *) exit 91 ;; esac\n'
-                    'while [ "${1#--}" != "$1" ]; do shift; done\nexec "$@"\n')
+    srun.write_text(f"#!{sys.executable}\n" + """
+import json, os, pathlib, sys
+pathlib.Path(os.environ['TEST_ROOT'], 'srun_args.json').write_text(json.dumps(sys.argv[1:]))
+args = sys.argv[1:]
+while args[0].startswith('--'):
+    args.pop(0)
+os.execv(args[0], args)
+""")
     srun.chmod(0o755)
-    sleep = fake_bin / "sleep"
-    sleep.write_text('#!/bin/sh\n/bin/sleep 0.1\n')
-    sleep.chmod(0o755)
-    env = dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}", TEST_ROOT=str(tmp_path),
-               TEST_EXIT=str(exit_code), PYTHON_BIN=str(fake_python), HF_HOME=str(tmp_path / "cache"),
-               TMPDIR=str(tmp_path / "tmp"), DATASET_OUTPUT_DIR=str(tmp_path / "data"),
-               SLURM_JOB_ID="unit-test-no-real-gpu", DRY_RUN="0", ALIGNMENT_SCOPE=scope)
+    return dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}", TEST_ROOT=str(tmp_path),
+                TEST_EXIT="0", PYTHON_BIN=str(fake_python), HF_HOME=str(tmp_path / "cache"),
+                TMPDIR=str(tmp_path / "tmp"), DATASET_OUTPUT_DIR=str(tmp_path / "data"),
+                SLURM_JOB_ID="unit-test-cpu", SLURM_JOB_PARTITION="berzelius-cpu",
+                SLURM_CPUS_PER_TASK="12", DRY_RUN="0", ALIGNMENT_SCOPE="images")
+
+
+@pytest.mark.parametrize("exit_code", [0, 23])
+@pytest.mark.parametrize("scope", ["images", "stage1", "stage1-expand"])
+def test_shell_cpu_step_propagates_download_status(tmp_path, cpu_download_env, exit_code, scope):
+    root = Path(__file__).resolve().parents[1]
+    env = dict(cpu_download_env, TEST_EXIT=str(exit_code), ALIGNMENT_SCOPE=scope)
     result = subprocess.run(["bash", str(root / "scripts/run_alignment_image_download.sh")],
                             env=env, capture_output=True, text=True, timeout=10)
     assert result.returncode == exit_code, result.stderr + result.stdout
-    assert (tmp_path / "heartbeat_started").exists()
-    assert (tmp_path / "heartbeat_stopped").exists()
-    assert not (tmp_path / "heartbeat_forced").exists()
-    assert not list((tmp_path / "tmp").glob("alignment-data-*"))
+    assert ("raw-data checks completed" in result.stdout) == (exit_code == 0)
+    srun_args = json.loads((tmp_path / "srun_args.json").read_text())
+    assert "--nodes=1" in srun_args and "--ntasks=1" in srun_args
+    assert "--cpus-per-task=12" in srun_args and "--cpu-bind=none" in srun_args
+    assert not any("gpu" in arg or "heartbeat" in arg for arg in srun_args)
     command = json.loads((tmp_path / "download_command.json").read_text())
-    expected = "prepare_stage1_alignment.py" if scope == "stage1" else "download_alignment_images.py"
+    expected = {"images": "download_alignment_images.py", "stage1": "prepare_stage1_alignment.py",
+                "stage1-expand": "expand_stage1_video_data.py"}[scope]
     assert command[1].endswith(expected)
+
+
+@pytest.mark.parametrize("partition", ["berzelius", "berzelius-hopper", ""])
+def test_shell_rejects_non_cpu_allocations(tmp_path, cpu_download_env, partition):
+    script = Path(__file__).resolve().parents[1] / "scripts/run_alignment_image_download.sh"
+    result = subprocess.run(["bash", str(script)], env=dict(cpu_download_env, SLURM_JOB_PARTITION=partition),
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 1
+    assert "--partition=berzelius-cpu" in result.stderr
+    assert not (tmp_path / "srun_args.json").exists()
+    assert not (tmp_path / "download_command.json").exists()
+
+
+def test_shell_accepts_hopper_cpu_partition(tmp_path, cpu_download_env):
+    script = Path(__file__).resolve().parents[1] / "scripts/run_alignment_image_download.sh"
+    result = subprocess.run(["bash", str(script)],
+                            env=dict(cpu_download_env, SLURM_JOB_PARTITION="berzelius-hopper-cpu"),
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "download_command.json").exists()
+
+
+def test_shell_forwards_termination_to_cpu_step(tmp_path, cpu_download_env):
+    script = Path(__file__).resolve().parents[1] / "scripts/run_alignment_image_download.sh"
+    process = subprocess.Popen(["bash", str(script)], env=dict(cpu_download_env, TEST_BLOCK="1"),
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 5
+        while not (tmp_path / "download_started").exists() and time.monotonic() < deadline:
+            assert process.poll() is None
+            time.sleep(0.02)
+        assert (tmp_path / "download_started").exists()
+        process.terminate()
+        stdout, stderr = process.communicate(timeout=5)
+        assert process.returncode == 143, stdout + stderr
+        assert (tmp_path / "download_stopped").exists()
+        assert "raw-data checks completed" not in stdout
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.communicate(timeout=5)
 
 
 def test_rejection_gate_does_not_mark_dataset_complete(tmp_path, monkeypatch):
