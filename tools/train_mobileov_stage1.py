@@ -4,8 +4,10 @@
 This is not an exact UniVideo reproduction: public data, MCP connector, pooled
 head, native pyramid schedule, equal task weights, and 1/49-frame targets.
 Phase 1 freezes the DiT. Phase 2 updates connector + DiT from Phase-1 weights.
-Neither phase uses a native text teacher, DreamLite, an external anchor, or DMD.
+Neither phase uses a native text teacher, DreamLite, or DMD.
 Phase 2 can optionally add paired T2I image reconstruction as an auxiliary loss.
+The opt-in media-epoch recipe also trains text+first-image video conditions,
+both with and without the observed frame's VAE latent as an anchor.
 UniVideo section 2.4 includes T2V but Table 7 lists one frame for Stage 1;
 including video here follows our explicit three-task scope, not that table.
 """
@@ -41,6 +43,7 @@ from tools.data_prepare.download_alignment_images import atomic_json, output_loc
 from tools.train_neodragon_dit_bridge import load_neodragon_train_modules, scale_vae_latents
 from new_mobile_ov.training import stage2_alignment as stage2
 from new_mobile_ov.training.stage1_vae import encode_posterior
+from new_mobile_ov.training import stage2_media_epochs as media_epochs
 
 FORMAT = "mobileov_stage1_mcp_v1"
 
@@ -55,6 +58,10 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--processor", default="HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
     parser.add_argument("--steps", type=int, help="Total optimizer updates, not microbatches")
+    parser.add_argument("--media-epochs", type=int, choices=(3,),
+                        help="Fresh Stage 2: each image/video three times; rotate T2V/reference/anchor modes")
+    parser.add_argument("--min-train-videos", type=int, default=1)
+    parser.add_argument("--require-expanded-release", action="store_true")
     parser.add_argument("--accumulation", type=int, help="Complete task cycles; Phase 1: 3 tasks, Phase 2: 2")
     parser.add_argument("--lr", type=float)
     parser.add_argument("--warmup", type=int, default=50)
@@ -88,6 +95,15 @@ def parse_args(argv=None):
     parser.add_argument("--cuda-memory-limit-gib", type=float, default=0,
                         help="Local memory regression test: cap the PyTorch allocator; 0 leaves it unrestricted")
     args = parser.parse_args(argv)
+    if args.media_epochs:
+        if args.phase != 2 or args.steps is not None or args.extend_steps or args.enable_reconstruction_on_resume:
+            parser.error("Media epochs require Phase 2, auto-calculated steps, and only exact own-run resumes")
+        if args.reconstruction_weight <= 0:
+            parser.error("Media epochs include paired reconstruction; set --reconstruction-weight (e.g. 0.1)")
+    elif args.require_expanded_release or args.min_train_videos != 1:
+        parser.error("Expanded-data guards require --media-epochs")
+    if args.min_train_videos < 1:
+        parser.error("Minimum training video count must be positive")
     args.tasks = TASKS if args.phase == 1 else stage2.TASKS
     if args.steps is None:
         args.steps = 15000 if args.phase == 1 else 100000
@@ -117,14 +133,15 @@ def parse_args(argv=None):
         parser.error("--enable-reconstruction-on-resume requires --resume and a positive reconstruction weight")
     if (args.extend_steps or args.expected_resume_step is not None) and args.resume is None:
         parser.error("--extend-steps and --expected-resume-step require --resume")
-    if args.expected_resume_step is not None and not 0 <= args.expected_resume_step < args.steps:
+    if args.expected_resume_step is not None and (args.expected_resume_step < 0 or
+                                                (not args.media_epochs and args.expected_resume_step >= args.steps)):
         parser.error("Expected resume step must be nonnegative and earlier than the target")
     if min(args.steps, args.accumulation, args.save_every, args.archive_every,
            args.validate_every, args.validation_samples, args.log_every, args.max_tokens) < 1:
         parser.error("Counts must be positive")
-    if args.accumulation % len(args.tasks) or args.workers < 0 or args.warmup < 0:
+    if (not args.media_epochs and args.accumulation % len(args.tasks)) or args.workers < 0 or args.warmup < 0:
         parser.error("Accumulation must contain complete task cycles; workers/warmup cannot be negative")
-    if args.stop_after is not None and not 0 < args.stop_after <= args.steps:
+    if args.stop_after is not None and (args.stop_after < 1 or (not args.media_epochs and args.stop_after > args.steps)):
         parser.error("Stop-after must be within the planned run")
     if not 0 <= args.condition_dropout < 1 or not 0 < args.lr < 1:
         parser.error("Invalid condition dropout or learning rate")
@@ -150,15 +167,30 @@ def load_stack(args, device):
 
 def encode_sample(encoder, vae, sample, device, generator, dropout, *, window_size=16):
     drop = bool(torch.rand((), device=device, generator=generator) < dropout)
-    layers, mask = encoder(sample["prompt"], sample["image"], drop_condition=drop)
+    mode = sample.get("mode", sample["task"])
+    kwargs = {"allow_text_image": True} if mode in ("i2v_anchor", "i2v_reference") else {}
+    layers, mask = encoder(sample["prompt"], sample["image"], drop_condition=drop, **kwargs)
     with torch.no_grad(), autocast(device):
         video = sample["video"].unsqueeze(0).to(device=device, dtype=torch.bfloat16)
         posterior = encode_posterior(vae, video, window_size=window_size)
         latent = scale_vae_latents(posterior.sample(generator=generator)).to(torch.bfloat16)
+        if mode == "i2v_anchor":
+            # Match inference: independently encode ONLY the observed first RGB frame.
+            latent[:, :, :1] = encode_anchor(vae, video, generator, window_size=window_size)
     expected = 1 if sample["task"] != "t2v" else 7
     if latent.shape[2] != expected or not bool(torch.isfinite(latent).all()):
         raise ValueError(f"Invalid VAE latent for {sample['task']}: {latent.shape}")
     return layers, mask, latent, drop
+
+
+@torch.no_grad()
+def encode_anchor(vae, video, generator, *, window_size=8):
+    with autocast(video.device):
+        posterior = encode_posterior(vae, video[:, :, :1], window_size=window_size)
+        anchor = scale_vae_latents(posterior.sample(generator=generator)).to(torch.bfloat16)
+    if anchor.shape[2] != 1 or not bool(torch.isfinite(anchor).all()):
+        raise ValueError("Invalid first-frame VAE anchor")
+    return anchor
 
 
 def generator_for(device, seed, ordinal, rank):
@@ -171,22 +203,27 @@ def validate(args, ctx, encoder, connector, dit, vae, scheduler, dataset):
     was_training = dit.training
     dit.eval()
     with torch.no_grad():
-        for task in TASKS:
-            records = JsonlRecords(args.data_root / "validation" / f"{task}.jsonl")
+        tasks = (*TASKS, "i2v_reference", "i2v_anchor") if args.media_epochs else TASKS
+        for task in tasks:
+            source = "t2v" if task in media_epochs.VIDEO_MODES else task
+            records = JsonlRecords(args.data_root / "validation" / f"{source}.jsonl")
             values = {}
             for item in range(args.validation_samples):
                 index = (item * ctx.world_size + ctx.rank) % len(records)
                 sample = prepare_sample(records[index], dataset.sources, args.short_side, args.long_side)
+                if source == "t2v" and args.media_epochs:
+                    sample = media_epochs.condition_video(sample, task)
                 rng = generator_for(ctx.device, args.seed + 888888, index, 0)
                 layers, mask, latent, _ = encode_sample(encoder, vae, sample, ctx.device, rng, 0,
                                                        window_size=args.vae_window_size)
-                units = [0] if task != "t2v" else [0, latent.shape[2] - 1]
+                units = [0] if source != "t2v" else [1 if task == "i2v_anchor" else 0, latent.shape[2] - 1]
                 for stage in range(3):
                     for unit in units:
                         with autocast(ctx.device):
                             loss = flow_loss(dit, connector, layers, mask, latent, scheduler,
                                              stage=stage, unit=unit, generator=rng, gradient_checkpointing=False)
-                        key = f"{task}.stage{stage}.{'first' if unit == 0 else 'last'}"
+                        unit_name = "first_future" if task == "i2v_anchor" and unit == 1 else ("first" if unit == 0 else "last")
+                        key = f"{task}.stage{stage}.{unit_name}"
                         values.setdefault(key, []).append(loss)
             for key, losses in values.items():
                 value = scalar_mean(torch.stack(losses).mean(), ctx)
@@ -320,6 +357,17 @@ def train(args, ctx):
         if (args.output_dir / "run_contract.json").exists() and args.resume is None:
             raise ValueError("Output already contains a run; specify --resume or a new output directory")
     barrier()
+    epoch_plan = None
+    if args.media_epochs:
+        epoch_plan = media_epochs.plan_from_release(
+            args.data_root, world_size=ctx.world_size, accumulation=args.accumulation,
+            epochs=args.media_epochs, seed=args.seed, min_videos=args.min_train_videos,
+            require_expansion=args.require_expanded_release, verify=False)
+        args.steps = epoch_plan.steps
+        if args.stop_after is not None and args.stop_after > args.steps:
+            raise ValueError("Stop-after exceeds calculated epoch budget")
+        if ctx.is_main:
+            print(f"Exact media epoch plan: {json.dumps(epoch_plan.contract())}", flush=True)
     torch.manual_seed(args.seed)
     cfg, encoder, connector, dit, vae, scheduler = load_stack(args, ctx.device)
     initial_modules = dict(smolvlm2=encoder, dit=dit, vae=vae)
@@ -363,6 +411,12 @@ def train(args, ctx):
         del payload
     if args.reconstruction_weight:
         contract["auxiliary_reconstruction"] = stage2.reconstruction_contract(args.reconstruction_weight)
+    if epoch_plan:
+        contract.update(media_epochs=epoch_plan.contract(), task_ratio="source_proportional_exposure; loss_balanced",
+                        tasks=list(media_epochs.METRIC_TASKS),
+                        scope="fresh_multimodal_stage2; public_data; not_exact_UniVideo_recipe",
+                        video_units="T2V/reference:0_to6; anchor:1_to6; teacher_forced_causal_history",
+                        text_contract="processor_chat; I2V_text_and_first_image_together; no_truncation")
     trainable = connector if args.phase == 1 else stage2.JointFlowModel(connector, dit)
     optimizer = torch.optim.AdamW(trainable.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-8,
                                   weight_decay=0, foreach=False)
@@ -398,9 +452,13 @@ def train(args, ctx):
     trainable_before = frozen_signatures(trainable_modules) if args.verify_frozen else None
     model = DDP(trainable, device_ids=[ctx.local_rank], broadcast_buffers=False,
                 gradient_as_bucket_view=True, find_unused_parameters=args.phase == 2) if ctx.is_distributed else trainable
-    dataset = Stage1Dataset(args.data_root, steps=args.steps, accumulation=args.accumulation, rank=ctx.rank,
-                            world_size=ctx.world_size, seed=args.seed, start_step=start,
-                            short_side=args.short_side, long_side=args.long_side, tasks=args.tasks)
+    if epoch_plan:
+        dataset = media_epochs.MediaEpochDataset(args.data_root, plan=epoch_plan, rank=ctx.rank,
+                                                start_step=start, short_side=args.short_side, long_side=args.long_side)
+    else:
+        dataset = Stage1Dataset(args.data_root, steps=args.steps, accumulation=args.accumulation, rank=ctx.rank,
+                                world_size=ctx.world_size, seed=args.seed, start_step=start,
+                                short_side=args.short_side, long_side=args.long_side, tasks=args.tasks)
     loader = DataLoader(dataset, batch_size=None, num_workers=args.workers,
                         multiprocessing_context="spawn" if args.workers else None,
                         timeout=120 if args.workers else 0,
@@ -413,10 +471,10 @@ def train(args, ctx):
         print(f"Stage{args.phase}: steps={start}->{args.steps} world={ctx.world_size} global_batch={ctx.world_size * args.accumulation} "
               f"trainable_connector={sum(p.numel() for p in connector.parameters()):,} "
               f"trainable_dit={sum(p.numel() for p in dit.parameters() if p.requires_grad):,} "
-              f"tasks={args.tasks} counts={ {k: len(v) for k, v in dataset.records.items()} } "
+              f"tasks={contract.get('tasks', args.tasks)} counts={ {k: len(v) for k, v in dataset.records.items()} } "
               f"vae_window_size={args.vae_window_size}", flush=True)
         if args.reconstruction_weight:
-            print(f"Auxiliary reconstruction: L=mean(T2I,T2V)+{args.reconstruction_weight}*mean(image_reconstruction); "
+            print(f"Auxiliary reconstruction: L=0.5*mean(T2I)+0.5*mean(video modes)+{args.reconstruction_weight}*mean(image_reconstruction); "
                   "paired T2I image, no caption/clean-latent condition, no extra VAE encoding.", flush=True)
     metrics = validate(args, ctx, encoder, connector, dit, vae, scheduler, dataset)
     if ctx.is_main:
@@ -428,7 +486,8 @@ def train(args, ctx):
         lr = args.lr * min(1.0, step / max(1, args.warmup))
         for group in optimizer.param_groups:
             group["lr"] = lr
-        losses = {task: [] for task in args.tasks}
+        losses = {task: [] for task in (media_epochs.METRIC_TASKS if epoch_plan else args.tasks)}
+        weighted_loss = torch.zeros((), device=ctx.device)
         if args.reconstruction_weight:
             losses["image_reconstruction"] = []
         observations = []
@@ -439,7 +498,10 @@ def train(args, ctx):
                                                          window_size=args.vae_window_size)
             # Independent draws avoid coupling image/video source order to a fixed stage.
             stage = int(torch.randint(3, (), device=ctx.device, generator=rng))
-            unit = int(torch.randint(latent.shape[2], (), device=ctx.device, generator=rng))
+            mode = sample.get("mode", sample["task"])
+            unit = media_epochs.sample_unit(mode, latent.shape[2], ctx.device, rng)
+            scale = sample.get("loss_scale", 1.0)
+            padding = sample.get("padding", False)
             sync = model.no_sync() if ctx.is_distributed and micro + 1 != args.accumulation else nullcontext()
             with sync, autocast(ctx.device):
                 if args.phase == 1:
@@ -449,7 +511,8 @@ def train(args, ctx):
                     loss = model(layers, mask, latent, scheduler, stage=stage, unit=unit, generator=rng)
                 if not bool(torch.isfinite(loss)):
                     raise RuntimeError(f"Non-finite loss at step={step} task={sample['task']} id={sample['sample_id']}")
-                (loss / args.accumulation).backward()
+                (loss * scale / args.accumulation).backward()
+                weighted_loss += loss.detach() * scale / args.accumulation
                 if args.reconstruction_weight and sample["task"] == "t2i":
                     # Separate RNG and backward pass preserve text sampling and bound activation memory.
                     rec_rng = generator_for(ctx.device, args.seed + stage2.RECONSTRUCTION_SEED_OFFSET,
@@ -459,17 +522,24 @@ def train(args, ctx):
                     rec_loss = model(rec_layers, rec_mask, latent, scheduler, stage=rec_stage, unit=0, generator=rec_rng)
                     if not bool(torch.isfinite(rec_loss)):
                         raise RuntimeError(f"Non-finite reconstruction loss at step={step} id={sample['sample_id']}")
-                    (rec_loss * stage2.reconstruction_coefficient(args.reconstruction_weight, args.accumulation)).backward()
-                    losses["image_reconstruction"].append(rec_loss.detach())
+                    rec_scale = (2 * args.reconstruction_weight * scale / args.accumulation if epoch_plan else
+                                 stage2.reconstruction_coefficient(args.reconstruction_weight, args.accumulation))
+                    (rec_loss * rec_scale).backward()
+                    weighted_loss += rec_loss.detach() * rec_scale
+                    if not padding:
+                        losses["image_reconstruction"].append(rec_loss.detach())
                     observations.append(dict(task="image_reconstruction", paired_with="t2i", unit=0,
                                              stage=rec_stage, dropped=False, tokens=rec_mask.shape[1],
-                                             sample_id=sample["sample_id"]))
+                                             sample_id=sample["sample_id"], **({"padding": padding} if epoch_plan else {})))
                     del rec_layers, rec_mask, rec_loss
-            losses[sample["task"]].append(loss.detach())
-            observations.append(dict(task=sample["task"], unit=unit, stage=stage, dropped=dropped,
+            if not padding:
+                losses[mode].append(loss.detach())
+            observations.append(dict(task=mode, unit=unit, stage=stage, dropped=dropped,
                                      tokens=mask.shape[1], sample_id=sample["sample_id"],
                                      source_duration_seconds=sample.get("source_duration_seconds"),
-                                     effective_sample_fps=sample.get("effective_sample_fps")))
+                                     effective_sample_fps=sample.get("effective_sample_fps"),
+                                     **({"epoch": sample["epoch"] + 1, "padding": padding,
+                                         "loss_scale": scale} if epoch_plan else {})))
             del layers, mask, latent, loss
         component_norms = dict(connector=stage2.gradient_norm(connector))
         if args.phase == 2:
@@ -484,13 +554,19 @@ def train(args, ctx):
         if runtime_expired(args, ctx, launched):
             end = step
         if step == start + 1 or step % args.log_every == 0 or step == end:
+            loss_report, counts = media_epochs.distributed_loss_means(losses, ctx) if epoch_plan else (
+                {task: scalar_mean(torch.stack(values).mean(), ctx) for task, values in losses.items()}, None)
             report = dict(step=step, lr=lr, grad_norm=scalar_mean(norm, ctx),
                           component_grad_norm={key: scalar_mean(value, ctx) for key, value in component_norms.items()},
-                          loss={task: scalar_mean(torch.stack(values).mean(), ctx) for task, values in losses.items()},
+                          loss=loss_report,
                           elapsed_seconds=time.monotonic() - started, rank0_samples=observations,
                           peak_memory_gib=torch.cuda.max_memory_allocated(ctx.device) / 1024**3,
                           memory_by_rank=memory_report(ctx))
-            if args.reconstruction_weight:
+            if epoch_plan:
+                report.update(epoch=(step - 1) // epoch_plan.steps_per_epoch + 1,
+                              steps_per_epoch=epoch_plan.steps_per_epoch,
+                              valid_samples_in_update=counts, weighted_loss=scalar_mean(weighted_loss, ctx))
+            elif args.reconstruction_weight:
                 report["loss_weights"] = dict(t2i=0.5, t2v=0.5, image_reconstruction=args.reconstruction_weight)
                 report["weighted_loss"] = sum(report["loss"][task] * weight
                                               for task, weight in report["loss_weights"].items())

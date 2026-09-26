@@ -13,9 +13,10 @@ sys.path.insert(0, str(ROOT))
 
 import torch
 import torch.nn.functional as F
+import numpy as np
 from PIL import Image
 
-from tools.train_mobileov_stage1 import FORMAT, load_stack, autocast
+from tools.train_mobileov_stage1 import FORMAT, load_stack, autocast, encode_anchor
 from new_mobile_ov.training.stage2_alignment import FORMAT as STAGE2_FORMAT
 from new_mobile_ov.training.stage1_alignment import frozen_signatures, JsonlRecords, prepare_sample, TASKS
 from new_mobile_ov.training.stage1_alignment_data import load_sources
@@ -49,7 +50,8 @@ def verify_inference_stack(cfg, encoder, dit, vae, contract):
 
 @torch.no_grad()
 def generate_frames(dit, vae, scheduler, condition, *, device, seed, height=320, width=512,
-                    num_frames=49, first_steps=20, video_steps=10, guidance=7., video_guidance=5.):
+                    num_frames=49, first_steps=20, video_steps=10, guidance=7., video_guidance=5.,
+                    anchor_latent=None):
     from neodragon.utils.generation_utils import (
         _prepare_latent_noise, _downsample_noise_2x, _prepare_past_condition_latents,
         _generate_one_unit, _decode_latent,
@@ -63,7 +65,14 @@ def generate_frames(dit, vae, scheduler, condition, *, device, seed, height=320,
                                        height // 8, width // 8, torch.bfloat16, device)
         noise = _downsample_noise_2x(latent, 2)
         generated, statistics = [], []
-        for unit in range(units):
+        if anchor_latent is not None:
+            expected = (1, dit.config.in_channels, 1, height // 8, width // 8)
+            if units <= 1 or tuple(anchor_latent.shape) != expected or not bool(torch.isfinite(anchor_latent).all()):
+                raise ValueError(f"Invalid video anchor; expected {expected}")
+            generated.append(anchor_latent.to(device=device, dtype=torch.bfloat16))
+            statistics.append(dict(unit=0, supplied_anchor=True, mean=float(anchor_latent.float().mean()),
+                                   std=float(anchor_latent.float().std())))
+        for unit in range(len(generated), units):
             history = _prepare_past_condition_latents(generated, 3, True)
             generated.append(_generate_one_unit(
                 scheduler, dit, 3, noise[:, :, unit:unit + 1], history, *condition,
@@ -80,6 +89,16 @@ def generate_frames(dit, vae, scheduler, condition, *, device, seed, height=320,
     return frames, statistics
 
 
+def verify_i2v_request(args, contract):
+    if args.first_frame:
+        if args.reconstruct_image or args.validation_task or args.frames != 49 or not args.prompt.strip():
+            raise ValueError("I2V needs text + --first-frame with --frames 49; no reconstruction/validation task")
+        if contract.get("media_epochs", {}).get("recipe") != "media_epochs_i2v_v1":
+            raise ValueError("Checkpoint was not trained with text+image video modes")
+    elif args.i2v_mode != "reference":
+        raise ValueError("--i2v-mode anchor requires --first-frame")
+
+
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -87,6 +106,8 @@ def main():
     parser.add_argument("--config", default="configs/mobile_ov_neodragon.yaml")
     parser.add_argument("--prompt", default="A red panda walking through a bamboo forest.")
     parser.add_argument("--reconstruct-image", type=Path)
+    parser.add_argument("--first-frame", type=Path, help="Observed first RGB frame, not an image generator")
+    parser.add_argument("--i2v-mode", choices=("reference", "anchor"), default="reference")
     parser.add_argument("--validation-task", choices=TASKS)
     parser.add_argument("--data-root", type=Path, default=Path("download_data/data/univideo_stage1"))
     parser.add_argument("--validation-index", type=int, default=0)
@@ -110,6 +131,7 @@ def main():
     if payload.get("format") not in (FORMAT, STAGE2_FORMAT):
         raise ValueError("Not a Stage-1/Stage-2 checkpoint")
     contract = payload["contract"]
+    verify_i2v_request(args, contract)
     validation_sample = None
     if args.validation_task:
         if args.reconstruct_image:
@@ -146,29 +168,42 @@ def main():
     if args.reconstruct_image:
         with Image.open(args.reconstruct_image) as source:
             image = source.convert("RGB").resize((args.width, args.height), Image.Resampling.LANCZOS)
+    if args.first_frame:
+        with Image.open(args.first_frame) as source:
+            image = source.convert("RGB").resize((args.width, args.height), Image.Resampling.LANCZOS)
     with autocast(device):
-        positive = connector(*encoder("" if image is not None else args.prompt, image))
+        if args.first_frame:
+            positive = connector(*encoder(args.prompt, image, allow_text_image=True))
+        else:
+            positive = connector(*encoder("" if image is not None else args.prompt, image))
         negative = connector(*encoder("", drop_condition=True))
         length = max(positive[0].shape[1], negative[0].shape[1])
         positive, negative = pad_condition(positive, length), pad_condition(negative, length)
         condition = [torch.cat([neg, pos]) for neg, pos in zip(negative, positive)]
+    anchor = None
+    if args.first_frame and args.i2v_mode == "anchor":
+        video = torch.from_numpy(np.array(image, copy=True)).permute(2, 0, 1)[None, :, None]
+        video = (video.to(device=device, dtype=torch.float32) / 127.5 - 1).to(torch.bfloat16)
+        anchor = encode_anchor(vae, video, torch.Generator(device=device).manual_seed(args.seed + 228),
+                               window_size=contract.get("vae_window_size", 8))
     frames, unit_statistics = generate_frames(
         dit, vae, scheduler, condition, device=device, seed=args.seed,
         height=args.height, width=args.width, num_frames=args.frames,
         first_steps=args.first_steps, video_steps=args.video_steps,
-        guidance=args.guidance, video_guidance=args.video_guidance)
+        guidance=args.guidance, video_guidance=args.video_guidance, anchor_latent=anchor)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if image is not None:
-        image.save(args.output_dir / "reconstruction_input.png")
+        image.save(args.output_dir / ("first_frame_input.png" if args.first_frame else "reconstruction_input.png"))
     if args.frames == 1:
         frames[0].save(args.output_dir / "image.png")
     else:
         from diffusers.utils import export_to_video
         export_to_video(frames, str(args.output_dir / "video.mp4"), fps=24)
     (args.output_dir / "inference.json").write_text(json.dumps(dict(
-        checkpoint=str(args.checkpoint), seed=args.seed, prompt=args.prompt if image is None else "",
-        task="image_reconstruction" if image is not None else ("t2i" if args.frames == 1 else "t2v"),
-        external_anchor=False, validation_index=args.validation_index if args.validation_task else None,
+        checkpoint=str(args.checkpoint), seed=args.seed, prompt=args.prompt if image is None or args.first_frame else "",
+        task=f"i2v_{args.i2v_mode}" if args.first_frame else ("image_reconstruction" if image is not None else ("t2i" if args.frames == 1 else "t2v")),
+        external_anchor=anchor is not None, first_frame=str(args.first_frame) if args.first_frame else None,
+        validation_index=args.validation_index if args.validation_task else None,
         first_steps=args.first_steps, video_steps=args.video_steps,
         guidance=args.guidance, video_guidance=args.video_guidance, frames=len(frames),
         unit_statistics=unit_statistics, weight_audit=weight_audit), indent=2))

@@ -55,12 +55,14 @@ class FrozenStage1Encoder(nn.Module):
         return self
 
     @torch.no_grad()
-    def forward(self, prompt, image=None, *, drop_condition=False):
+    def forward(self, prompt, image=None, *, drop_condition=False, allow_text_image=False):
         if drop_condition:
             prompt, image = "", None
-        if image is not None and prompt:
+        if image is not None and prompt and not allow_text_image:
             raise ValueError("Reconstruction is image-only; target caption must not leak into the MLLM")
         content = [{"type": "image"}] if image is not None else [{"type": "text", "text": prompt}]
+        if image is not None and prompt:
+            content.append({"type": "text", "text": prompt})
         text = self.processor.apply_chat_template(
             [{"role": "user", "content": content}], tokenize=False, add_generation_prompt=True)
         kwargs = dict(text=[text], return_tensors="pt", padding=False, truncation=False)
