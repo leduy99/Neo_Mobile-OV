@@ -68,6 +68,39 @@ NORMALIZATION = {
 }
 
 
+class SampleCountVBench(VBench):
+    """Keep VBench's metrics while explicitly selecting the requested seed count."""
+
+    def __init__(self, *args, samples_per_prompt=5, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.samples_per_prompt = samples_per_prompt
+
+    def build_full_info_json(self, videos_path, name, dimension_list, prompt_list=None,
+                             special_str="", verbose=False, custom_image_folder=None,
+                             mode="vbench_standard", **kwargs):
+        if mode != "vbench_standard" or self.samples_per_prompt == 5:
+            return super().build_full_info_json(
+                videos_path, name, dimension_list, prompt_list=prompt_list or [],
+                special_str=special_str, verbose=verbose, custom_image_folder=custom_image_folder,
+                mode=mode, **kwargs,
+            )
+        selected = []
+        for row in json.loads(Path(self.full_info_dir).read_text(encoding="utf-8")):
+            if not set(dimension_list).intersection(row["dimension"]):
+                continue
+            videos = [str(Path(videos_path) / f"{row['prompt_en']}{special_str}-{index}.mp4")
+                      for index in range(self.samples_per_prompt)]
+            if any(not Path(path).is_file() or Path(path).stat().st_size == 0 for path in videos):
+                raise RuntimeError(f"Missing requested samples for {row['prompt_en']!r}")
+            selected.append({**row, "video_list": videos})
+        if not selected:
+            raise ValueError(f"No benchmark prompts for dimensions {dimension_list}")
+        target = Path(self.output_path) / f"{name}_full_info.json"
+        target.write_text(json.dumps(selected, indent=4) + "\n", encoding="utf-8")
+        print(f"Evaluation metadata: {target}; {self.samples_per_prompt} independently generated sample(s)/prompt", flush=True)
+        return str(target)
+
+
 def valid_result(path: Path, dimension: str) -> bool:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -172,7 +205,8 @@ def main() -> None:
         encoding="utf-8",
     )
     print(f"Validated VBench input coverage: {json.dumps(coverage)}", flush=True)
-    evaluator = VBench(torch.device("cuda"), str(info_path), str(score_dir))
+    evaluator = SampleCountVBench(torch.device("cuda"), str(info_path), str(score_dir),
+                                 samples_per_prompt=args.expected_samples_per_prompt)
     for dimension in DIMENSIONS[args.start : args.end]:
         result_path = score_dir / f"{dimension}_eval_results.json"
         if valid_result(result_path, dimension):

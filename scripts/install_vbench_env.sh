@@ -10,7 +10,18 @@ DETECTRON2_COMMIT="${DETECTRON2_COMMIT:-e0ec4e189d438848521aee7926f9900e114229f5
 DETECTRON2_MAX_JOBS="${DETECTRON2_MAX_JOBS:-4}"
 READY="${VBENCH_ENV}/.mobileov_vbench_ready_${VBENCH_COMMIT}_${DETECTRON2_COMMIT}"
 
-if [[ -f "${READY}" ]] && "${VBENCH_ENV}/bin/python" -c 'import torch, vbench, detectron2' >/dev/null 2>&1; then
+if [[ -f "${READY}" && -d "${VBENCH_REPO}/.git" && -s "${VBENCH_REPO}/vbench/VBench_full_info.json" ]] \
+    && [[ "$(git -C "${VBENCH_REPO}" rev-parse HEAD)" == "${VBENCH_COMMIT}" ]] \
+    && "${VBENCH_ENV}/bin/python" - <<'PY' >/dev/null 2>&1
+import importlib
+import torch, vbench, detectron2
+for dimension in ("subject_consistency", "background_consistency", "motion_smoothness", "dynamic_degree",
+                  "aesthetic_quality", "imaging_quality", "temporal_flickering", "object_class",
+                  "multiple_objects", "color", "spatial_relationship", "scene", "temporal_style",
+                  "overall_consistency", "human_action", "appearance_style"):
+    importlib.import_module(f"vbench.{dimension}")
+PY
+then
   echo "VBench environment already ready: ${VBENCH_ENV}"
   exit 0
 fi
@@ -30,7 +41,11 @@ if ! "${PYTHON}" -c 'import torch; assert torch.version.cuda == "12.1"' >/dev/nu
 fi
 
 if [[ ! -d "${VBENCH_REPO}/.git" ]]; then
-  rm -rf "${VBENCH_REPO}"
+  if [[ -e "${VBENCH_REPO}" ]]; then
+    echo "VBench target already exists but is not a git checkout: ${VBENCH_REPO}. Use a new VBENCH_REPO; existing files were not removed." >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "${VBENCH_REPO}")"
   git clone https://github.com/Vchitect/VBench.git "${VBENCH_REPO}"
 fi
 git -C "${VBENCH_REPO}" fetch origin "${VBENCH_COMMIT}" --depth 1

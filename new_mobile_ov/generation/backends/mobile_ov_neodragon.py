@@ -15,13 +15,52 @@ from new_mobile_ov.generation.backends.base import AnchorGenerationBackend
 class _PrecomputedNeodragonTextEncoder(nn.Module):
     """Tiny callable matching Neodragon TextEncoderBundle.forward."""
 
-    def __init__(self, prompt_embeds: torch.Tensor, prompt_mask: torch.Tensor, pooled: torch.Tensor):
+    def __init__(
+        self,
+        prompt_embeds: torch.Tensor,
+        prompt_mask: torch.Tensor,
+        pooled: torch.Tensor,
+        *,
+        negative_prompt: str | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_mask: torch.Tensor | None = None,
+        negative_pooled: torch.Tensor | None = None,
+    ):
         super().__init__()
         self.register_buffer("prompt_embeds", prompt_embeds.detach(), persistent=False)
         self.register_buffer("prompt_mask", prompt_mask.detach(), persistent=False)
         self.register_buffer("pooled", pooled.detach(), persistent=False)
+        self.negative_prompt = negative_prompt
+        self.register_buffer(
+            "negative_prompt_embeds",
+            None if negative_prompt_embeds is None else negative_prompt_embeds.detach(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "negative_prompt_mask",
+            None if negative_prompt_mask is None else negative_prompt_mask.detach(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "negative_pooled",
+            None if negative_pooled is None else negative_pooled.detach(),
+            persistent=False,
+        )
 
     def forward(self, input_prompts, device: torch.device):
+        prompts = [input_prompts] if isinstance(input_prompts, str) else list(input_prompts)
+        use_negative = (
+            self.negative_prompt is not None
+            and self.negative_prompt_embeds is not None
+            and prompts
+            and all(str(prompt) == self.negative_prompt for prompt in prompts)
+        )
+        if use_negative:
+            return (
+                self.negative_prompt_embeds.to(device),
+                self.negative_prompt_mask.to(device),
+                self.negative_pooled.to(device),
+            )
         return (
             self.prompt_embeds.to(device),
             self.prompt_mask.to(device),
@@ -118,6 +157,9 @@ class MobileOVNeodragonBackend(AnchorGenerationBackend):
         prompt_embeds: torch.Tensor,
         prompt_mask: torch.Tensor,
         pooled_prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_mask: torch.Tensor | None = None,
+        negative_pooled_prompt_embeds: torch.Tensor | None = None,
         first_frame: Image.Image | None = None,
         height: int = 320,
         width: int = 512,
@@ -134,23 +176,57 @@ class MobileOVNeodragonBackend(AnchorGenerationBackend):
         Neodragon still uses its native SSD first-frame generator. Supplying
         ``first_frame`` lets another Mobile-OV generation head provide the anchor.
         """
-        if self.mode != "hybrid":
-            raise NotImplementedError("Bridge-conditioned smoke path currently supports Neodragon hybrid mode.")
-        from neodragon.utils.generation_utils import DEFAULT_PROMPT_MODIFIER, generate
+        from neodragon.utils.generation_utils import (
+            DEFAULT_NEGATIVE_PROMPT,
+            DEFAULT_PROMPT_MODIFIER,
+            generate,
+        )
 
         prompt_modifier = DEFAULT_PROMPT_MODIFIER if prompt_modifier is None else prompt_modifier
+        negative_prompt = (
+            DEFAULT_NEGATIVE_PROMPT if negative_prompt is None else negative_prompt
+        )
+        if self.mode == "monolithic" and any(
+            value is None
+            for value in (
+                negative_prompt_embeds,
+                negative_prompt_mask,
+                negative_pooled_prompt_embeds,
+            )
+        ):
+            raise ValueError(
+                "Monolithic bridge inference requires negative bridge conditions for CFG."
+            )
         text_encoder = _PrecomputedNeodragonTextEncoder(
             prompt_embeds.to(device=self.device, dtype=self.dtype),
             prompt_mask.to(device=self.device),
             pooled_prompt_embeds.to(device=self.device, dtype=self.dtype),
+            negative_prompt=negative_prompt,
+            negative_prompt_embeds=(
+                None
+                if negative_prompt_embeds is None
+                else negative_prompt_embeds.to(device=self.device, dtype=self.dtype)
+            ),
+            negative_prompt_mask=(
+                None
+                if negative_prompt_mask is None
+                else negative_prompt_mask.to(device=self.device)
+            ),
+            negative_pooled=(
+                None
+                if negative_pooled_prompt_embeds is None
+                else negative_pooled_prompt_embeds.to(
+                    device=self.device, dtype=self.dtype
+                )
+            ),
         )
         with torch.cuda.amp.autocast(enabled=self.device.type == "cuda", dtype=self.dtype):
-            if first_frame is None:
+            if self.mode == "hybrid" and first_frame is None:
                 first_frame = self.pipeline.first_frame_gen_pipeline(
                     prompt=str(prompt) + prompt_modifier,
                     num_images_per_prompt=1,
                 ).images[0]
-            else:
+            elif first_frame is not None:
                 first_frame = first_frame.convert("RGB")
             return generate(
                 text_encoder_bundle=text_encoder,
@@ -171,7 +247,7 @@ class MobileOVNeodragonBackend(AnchorGenerationBackend):
                 profile=profile,
                 device=self.device,
                 dtype=self.dtype,
-                **{**self.pipeline.config.gen_confs["hybrid"], **kwargs},
+                **{**self.pipeline.config.gen_confs[self.mode], **kwargs},
             )
 
     @torch.no_grad()
