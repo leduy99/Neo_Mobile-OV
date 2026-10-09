@@ -35,8 +35,8 @@ def launch(tmp_path):
 argv = sys.argv[1:]
 pathlib.Path(os.environ["ARGV_LOG"]).write_text(json.dumps(argv))
 output = pathlib.Path(argv[argv.index("--output-dir") + 1])
-systems = argv[argv.index("--systems") + 1:argv.index("--protocol")]
-report = "paper_reference_comparison" if "tools/reproduce_native_neodragon_vbench.py" in argv else ("quicksr_ablation" if "tools/benchmark_joint_v2_quicksr_ablation.py" in argv else ("comparison" if len(systems) == 2 else "result"))
+systems = argv[argv.index("--systems") + 1:argv.index("--protocol")] if "--systems" in argv else []
+report = "paper_reference_comparison" if "tools/reproduce_native_neodragon_vbench.py" in argv else ("quicksr_ablation" if ("tools/benchmark_joint_v2_quicksr_ablation.py" in argv or "tools/benchmark_mobileov_stage2_media3epochs_dual.py" in argv) else ("comparison" if len(systems) == 2 else "result"))
 output.mkdir(parents=True, exist_ok=True)
 (output / (report + ".json")).write_text("{}")
 (output / (report + ".md")).write_text("mock report")
@@ -46,7 +46,7 @@ if report == "paper_reference_comparison":
     python.chmod(0o755)
     names = ("PROJECT_ROOT", "SAMPLES_PER_PROMPT", "MAX_PROMPTS", "RUN_ROOT", "BENCHMARK_SYSTEMS",
              "JOINT_CKPT", "IMAGE_CKPT", "JOINT_1X", "NATIVE_1X", "NATIVE_MODEL_DIR", "NATIVE_REPO",
-             "NATIVE_CACHE", "SEED", "VBENCH_REPO", "EXPORT_VERSIONS")
+             "NATIVE_CACHE", "SEED", "VBENCH_REPO", "EXPORT_VERSIONS", "CHECKPOINT", "EXPECTED_SHA256")
     env = {name: value for name, value in os.environ.items() if name not in names}
     env.update(PATH=f"{bin_dir}:{env['PATH']}", SLURM_SUBMIT_DIR=str(root), CONDA_ENV=str(python.parents[1]),
                VBENCH_ENV=str(python.parents[1]), HF_HOME=str(tmp_path / "cache"), TMPDIR=str(tmp_path / "tmp"),
