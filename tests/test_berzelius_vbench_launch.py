@@ -36,10 +36,12 @@ argv = sys.argv[1:]
 pathlib.Path(os.environ["ARGV_LOG"]).write_text(json.dumps(argv))
 output = pathlib.Path(argv[argv.index("--output-dir") + 1])
 systems = argv[argv.index("--systems") + 1:argv.index("--protocol")]
-report = "quicksr_ablation" if "tools/benchmark_joint_v2_quicksr_ablation.py" in argv else ("comparison" if len(systems) == 2 else "result")
+report = "paper_reference_comparison" if "tools/reproduce_native_neodragon_vbench.py" in argv else ("quicksr_ablation" if "tools/benchmark_joint_v2_quicksr_ablation.py" in argv else ("comparison" if len(systems) == 2 else "result"))
 output.mkdir(parents=True, exist_ok=True)
 (output / (report + ".json")).write_text("{}")
 (output / (report + ".md")).write_text("mock report")
+if report == "paper_reference_comparison":
+    (output / "quicksr_ablation.json").write_text("{}")
 ''')
     python.chmod(0o755)
     names = ("PROJECT_ROOT", "SAMPLES_PER_PROMPT", "MAX_PROMPTS", "RUN_ROOT", "BENCHMARK_SYSTEMS",

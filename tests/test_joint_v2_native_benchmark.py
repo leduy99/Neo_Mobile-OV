@@ -372,7 +372,8 @@ def test_local_job_selects_only_joint_v2_1x_on_2_gpus():
 
 
 @pytest.mark.parametrize("name", ["benchmark_joint_v2_native.py", "generate_vbench_joint_v2_native.py",
-                                  "benchmark_joint_v2_quicksr_ablation.py", "generate_vbench_joint_v2_dual_export.py"])
+                                  "benchmark_joint_v2_quicksr_ablation.py", "generate_vbench_joint_v2_dual_export.py",
+                                  "reproduce_native_neodragon_vbench.py", "generate_native_neodragon_release.py"])
 def test_cli_imports_with_a_foreign_installed_tools_package(tmp_path, name):
     foreign = tmp_path / "tools"
     foreign.mkdir()
