@@ -1,7 +1,7 @@
 # VBench: First-Frame Swaps and Stage-2 Three-Epoch Results
 
 - **Recorded:** 2026-10-12 (Asia/Dubai)
-- **Status:** measured-score record; checkpoint-curve results are still pending
+- **Status:** measured-score record; matched 100K/190K/final checkpoint curve recorded
 - **Scope:** recent Berzelius evaluations, not mobile latency measurements
 
 ## 1. Main Findings
@@ -22,6 +22,12 @@ gap. Joint V2 and native Hybrid use different video weights, conditioners, and
 denoising schedules. The newer Stage-2 run also changed the data and task mixture,
 not only the number of steps.
 
+The newly supplied within-run checkpoint curve is a cleaner comparison:
+quality, semantic, and total scores increase from 100K to 190K to the final
+checkpoint, while dynamic degree peaks at 190K. Continuing this particular
+training run produced meaningful gains over the measured range, with a movement
+tradeoff rather than an aggregate late-training collapse.
+
 ## 2. Sources and Status
 
 The numerical tables below were transcribed from Markdown reports pasted by the
@@ -39,6 +45,8 @@ is `/proj/cvl/users/x_fahkh2/Neo_Mobile-OV`.
 | SSD1B first frame -> Joint V2 | `output/vbench_joint_v2_ssd1b_5x_dual/` | User supplied `anchor_effect.md`; intended job `17728808` |
 | V11/DreamLite first frame -> native Hybrid | `output/vbench_native_hybrid_dreamlite_v11_5x_dual/` | User supplied `anchor_effect.md`; submitted job `17728809` |
 | Stage-2 three-media-epoch checkpoint | `output/vbench_mobileov_stage2_media3epochs_5x_dual/` | User supplied `quicksr_ablation.md`; benchmark job ID not independently confirmed |
+| Same-run 100K checkpoint, ~1.056 epochs | `output/vbench_mobileov_stage2_media3epochs_epoch1_step100000_5x_dual/` | User supplied full `epoch_comparison.md`; job ID not provided |
+| Same-run 190K checkpoint, ~2.007 epochs | `output/vbench_mobileov_stage2_media3epochs_epoch2_step190000_5x_dual/` | User supplied full `epoch_comparison.md`; job ID not provided |
 | Separate native-release reproduction | `output/vbench_native_neodragon_release_5x/` | Earlier user-supplied report; a different generation protocol |
 
 Submission `17728910` duplicated the SSD1B -> Joint V2 job. Cancellation was
@@ -349,6 +357,7 @@ equivalence to the paper's quantized mobile implementation.
 - First-frame-stack choice is a substantial contributor to semantic and imaging scores in the anchored systems.
 - Better aggregate semantic score with SSD1B does not eliminate the video-stack dynamic-degree gap.
 - The new Stage-2 recipe has better reported scores than older Stage-2 runs; the improvement is visible without QuickSR.
+- The same-run 100K/190K/final comparisons show increasing aggregate quality, semantic, and total scores under matched evaluation; dynamic degree is not monotonic.
 - QuickSR/resolution changes materially affect some semantic measurements and must be kept consistent in comparisons.
 
 **Not established by these measurements:**
@@ -359,27 +368,104 @@ equivalence to the paper's quantized mobile implementation.
 - That additional steps alone, adding LoRA alone, or a particular loss change will close the gap.
 - That these GPU VBench runs establish mobile latency, unified understanding improvement, or exact paper reproduction.
 
-The next checkpoint comparisons should keep the new run, prompt/seed plan,
-inference code, and raw/QuickSR evaluation fixed. They can determine whether the
-new run improves, plateaus, or degrades across training. They cannot, by
-themselves, separate data quality from task-mixture effects.
+The supplied within-run comparisons keep the prompt/seed plan, inference code,
+and raw/QuickSR evaluation fixed. They support aggregate progress from 100K to
+the final checkpoint, but do not isolate the mechanism behind it or show the
+unmeasured pre-training baseline's quality. Further checkpoints should retain
+the same controls rather than mixing different runs or protocols.
 
-## 9. Pending Checkpoint Comparisons
+## 9. Within-Run Checkpoint Curve
+
+Both intermediate `epoch_comparison.md` reports have now been supplied by the
+user. They compare checkpoints from the **same run 17641364** with the completed
+final benchmark. This is distinct from Section 6.1's older, differently trained
+100K/150K models.
 
 Exact media-epoch boundaries are 94,659; 189,318; and 283,977 steps. Archiving was
-configured every 10K steps, so the chosen intermediate checkpoints are slightly
-after epoch boundaries.
+configured every 10K steps, so 100K and 190K are slightly after epoch boundaries.
+All three checkpoints use five videos per prompt, the same inference code,
+prompt/seed plan, sampling settings, and raw/QuickSR exports, as checked by the
+intermediate evaluator before generation. No external first-frame anchor is used.
+
+| Checkpoint | Media epochs | QuickSR | Quality | Semantic | Total | Dynamic degree |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| 100,000 | 1.056 | Without | 77.68 | 48.30 | 71.81 | 63.33 |
+| 100,000 | 1.056 | With | 77.87 | 49.97 | 72.29 | 64.72 |
+| 190,000 | 2.007 | Without | 78.79 | 55.13 | 74.06 | 75.56 |
+| 190,000 | 2.007 | With | 78.75 | 56.87 | 74.37 | 73.61 |
+| 283,977 | 3.000 | Without | 79.83 | 60.32 | 75.93 | 66.94 |
+| 283,977 | 3.000 | With | 79.77 | 62.00 | 76.22 | 64.72 |
+
+### 9.1 What the Curve Establishes
+
+Aggregate quality, semantic, and total scores increase at every measured
+checkpoint, with and without QuickSR. QuickSR total rises **72.29 -> 74.37 ->
+76.22**, while raw total rises **71.81 -> 74.06 -> 75.93**. The gain therefore
+does not come only from super-resolution.
+
+From 190K to the final checkpoint, the original reports give these QuickSR
+gains: quality **+1.03 pp**, semantic **+5.13 pp**, total **+1.85 pp**,
+multiple objects **+19.28 pp**, human action **+8.60 pp**, and imaging quality
+**+3.98 pp**. Learning remains productive over that measured interval. A
+claim that this monolithic model cannot learn, or that the run undergoes an
+aggregate late-training collapse between 100K and the final checkpoint, is
+not supported by this curve.
+
+The final checkpoint is the best of these three for aggregate scores. The
+curve does not establish the performance of the unmeasured pre-training
+baseline or checkpoints earlier than 100K. It also does not prove that further
+training will continue to improve, reach native performance, or follow a
+particular scaling law.
+
+### 9.2 Movement Tradeoff
+
+190K has the highest dynamic degree: **73.61 with QuickSR**, versus **64.72**
+at the final checkpoint. The original report gives a **-8.89 pp** change from
+190K to final. Raw dynamic degree also falls, from **75.56 to 66.94**
+(**-8.61 pp** reported), so this is not merely a QuickSR effect.
+
+Over the same interval, subject/background consistency, imaging quality,
+human-action score, and motion smoothness improve. Thus, fewer clips pass the
+movement threshold even as aggregate prompt-following and visual scores rise.
+This does not prove either better motion or motion collapse. The relevant
+qualitative check is the same-prompt/same-seed clips where 190K passes the
+movement criterion but the final checkpoint does not.
+
+Keep both checkpoints: final for the best reported aggregate result, 190K as
+a useful movement reference. No single checkpoint wins every dimension.
+
+### 9.3 Interpretation and Next Training Decision
+
+Unlike the historical comparison in Section 6.1, this curve holds the training
+run and evaluation protocol fixed. It supports progress from continuing the
+existing training process, but additional updates are accompanied by more
+media exposure and rotating per-video task coverage. It cannot isolate those
+mechanisms from one another.
+
+A continuation with the existing data/recipe is now a reasonable proposed test,
+rather than switching data, losses, LoRA, and learning rate simultaneously.
+Under the unchanged sampler, **six media epochs would give every video two
+presentations in each video mode**, including two T2V presentations. This is
+a proposal, not a completed run or a guarantee of further gains.
+
+Any continuation must preserve optimizer/sample position and explicitly extend
+the epoch budget; the existing training CLI only accepts a three-epoch target.
+Movement, scene depiction, and the native-quality gap still need monitoring.
+No new training was launched as part of recording these results.
+
+### 9.4 Checkpoint and Artifact Status
 
 | Checkpoint of run 17641364 | Approximate media epochs | Measurement status |
 | --- | ---: | --- |
-| `stage2_dit_connector_step100000.pt` | 1.056 | Evaluation scripts prepared; no score supplied yet |
-| `stage2_dit_connector_step190000.pt` | 2.007 | Evaluation scripts prepared; no score supplied yet |
-| `stage2_dit_connector_step283977.pt` / final `latest` | 3.000 | Remote full VBench report supplied above |
+| `stage2_dit_connector_step100000.pt` | 1.056 | Full remote comparison report supplied; QuickSR total 72.29 |
+| `stage2_dit_connector_step190000.pt` | 2.007 | Full remote comparison report supplied; QuickSR total 74.37 |
+| `stage2_dit_connector_step283977.pt` / final `latest` | 3.000 | Full remote report supplied; QuickSR total 76.22 |
 | Locally cached `stage2_dit_connector_latest.pt` | 1.373, step 130K | Intermediate only; not the final three-epoch weight |
 
-The new epoch jobs verify the payload step and training contract, compare their
-inference settings with the completed epoch-3 report, and write
-`epoch_comparison.md` for raw and QuickSR. They do not regenerate epoch 3.
+The epoch jobs verify the payload step and training contract and compare their
+inference settings with the completed epoch-3 report. They do not regenerate
+epoch 3. The intermediate job IDs, JSON receipts, weights, and per-video score
+arrays have not been independently fetched for this note.
 
 Local jobs `6323`, `6324`, `6325`, and `6408` are functional smoke tests of
 generation/export/resume and selected metric paths. They are not full VBench
@@ -453,3 +539,60 @@ the intermediate-checkpoint wrapper:
 - [Intermediate Stage-2 checkpoint benchmark](../tools/benchmark_mobileov_stage2_epoch_dual.py)
 - [Media-epoch sampling contract](../new_mobile_ov/training/stage2_media_epochs.py)
 - [Frozen Stage-1/2 SmolVLM2 encoder](../new_mobile_ov/bridge/stage1_conditioner.py)
+
+## Appendix C. Matched Intermediate-Checkpoint Measurements
+
+These are the newly supplied epoch reports, not the historical Stage-2 100K
+run. The final columns reproduce Section 4's completed three-epoch result.
+
+### C.1 Absolute Scores
+
+| Score/dimension (%) | 100K raw | 190K raw | Final raw | 100K QuickSR | 190K QuickSR | Final QuickSR |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| quality_score | 77.68 | 78.79 | 79.83 | 77.87 | 78.75 | 79.77 |
+| semantic_score | 48.30 | 55.13 | 60.32 | 49.97 | 56.87 | 62.00 |
+| total_score | 71.81 | 74.06 | 75.93 | 72.29 | 74.37 | 76.22 |
+| subject_consistency | 91.29 | 89.90 | 92.17 | 90.98 | 89.64 | 91.88 |
+| background_consistency | 91.57 | 92.24 | 94.38 | 91.18 | 91.84 | 94.23 |
+| motion_smoothness | 98.91 | 98.38 | 98.84 | 98.80 | 98.25 | 98.70 |
+| dynamic_degree | 63.33 | 75.56 | 66.94 | 64.72 | 73.61 | 64.72 |
+| aesthetic_quality | 48.16 | 50.53 | 51.07 | 48.98 | 51.25 | 51.56 |
+| imaging_quality | 52.31 | 53.71 | 57.65 | 53.59 | 55.27 | 59.25 |
+| temporal_flickering | 99.00 | 98.94 | 98.75 | 98.89 | 98.83 | 98.62 |
+| object_class | 63.88 | 73.50 | 79.08 | 63.13 | 74.27 | 78.09 |
+| multiple_objects | 10.49 | 21.72 | 41.62 | 14.41 | 28.92 | 48.20 |
+| color | 91.85 | 94.74 | 92.78 | 94.27 | 93.34 | 93.20 |
+| spatial_relationship | 24.82 | 41.74 | 48.27 | 35.31 | 50.64 | 58.26 |
+| scene | 6.63 | 9.11 | 14.91 | 6.92 | 9.53 | 14.01 |
+| temporal_style | 20.11 | 20.96 | 20.87 | 19.88 | 20.74 | 20.70 |
+| overall_consistency | 21.09 | 22.50 | 22.79 | 20.98 | 22.40 | 22.72 |
+| human_action | 48.60 | 60.60 | 68.20 | 48.20 | 60.60 | 69.20 |
+| appearance_style | 21.09 | 20.99 | 21.39 | 21.08 | 21.14 | 21.35 |
+
+### C.2 Reported Intermediate Minus Final Changes
+
+Changes below preserve the original report's unrounded-result subtraction.
+They may differ by 0.01 pp from subtracting displayed two-decimal scores.
+Positive values favor the intermediate checkpoint; negative values favor final.
+
+| Score/dimension | 100K - final raw | 100K - final QuickSR | 190K - final raw | 190K - final QuickSR |
+| --- | ---: | ---: | ---: | ---: |
+| quality_score | -2.15 | -1.90 | -1.05 | -1.03 |
+| semantic_score | -12.02 | -12.03 | -5.19 | -5.13 |
+| total_score | -4.13 | -3.93 | -1.88 | -1.85 |
+| subject_consistency | -0.88 | -0.91 | -2.27 | -2.24 |
+| background_consistency | -2.81 | -3.05 | -2.14 | -2.40 |
+| motion_smoothness | +0.08 | +0.10 | -0.46 | -0.45 |
+| dynamic_degree | -3.61 | +0.00 | +8.61 | +8.89 |
+| aesthetic_quality | -2.91 | -2.58 | -0.54 | -0.31 |
+| imaging_quality | -5.34 | -5.66 | -3.94 | -3.98 |
+| temporal_flickering | +0.24 | +0.27 | +0.19 | +0.21 |
+| object_class | -15.21 | -14.95 | -5.59 | -3.81 |
+| multiple_objects | -31.13 | -33.80 | -19.89 | -19.28 |
+| color | -0.93 | +1.08 | +1.96 | +0.15 |
+| spatial_relationship | -23.46 | -22.96 | -6.54 | -7.62 |
+| scene | -8.28 | -7.09 | -5.80 | -4.48 |
+| temporal_style | -0.76 | -0.82 | +0.09 | +0.04 |
+| overall_consistency | -1.70 | -1.74 | -0.29 | -0.32 |
+| human_action | -19.60 | -21.00 | -7.60 | -8.60 |
+| appearance_style | -0.30 | -0.27 | -0.40 | -0.22 |
