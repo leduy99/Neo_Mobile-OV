@@ -19,6 +19,8 @@ import json
 import math
 import os
 from pathlib import Path
+import random
+import re
 import sys
 import tempfile
 import time
@@ -28,6 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import torch
+import numpy as np
 import torch.distributed as dist
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -52,14 +55,22 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--phase", type=int, choices=(1, 2), default=1)
     parser.add_argument("--init-connector", type=Path, help="Stage-1 inference checkpoint, only for Phase 2")
+    parser.add_argument("--init-stage2", type=Path, help="Opt-in first-frame-focused weights-only fork from completed epoch 3")
+    parser.add_argument("--expected-stage2-step", type=int, default=283977)
+    parser.add_argument("--expected-stage2-sha256", help="Exact parent file digest; no silent latest-checkpoint substitution")
     parser.add_argument("--expected-init-step", type=int, default=15000)
     parser.add_argument("--config", default="configs/mobile_ov_neodragon.yaml")
     parser.add_argument("--data-root", type=Path, default=Path("download_data/data/univideo_stage1"))
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--processor", default="HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
     parser.add_argument("--steps", type=int, help="Total optimizer updates, not microbatches")
-    parser.add_argument("--media-epochs", type=int, choices=(3,),
+    parser.add_argument("--media-epochs", type=int, choices=(1, 3),
                         help="Fresh Stage 2: each image/video three times; rotate T2V/reference/anchor modes")
+    parser.add_argument("--media-start-epoch", type=int, default=0, help="Zero-based absolute media epoch; 3 only for --init-stage2")
+    parser.add_argument("--t2v-first-probability", type=float,
+                        help="Opt-in T2V unit-zero preference; reference/anchor sampling is unchanged")
+    parser.add_argument("--integration-smoke", action="store_true",
+                        help="Allow tiny local data/world size for a <=10-update Stage-2 fork correctness smoke only")
     parser.add_argument("--min-train-videos", type=int, default=1)
     parser.add_argument("--require-expanded-release", action="store_true")
     parser.add_argument("--accumulation", type=int, help="Complete task cycles; Phase 1: 3 tasks, Phase 2: 2")
@@ -95,6 +106,19 @@ def parse_args(argv=None):
     parser.add_argument("--cuda-memory-limit-gib", type=float, default=0,
                         help="Local memory regression test: cap the PyTorch allocator; 0 leaves it unrestricted")
     args = parser.parse_args(argv)
+    if args.init_stage2:
+        if (args.phase != 2 or args.init_connector is not None or args.media_epochs != 1
+                or args.media_start_epoch != 3 or args.t2v_first_probability != .5
+                or args.reconstruction_weight != .2 or args.expected_stage2_step < 1):
+            parser.error("Stage-2 fork requires Phase 2, one pass at epoch offset 3, T2V probability .5, reconstruction .2, and no Stage-1 init")
+    elif (args.media_start_epoch or args.t2v_first_probability is not None or args.media_epochs == 1
+          or args.expected_stage2_sha256 or args.integration_smoke):
+        parser.error("First-frame fork options require --init-stage2; legacy recipes are unchanged")
+    if args.expected_stage2_sha256 and not re.fullmatch(r"[0-9a-f]{64}", args.expected_stage2_sha256):
+        parser.error("Parent digest must be a lowercase SHA256")
+    if args.integration_smoke and (args.stop_after is None or
+                                   not args.expected_stage2_step < args.stop_after <= args.expected_stage2_step + 10):
+        parser.error("Integration smoke requires an absolute --stop-after within ten updates of the parent")
     if args.media_epochs:
         if args.phase != 2 or args.steps is not None or args.extend_steps or args.enable_reconstruction_on_resume:
             parser.error("Media epochs require Phase 2, auto-calculated steps, and only exact own-run resumes")
@@ -121,8 +145,8 @@ def parse_args(argv=None):
         parser.error("VAE window must be a positive multiple of 8")
     if not math.isfinite(args.cuda_memory_limit_gib) or args.cuda_memory_limit_gib < 0:
         parser.error("Invalid CUDA memory limit")
-    if (args.phase == 2) != (args.init_connector is not None):
-        parser.error("Phase 2 requires --init-connector; Phase 1 always starts randomly or resumes its own run")
+    if (args.phase == 2) != (args.init_connector is not None or args.init_stage2 is not None):
+        parser.error("Phase 2 requires --init-connector or --init-stage2; Phase 1 starts randomly or resumes its own run")
     if args.max_runtime_seconds < 0 or args.expected_init_step < 1:
         parser.error("Invalid runtime limit or initialization step")
     if not math.isfinite(args.reconstruction_weight) or args.reconstruction_weight < 0:
@@ -273,10 +297,13 @@ def validate_resume(saved, contract, connector_spec, *, extend_steps=False, expe
     optimizer = saved.get("optimizer")
     if not isinstance(optimizer, dict) or not optimizer.get("param_groups") or (step and not optimizer.get("state")):
         raise ValueError("Resume requires optimizer state. Use stage2_resume.pt (or stage1_resume.pt), not an inference checkpoint")
+    if "first_frame_focus" in contract and (not isinstance(saved.get("rng_states"), list)
+                                            or len(saved["rng_states"]) != contract["world_size"]):
+        raise ValueError("First-frame fork resume requires exact per-rank RNG states")
     return step
 
 
-def save(args, step, connector, optimizer, contract, *, final=False, dit=None):
+def save(args, step, connector, optimizer, contract, *, final=False, dit=None, rng_states=None):
     payload = dict(format=contract["format"], step=step, connector_spec=connector.spec,
                    connector={key: value.detach().cpu() for key, value in connector.state_dict().items()},
                    contract=contract)
@@ -284,7 +311,7 @@ def save(args, step, connector, optimizer, contract, *, final=False, dit=None):
     if dit is not None:
         payload["dit"] = {key: value.detach().cpu() for key, value in dit.state_dict().items()}
     latest = args.output_dir / f"{prefix}_latest.pt"
-    archive = step % args.archive_every == 0 or final
+    archive = (step - getattr(args, "checkpoint_origin", 0)) % args.archive_every == 0 or final
     destination = args.output_dir / f"{prefix}_step{step:06d}.pt" if archive else latest
     atomic_torch_save(payload, destination)
     if archive:
@@ -297,8 +324,46 @@ def save(args, step, connector, optimizer, contract, *, final=False, dit=None):
             shutil.copyfile(destination, temporary)
         temporary.replace(latest)
     phase = 1 if dit is None else 2
-    atomic_torch_save({**payload, "optimizer": optimizer.state_dict()}, args.output_dir / f"stage{phase}_resume.pt")
+    resume = {**payload, "optimizer": optimizer.state_dict()}
+    if rng_states is not None:
+        resume["rng_states"] = rng_states
+    atomic_torch_save(resume, args.output_dir / f"stage{phase}_resume.pt")
     print(f"Saved Stage-{phase} step={step}; optimizer only in resume file; SmolVLM2/VAE excluded.", flush=True)
+
+
+def capture_rng_states(ctx):
+    state = np.random.get_state()
+    local = dict(torch_cpu=torch.get_rng_state(),
+                 torch_cuda=torch.cuda.get_rng_state(ctx.device) if ctx.device.type == "cuda" else None,
+                 python=random.getstate(), numpy=(state[0], state[1].tolist(), *state[2:]))
+    if not ctx.is_distributed:
+        return [local]
+    values = [None] * ctx.world_size
+    dist.all_gather_object(values, local)
+    return values
+
+
+def restore_rng_states(states, ctx):
+    if not isinstance(states, list) or len(states) != ctx.world_size:
+        raise ValueError("Fork resume requires per-rank RNG states and the same world size")
+    state = states[ctx.rank]
+    torch.set_rng_state(state["torch_cpu"])
+    random.setstate(state["python"])
+    name, values, position, gaussian, cached = state["numpy"]
+    np.random.set_state((name, np.asarray(values, dtype=np.uint32), position, gaussian, cached))
+    if ctx.device.type == "cuda":
+        if state["torch_cuda"] is None:
+            raise ValueError("Missing CUDA RNG for fork resume")
+        torch.cuda.set_rng_state(state["torch_cuda"], ctx.device)
+
+
+def validation_metrics(args, ctx, *stack):
+    states = capture_rng_states(ctx) if args.init_stage2 else None
+    try:
+        return validate(args, ctx, *stack)
+    finally:
+        if states is not None:
+            restore_rng_states(states, ctx)
 
 
 def runtime_expired(args, ctx, started):
@@ -358,17 +423,22 @@ def train(args, ctx):
             raise ValueError("Output already contains a run; specify --resume or a new output directory")
     barrier()
     epoch_plan = None
+    parent_step = args.expected_stage2_step if args.init_stage2 else 0
+    args.checkpoint_origin = parent_step
     if args.media_epochs:
         epoch_plan = media_epochs.plan_from_release(
             args.data_root, world_size=ctx.world_size, accumulation=args.accumulation,
             epochs=args.media_epochs, seed=args.seed, min_videos=args.min_train_videos,
-            require_expansion=args.require_expanded_release, verify=False)
-        args.steps = epoch_plan.steps
+            require_expansion=args.require_expanded_release, verify=False, start_epoch=args.media_start_epoch)
+        args.steps = parent_step + epoch_plan.steps
         if args.stop_after is not None and args.stop_after > args.steps:
             raise ValueError("Stop-after exceeds calculated epoch budget")
         if ctx.is_main:
             print(f"Exact media epoch plan: {json.dumps(epoch_plan.contract())}", flush=True)
     torch.manual_seed(args.seed)
+    if args.init_stage2:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
     cfg, encoder, connector, dit, vae, scheduler = load_stack(args, ctx.device)
     initial_modules = dict(smolvlm2=encoder, dit=dit, vae=vae)
     if any(p.requires_grad for module in initial_modules.values() for p in module.parameters()):
@@ -395,7 +465,41 @@ def train(args, ctx):
     # Keep old default Stage-1 resume contracts valid; record nondefault encoding explicitly.
     if args.phase == 2 or args.vae_window_size != 16:
         contract["vae_window_size"] = args.vae_window_size
-    if args.phase == 2:
+    if args.init_stage2:
+        if args.output_dir.resolve() == args.init_stage2.resolve().parent:
+            raise ValueError("Stage-2 fork must use a new output directory; preserve the epoch-3 baseline")
+        digest = [sha256_file(args.init_stage2) if ctx.is_main else None]
+        if ctx.is_distributed:
+            dist.broadcast_object_list(digest, src=0)
+        if args.expected_stage2_sha256 and digest[0] != args.expected_stage2_sha256:
+            raise ValueError("Stage-2 parent file SHA256 differs from the selected final epoch-3 weights")
+        payload = torch.load(args.init_stage2, map_location="cpu", weights_only=False, mmap=True)
+        media_epochs.validate_fork_parent(payload, epoch_plan, expected_step=parent_step,
+                                         data_summary_sha256=contract["data_summary_sha256"],
+                                         integration_smoke=args.integration_smoke)
+        stage2.initialize_from_stage2(payload, connector, dit, contract=contract, args=args)
+        contract.update(initial_weights_sha256=initial_signatures,
+                        initialization="stage2_weights_only_fork_fresh_optimizer",
+                        init_stage2_sha256=digest[0], init_step=parent_step,
+                        parent_contract=payload["contract"],
+                        task_ratio=[1, 1], tasks=list(args.tasks), backbone="released_multistep_t2v_trainable",
+                        frozen_components=["smolvlm2", "vae"], trainable_components=["connector", "dit"],
+                        ema=False, scope="first_frame_focus_continuation_public_data_not_exact_UniVideo",
+                        first_frame_focus=dict(t2v_first_probability=args.t2v_first_probability,
+                                               optimizer_step_origin=parent_step, history_noise=0,
+                                               reconstruction_weight=args.reconstruction_weight,
+                                               first_frame_caption_semantics_verified=False,
+                                               integration_smoke=args.integration_smoke))
+        if args.integration_smoke:
+            contract["scope"] = "first_frame_focus_integration_smoke_NOT_quality_training"
+        if ctx.is_main:
+            print(f"Weights-only Stage-2 fork from step={parent_step}; fresh AdamW + local warmup; "
+                  f"target={args.steps}; no LoRA, teacher, EMA or history corruption.", flush=True)
+            if payload["contract"]["smolvlm2_sha256"] != contract["smolvlm2_sha256"]:
+                print("SmolVLM2 packaging SHA differs; accepting only because full loaded frozen weights "
+                      "and processor identity match the parent exactly.", flush=True)
+        del payload
+    elif args.phase == 2:
         payload = torch.load(args.init_connector, map_location="cpu", weights_only=False)
         stage2.initialize_from_alignment(
             payload, connector, dit, expected_step=args.expected_init_step, signatures=initial_signatures,
@@ -417,10 +521,15 @@ def train(args, ctx):
                         scope="fresh_multimodal_stage2; public_data; not_exact_UniVideo_recipe",
                         video_units="T2V/reference:0_to6; anchor:1_to6; teacher_forced_causal_history",
                         text_contract="processor_chat; I2V_text_and_first_image_together; no_truncation")
+        if args.init_stage2:
+            contract.update(scope="first_frame_focus_integration_smoke_NOT_quality_training" if args.integration_smoke
+                                  else "first_frame_focus_continuation_public_data_not_exact_UniVideo",
+                            video_units="T2V:50pct_unit0_rest_uniform_future; reference:uniform0_to6; anchor:uniform1_to6")
     trainable = connector if args.phase == 1 else stage2.JointFlowModel(connector, dit)
     optimizer = torch.optim.AdamW(trainable.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-8,
                                   weight_decay=0, foreach=False)
-    start = 0
+    start = parent_step
+    resume_rng = None
     if args.resume:
         saved = torch.load(args.resume, map_location="cpu", weights_only=False)
         start = validate_resume(saved, contract, connector.spec, extend_steps=args.extend_steps,
@@ -433,6 +542,8 @@ def train(args, ctx):
         if args.phase == 2:
             dit.load_state_dict(saved["dit"], strict=True)
         optimizer.load_state_dict(saved["optimizer"])
+        if args.init_stage2:
+            resume_rng = saved["rng_states"]
         if ctx.is_main:
             atomic_json(args.output_dir / f"resume_from_step{start:06d}.json",
                         dict(checkpoint=str(args.resume.resolve()), checkpoint_step=start,
@@ -454,7 +565,8 @@ def train(args, ctx):
                 gradient_as_bucket_view=True, find_unused_parameters=args.phase == 2) if ctx.is_distributed else trainable
     if epoch_plan:
         dataset = media_epochs.MediaEpochDataset(args.data_root, plan=epoch_plan, rank=ctx.rank,
-                                                start_step=start, short_side=args.short_side, long_side=args.long_side)
+                                                start_step=start - parent_step,
+                                                short_side=args.short_side, long_side=args.long_side)
     else:
         dataset = Stage1Dataset(args.data_root, steps=args.steps, accumulation=args.accumulation, rank=ctx.rank,
                                 world_size=ctx.world_size, seed=args.seed, start_step=start,
@@ -476,17 +588,26 @@ def train(args, ctx):
         if args.reconstruction_weight:
             print(f"Auxiliary reconstruction: L=0.5*mean(T2I)+0.5*mean(video modes)+{args.reconstruction_weight}*mean(image_reconstruction); "
                   "paired T2I image, no caption/clean-latent condition, no extra VAE encoding.", flush=True)
-    metrics = validate(args, ctx, encoder, connector, dit, vae, scheduler, dataset)
+        if args.init_stage2:
+            print("First-frame captions are NOT semantically certified by decode checks. "
+                  "Audit representative processed samples; no automatic caption relabeling/filtering.", flush=True)
+    metrics = validation_metrics(args, ctx, encoder, connector, dit, vae, scheduler, dataset)
     if ctx.is_main:
         atomic_json(args.output_dir / f"validation_step{start:06d}.json", metrics)
+    if resume_rng is not None:
+        # Restore after model/loader/validation setup, before any train-time stochastic layers.
+        restore_rng_states(resume_rng, ctx)
     started = time.monotonic()
     for step in range(start + 1, end + 1):
         trainable.train()
         optimizer.zero_grad(set_to_none=True)
-        lr = args.lr * min(1.0, step / max(1, args.warmup))
+        local_step = step - parent_step
+        lr = args.lr * min(1.0, local_step / max(1, args.warmup))
         for group in optimizer.param_groups:
             group["lr"] = lr
         losses = {task: [] for task in (media_epochs.METRIC_TASKS if epoch_plan else args.tasks)}
+        extra_metrics = ("t2v.first", "t2v.future") if args.init_stage2 else ()
+        losses.update({key: [] for key in extra_metrics})
         weighted_loss = torch.zeros((), device=ctx.device)
         if args.reconstruction_weight:
             losses["image_reconstruction"] = []
@@ -499,7 +620,8 @@ def train(args, ctx):
             # Independent draws avoid coupling image/video source order to a fixed stage.
             stage = int(torch.randint(3, (), device=ctx.device, generator=rng))
             mode = sample.get("mode", sample["task"])
-            unit = media_epochs.sample_unit(mode, latent.shape[2], ctx.device, rng)
+            unit = media_epochs.sample_unit(mode, latent.shape[2], ctx.device, rng,
+                                            t2v_first_probability=args.t2v_first_probability)
             scale = sample.get("loss_scale", 1.0)
             padding = sample.get("padding", False)
             sync = model.no_sync() if ctx.is_distributed and micro + 1 != args.accumulation else nullcontext()
@@ -534,6 +656,8 @@ def train(args, ctx):
                     del rec_layers, rec_mask, rec_loss
             if not padding:
                 losses[mode].append(loss.detach())
+                if extra_metrics and mode == "t2v":
+                    losses["t2v.first" if unit == 0 else "t2v.future"].append(loss.detach())
             observations.append(dict(task=mode, unit=unit, stage=stage, dropped=dropped,
                                      tokens=mask.shape[1], sample_id=sample["sample_id"],
                                      source_duration_seconds=sample.get("source_duration_seconds"),
@@ -553,8 +677,8 @@ def train(args, ctx):
         optimizer.zero_grad(set_to_none=True)
         if runtime_expired(args, ctx, launched):
             end = step
-        if step == start + 1 or step % args.log_every == 0 or step == end:
-            loss_report, counts = media_epochs.distributed_loss_means(losses, ctx) if epoch_plan else (
+        if step == start + 1 or local_step % args.log_every == 0 or step == end:
+            loss_report, counts = media_epochs.distributed_loss_means(losses, ctx, extra_tasks=extra_metrics) if epoch_plan else (
                 {task: scalar_mean(torch.stack(values).mean(), ctx) for task, values in losses.items()}, None)
             report = dict(step=step, lr=lr, grad_norm=scalar_mean(norm, ctx),
                           component_grad_norm={key: scalar_mean(value, ctx) for key, value in component_norms.items()},
@@ -563,9 +687,11 @@ def train(args, ctx):
                           peak_memory_gib=torch.cuda.max_memory_allocated(ctx.device) / 1024**3,
                           memory_by_rank=memory_report(ctx))
             if epoch_plan:
-                report.update(epoch=(step - 1) // epoch_plan.steps_per_epoch + 1,
+                report.update(epoch=epoch_plan.start_epoch + (local_step - 1) // epoch_plan.steps_per_epoch + 1,
                               steps_per_epoch=epoch_plan.steps_per_epoch,
                               valid_samples_in_update=counts, weighted_loss=scalar_mean(weighted_loss, ctx))
+                if args.init_stage2:
+                    report.update(optimizer_step=local_step, parent_step=parent_step)
             elif args.reconstruction_weight:
                 report["loss_weights"] = dict(t2i=0.5, t2v=0.5, image_reconstruction=args.reconstruction_weight)
                 report["weighted_loss"] = sum(report["loss"][task] * weight
@@ -574,16 +700,17 @@ def train(args, ctx):
                 print(json.dumps(report), flush=True)
                 with (args.output_dir / "history.jsonl").open("a") as stream:
                     stream.write(json.dumps(report) + "\n")
-        if step % args.validate_every == 0 or step == end:
-            metrics = validate(args, ctx, encoder, connector, dit, vae, scheduler, dataset)
+        if local_step % args.validate_every == 0 or step == end:
+            metrics = validation_metrics(args, ctx, encoder, connector, dit, vae, scheduler, dataset)
             if ctx.is_main:
                 atomic_json(args.output_dir / f"validation_step{step:06d}.json", metrics)
                 print(f"Validation step={step}: {json.dumps(metrics)}", flush=True)
-        if step % args.save_every == 0 or step % args.archive_every == 0 or step == end:
+        if local_step % args.save_every == 0 or local_step % args.archive_every == 0 or step == end:
             barrier()
+            rng_states = capture_rng_states(ctx) if args.init_stage2 else None
             if ctx.is_main:
                 save(args, step, connector, optimizer, contract, final=step == args.steps,
-                     dit=dit if args.phase == 2 else None)
+                     dit=dit if args.phase == 2 else None, rng_states=rng_states)
             barrier()
         if step == end:
             break
