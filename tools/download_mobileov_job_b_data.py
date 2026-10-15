@@ -194,7 +194,7 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     if not (args.dry_run or args.metadata_only or os.environ.get("SLURM_JOB_ID")):
-        raise RuntimeError("Submit the CPU Slurm job; do not download bulk data on the login node")
+        raise RuntimeError("Submit the Slurm data job; do not download bulk data on the login node")
     report = run(args)
     print(json.dumps({key: value for key, value in report.items() if key != "files"}, indent=2), flush=True)
 

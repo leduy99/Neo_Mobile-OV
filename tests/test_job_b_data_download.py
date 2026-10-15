@@ -274,7 +274,7 @@ def test_invalid_cli_options(argv):
 
 def test_bulk_download_requires_slurm(corpus, monkeypatch):
     monkeypatch.delenv("SLURM_JOB_ID", raising=False)
-    with pytest.raises(RuntimeError, match="CPU Slurm job"):
+    with pytest.raises(RuntimeError, match="Slurm data job"):
         download.main(["--plan", str(corpus.args.plan)])
 
 
