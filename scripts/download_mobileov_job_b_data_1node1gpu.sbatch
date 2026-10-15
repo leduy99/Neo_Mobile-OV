@@ -22,11 +22,17 @@ if [[ -z "${SLURM_JOB_ID:-}" || "${SLURM_JOB_RESERVATION:-}" != safe ]]; then
 fi
 PYTHON="${PYTHON:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov/bin/python}"
 export PYTHON
+export HF_HOME="${HF_HOME:-/proj/cvl/users/x_fahkh2/caches}"
 export PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 TOKENIZERS_PARALLELISM=false
 export DOWNLOAD_WORKERS="${DOWNLOAD_WORKERS:-8}"
 export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-120}"
 export HF_HUB_ETAG_TIMEOUT="${HF_HUB_ETAG_TIMEOUT:-60}"
 test -x "${PYTHON}"
+if ! "${PYTHON}" -s -c 'import pyarrow, av, transformers; print("QA dependencies: pyarrow=" + pyarrow.__version__ + " av=" + av.__version__ + " transformers=" + transformers.__version__)'; then
+    echo "QA preparation needs pyarrow, av and transformers in PYTHON. Fix the data environment before resubmitting." >&2
+    exit 1
+fi
 mkdir -p logs
 STATE="$(mktemp -d "${TMPDIR:-/tmp}/mov-jobb-heartbeat.XXXXXX")"
 READY="${STATE}/ready"
@@ -83,4 +89,19 @@ while kill -0 "${DOWNLOAD_PID}" 2>/dev/null; do
 done
 wait "${DOWNLOAD_PID}"
 DOWNLOAD_PID=""
-echo "Job-B source download finished; training has not been launched."
+echo "Source files verified. Preparing answer-only QA manifests and a media-disjoint validation split."
+"${PYTHON}" -s -u tools/prepare_mobileov_job_b_qa.py \
+    --source-root "${JOB_B_DATA_ROOT:-download_data/data/mobileov_job_b_understanding_sources}" \
+    --output-dir "${QA_ROOT:-download_data/data/mobileov_job_b_understanding}" \
+    --workers "${DOWNLOAD_WORKERS}" &
+DOWNLOAD_PID=$!
+while kill -0 "${DOWNLOAD_PID}" 2>/dev/null; do
+    if ! kill -0 "${HEARTBEAT_PID}" 2>/dev/null; then
+        echo "CUDA heartbeat exited during QA preparation; stopping the data job." >&2
+        exit 1
+    fi
+    sleep 1
+done
+wait "${DOWNLOAD_PID}"
+DOWNLOAD_PID=""
+echo "Job-B QA preparation finished; no model training ran inside this data job."

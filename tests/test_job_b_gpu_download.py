@@ -76,6 +76,8 @@ def launch_environment(tmp_path):
 import json, os, signal, sys, time
 from pathlib import Path
 root = Path(os.environ["PROJECT_ROOT"])
+if "-c" in sys.argv:
+    sys.exit(0)
 if "tools/utils/gpu_status_heartbeat.py" in sys.argv:
     (root / "monitor.pid").write_text(str(os.getpid()))
     if os.environ.get("MONITOR_ACTION") == "fail-start":
