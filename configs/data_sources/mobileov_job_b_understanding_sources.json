@@ -1,0 +1,48 @@
+{
+  "format": "mobileov_job_b_understanding_sources_v1",
+  "purpose": "source_files_for_LoRA_generation_plus_answer_CE; no_KL_requirement; not_training_manifests",
+  "selection_policy": "bounded_train_files_by_task; not_a_random_or_exact_original_SmolVLM2_training_mixture",
+  "sources": {
+    "image_qa": {
+      "repo_id": "HuggingFaceM4/the_cauldron",
+      "revision": "847a98a779b1652d65111daf20c972dfcd333605",
+      "rationale": "Explicit image questions and answers covering objects, OCR, diagrams, counting and relations; captions alone do not cover these tasks.",
+      "license_policy": "Inspect the included card and each underlying dataset license before constructing the training release.",
+      "split_policy": "HF train filenames are not proof of original train provenance; verify source splits and exclude evaluation media during preparation.",
+      "files": [
+        {"filename": "vqav2/train-00000-of-00022-1f40dc68b5c44ca4.parquet", "size": 610986082, "hash_algorithm": "sha256", "hash": "0e703056fa296fcaed0eb6ae26300cacc7ff699437e0e917ad4915cdc8715034", "kind": "train_parquet"},
+        {"filename": "textvqa/train-00000-of-00012-31f9e352dd92b89f.parquet", "size": 495115809, "hash_algorithm": "sha256", "hash": "1e7828f3ae58bf09e21e67d92a28321d67db17e60d8a498b58964ac80e6db5db", "kind": "train_parquet"},
+        {"filename": "ai2d/train-00000-of-00001-2ce340398c113b79.parquet", "size": 438136609, "hash_algorithm": "sha256", "hash": "a1e05b99801ec73374dff401b7c91645465da955fc85ac62b2b5aaf6c9a18ab5", "kind": "train_parquet"},
+        {"filename": "chartqa/train-00000-of-00002-7733d4ca73ccd12e.parquet", "size": 395345697, "hash_algorithm": "sha256", "hash": "7d96bf7b4b083f7228446c2c7eb1826f594872d715a33fe269fce1b2fbacf6c9", "kind": "train_parquet"},
+        {"filename": "clevr/train-00000-of-00024-d244df5ec45319a1.parquet", "size": 552659811, "hash_algorithm": "sha256", "hash": "919f65d5eac2cd11e462fc13acd9ef9b13171706adbfa7e18fff4be345590c49", "kind": "train_parquet"},
+        {"filename": "tallyqa/train-00000-of-00009-e0b7d3ce56af002d.parquet", "size": 419736178, "hash_algorithm": "sha256", "hash": "db29da923deb73537cb9185979307c80b9690d4f299297b91d05b06608b90150", "kind": "train_parquet"},
+        {"filename": "vsr/train-00000-of-00001-b56e9224d46b0ed3.parquet", "size": 107576214, "hash_algorithm": "sha256", "hash": "30e15569bc4d845205e7f92d1fb58b83262a52242c63a7f83d09de769260ad02", "kind": "train_parquet"},
+        {"filename": "README.md", "size": 50328, "hash_algorithm": "git_blob_sha1", "hash": "03191188bcfb950985d1271b768c437135a0297c", "kind": "dataset_card"}
+      ]
+    },
+    "text_instruction": {
+      "repo_id": "HuggingFaceTB/smol-smoltalk",
+      "revision": "f73fe857d519ff6ac5af2ea67c4d3834da7b8bcc",
+      "rationale": "The smaller-model SmolTalk subset used for SmolLM2-360M-Instruct, the language-backbone family of SmolVLM2-500M; shorter conversations and no advanced math corpus.",
+      "license_policy": "Inspect the included card and inherited source licenses; do not infer annotation correctness from the license.",
+      "split_policy": "Download one original train file only; keep supported conversation roles and construct independent held-out evaluation during preparation.",
+      "files": [
+        {"filename": "data/train-00000-of-00004.parquet", "size": 229710350, "hash_algorithm": "sha256", "hash": "498cd4580014f42c40cfde066573564ed28e3e1548a5566715b615f5ea932856", "kind": "train_parquet"},
+        {"filename": "README.md", "size": 2239, "hash_algorithm": "git_blob_sha1", "hash": "42b88b83e018ec7fd021b148d2eeaaa7c3c00931", "kind": "dataset_card"}
+      ]
+    },
+    "video_qa": {
+      "repo_id": "lmms-lab/LLaVA-Video-178K",
+      "revision": "6d8c562dc26d70042a0d9704d1cae58c94b89098",
+      "rationale": "Video QA supplies temporal-understanding supervision rather than video-generation captions. LLaVA-Video-178K is explicitly listed in SmolVLM2's training data.",
+      "license_policy": "Academic use and underlying media/source conditions must be reviewed; answers are source-provided synthetic annotations, not verified human gold.",
+      "split_policy": "Join MC/OE annotations ONLY to selected archive media; verify original train provenance and exclude evaluation overlaps. Do not count all annotation rows as retained samples.",
+      "files": [
+        {"filename": "0_30_s_academic_v0_1/0_30_s_academic_mc_v0_1_qa_processed.json", "size": 8578958, "hash_algorithm": "sha256", "hash": "041d0a81c82326b9bc410681bada9d8a5488f5f26418e5436d2a7c5c1aeb39c0", "kind": "qa_annotation"},
+        {"filename": "0_30_s_academic_v0_1/0_30_s_academic_oe_v0_1_qa_processed.json", "size": 52196411, "hash_algorithm": "sha256", "hash": "c555be1b90533edaabc116be4c2ec8de6c3fdd5cd1581a36dc93e16ca36c88bc", "kind": "qa_annotation"},
+        {"filename": "0_30_s_academic_v0_1/0_30_s_academic_v0_1_videos_1.tar.gz", "size": 5333957094, "hash_algorithm": "sha256", "hash": "f39ac05aa32ecf47349d97ce0e921e6236abddde93f301633d300e51dc3c7761", "kind": "media_archive"},
+        {"filename": "README.md", "size": 7165, "hash_algorithm": "git_blob_sha1", "hash": "e037df6512ba9c415a05bc3dfc4b50aac25667db", "kind": "dataset_card"}
+      ]
+    }
+  }
+}
