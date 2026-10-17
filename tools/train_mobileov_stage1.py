@@ -47,6 +47,9 @@ from tools.train_neodragon_dit_bridge import load_neodragon_train_modules, scale
 from new_mobile_ov.training import stage2_alignment as stage2
 from new_mobile_ov.training.stage1_vae import encode_posterior
 from new_mobile_ov.training import stage2_media_epochs as media_epochs
+from new_mobile_ov.training.stage2_history import (
+    HISTORY_SEED_OFFSET, MAX_HISTORY_SIGMA, history_contract, summarize_history,
+)
 
 FORMAT = "mobileov_stage1_mcp_v1"
 
@@ -69,6 +72,8 @@ def parse_args(argv=None):
     parser.add_argument("--media-start-epoch", type=int, default=0, help="Zero-based absolute media epoch; 3 only for --init-stage2")
     parser.add_argument("--t2v-first-probability", type=float,
                         help="Opt-in T2V unit-zero preference; reference/anchor sampling is unchanged")
+    parser.add_argument("--history-corrupt-max", type=float, default=0.,
+                        help="Opt-in uniform-unit epoch-4 fork: corrupt past stage-resolution latents, maximum <=1/3")
     parser.add_argument("--integration-smoke", action="store_true",
                         help="Allow tiny local data/world size for a <=10-update Stage-2 fork correctness smoke only")
     parser.add_argument("--min-train-videos", type=int, default=1)
@@ -106,13 +111,18 @@ def parse_args(argv=None):
     parser.add_argument("--cuda-memory-limit-gib", type=float, default=0,
                         help="Local memory regression test: cap the PyTorch allocator; 0 leaves it unrestricted")
     args = parser.parse_args(argv)
+    if not math.isfinite(args.history_corrupt_max) or not 0 <= args.history_corrupt_max <= MAX_HISTORY_SIGMA:
+        parser.error("History corruption maximum must be finite and within [0, 1/3]")
     if args.init_stage2:
+        policy_ok = (args.t2v_first_probability is None and args.reconstruction_weight == .1
+                     if args.history_corrupt_max else
+                     args.t2v_first_probability == .5 and args.reconstruction_weight == .2)
         if (args.phase != 2 or args.init_connector is not None or args.media_epochs != 1
-                or args.media_start_epoch != 3 or args.t2v_first_probability != .5
-                or args.reconstruction_weight != .2 or args.expected_stage2_step < 1):
-            parser.error("Stage-2 fork requires Phase 2, one pass at epoch offset 3, T2V probability .5, reconstruction .2, and no Stage-1 init")
+                or args.media_start_epoch != 3 or not policy_ok or args.expected_stage2_step < 1):
+            parser.error("Stage-2 fork requires Phase 2, one pass at epoch offset 3 and no Stage-1 init; "
+                         "choose legacy first-unit .5/reconstruction .2, or positive history corruption/uniform units/reconstruction .1")
     elif (args.media_start_epoch or args.t2v_first_probability is not None or args.media_epochs == 1
-          or args.expected_stage2_sha256 or args.integration_smoke):
+          or args.expected_stage2_sha256 or args.integration_smoke or args.history_corrupt_max):
         parser.error("First-frame fork options require --init-stage2; legacy recipes are unchanged")
     if args.expected_stage2_sha256 and not re.fullmatch(r"[0-9a-f]{64}", args.expected_stage2_sha256):
         parser.error("Parent digest must be a lowercase SHA256")
@@ -297,7 +307,7 @@ def validate_resume(saved, contract, connector_spec, *, extend_steps=False, expe
     optimizer = saved.get("optimizer")
     if not isinstance(optimizer, dict) or not optimizer.get("param_groups") or (step and not optimizer.get("state")):
         raise ValueError("Resume requires optimizer state. Use stage2_resume.pt (or stage1_resume.pt), not an inference checkpoint")
-    if "first_frame_focus" in contract and (not isinstance(saved.get("rng_states"), list)
+    if ("first_frame_focus" in contract or "history_corruption" in contract) and (not isinstance(saved.get("rng_states"), list)
                                             or len(saved["rng_states"]) != contract["world_size"]):
         raise ValueError("First-frame fork resume requires exact per-rank RNG states")
     return step
@@ -492,9 +502,15 @@ def train(args, ctx):
                                                integration_smoke=args.integration_smoke))
         if args.integration_smoke:
             contract["scope"] = "first_frame_focus_integration_smoke_NOT_quality_training"
+        if args.history_corrupt_max:
+            contract.pop("first_frame_focus")
+            contract.update(scope="uniform_history_continuation_public_data_not_exact_UniVideo",
+                            history_corruption=history_contract(args.history_corrupt_max))
+            if args.integration_smoke:
+                contract["scope"] = "uniform_history_integration_smoke_NOT_quality_training"
         if ctx.is_main:
             print(f"Weights-only Stage-2 fork from step={parent_step}; fresh AdamW + local warmup; "
-                  f"target={args.steps}; no LoRA, teacher, EMA or history corruption.", flush=True)
+                  f"target={args.steps}; no LoRA, teacher or EMA; history_corrupt_max={args.history_corrupt_max}.", flush=True)
             if payload["contract"]["smolvlm2_sha256"] != contract["smolvlm2_sha256"]:
                 print("SmolVLM2 packaging SHA differs; accepting only because full loaded frozen weights "
                       "and processor identity match the parent exactly.", flush=True)
@@ -525,7 +541,11 @@ def train(args, ctx):
             contract.update(scope="first_frame_focus_integration_smoke_NOT_quality_training" if args.integration_smoke
                                   else "first_frame_focus_continuation_public_data_not_exact_UniVideo",
                             video_units="T2V:50pct_unit0_rest_uniform_future; reference:uniform0_to6; anchor:uniform1_to6")
-    trainable = connector if args.phase == 1 else stage2.JointFlowModel(connector, dit)
+            if args.history_corrupt_max:
+                contract.update(scope="uniform_history_integration_smoke_NOT_quality_training" if args.integration_smoke
+                                else "uniform_history_continuation_public_data_not_exact_UniVideo",
+                                video_units="T2V/reference:uniform0_to6; anchor:uniform1_to6; teacher_forced_corrupted_history")
+    trainable = connector if args.phase == 1 else stage2.JointFlowModel(connector, dit, history_corrupt_max=args.history_corrupt_max)
     optimizer = torch.optim.AdamW(trainable.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-8,
                                   weight_decay=0, foreach=False)
     start = parent_step
@@ -598,6 +618,14 @@ def train(args, ctx):
         # Restore after model/loader/validation setup, before any train-time stochastic layers.
         restore_rng_states(resume_rng, ctx)
     started = time.monotonic()
+    history_audit = args.output_dir / "history_corruption_audit.json"
+    history_audited = history_audit.is_file()
+    if args.history_corrupt_max and history_audited:
+        previous_audit = json.loads(history_audit.read_text())
+        if (previous_audit.get("contract") != contract["history_corruption"]
+                or not previous_audit.get("actual", {}).get("changed_rms", 0)
+                or not parent_step < previous_audit.get("step", 0) <= start):
+            raise ValueError("History corruption audit differs from this run/resume position")
     for step in range(start + 1, end + 1):
         trainable.train()
         optimizer.zero_grad(set_to_none=True)
@@ -612,6 +640,7 @@ def train(args, ctx):
         if args.reconstruction_weight:
             losses["image_reconstruction"] = []
         observations = []
+        history_records = []
         for micro in range(args.accumulation):
             sample = next(batches)
             rng = generator_for(ctx.device, args.seed, sample["micro"], ctx.rank)
@@ -630,7 +659,19 @@ def train(args, ctx):
                     loss = flow_loss(dit, model, layers, mask, latent, scheduler, stage=stage, unit=unit,
                                      generator=rng, gradient_checkpointing=args.gradient_checkpointing)
                 else:
-                    loss = model(layers, mask, latent, scheduler, stage=stage, unit=unit, generator=rng)
+                    history_args = {}
+                    if args.history_corrupt_max:
+                        history_args = dict(history_generator=generator_for(ctx.device, args.seed + HISTORY_SEED_OFFSET,
+                                                                           sample["micro"], ctx.rank),
+                                            preserve_first_anchor=mode == "i2v_anchor")
+                    loss = model(layers, mask, latent, scheduler, stage=stage, unit=unit, generator=rng, **history_args)
+                    if args.history_corrupt_max:
+                        # Read from the owner: DDP may copy mutable dictionaries passed as forward kwargs.
+                        actual_history = trainable.last_history_stats
+                        history_records.append(actual_history)
+                        expected_units = (unit - int(mode == "i2v_anchor" and unit > 0)) * latent.shape[0]
+                        if actual_history.get("eligible_units") != expected_units:
+                            raise RuntimeError("History corruption is not connected to the actual sampled-unit forward")
                 if not bool(torch.isfinite(loss)):
                     raise RuntimeError(f"Non-finite loss at step={step} task={sample['task']} id={sample['sample_id']}")
                 (loss * scale / args.accumulation).backward()
@@ -675,6 +716,12 @@ def train(args, ctx):
             raise RuntimeError("Frozen backbone received gradients")
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        history_report = summarize_history(history_records, ctx, args.history_corrupt_max) if args.history_corrupt_max else None
+        if history_report and not history_audited and history_report["changed_rms"] and history_report["changed_rms"] > 0:
+            if ctx.is_main:
+                atomic_json(history_audit, dict(step=step, contract=contract["history_corruption"], actual=history_report))
+                print(f"Verified actual history corruption at step={step}: {json.dumps(history_report)}", flush=True)
+            history_audited = True
         if runtime_expired(args, ctx, launched):
             end = step
         if step == start + 1 or local_step % args.log_every == 0 or step == end:
@@ -692,6 +739,8 @@ def train(args, ctx):
                               valid_samples_in_update=counts, weighted_loss=scalar_mean(weighted_loss, ctx))
                 if args.init_stage2:
                     report.update(optimizer_step=local_step, parent_step=parent_step)
+                if history_report:
+                    report["history_corruption"] = history_report
             elif args.reconstruction_weight:
                 report["loss_weights"] = dict(t2i=0.5, t2v=0.5, image_reconstruction=args.reconstruction_weight)
                 report["weighted_loss"] = sum(report["loss"][task] * weight
@@ -730,6 +779,8 @@ def train(args, ctx):
             atomic_json(args.output_dir / "frozen_weight_audit.json",
                         dict(before=before, after=after, passed=True,
                              trainable_before=trainable_before, trainable_after=trainable_after))
+    if end == args.steps and args.history_corrupt_max and not history_audited:
+        raise RuntimeError("Refusing to complete: no runtime evidence that historical inputs were actually corrupted")
     if ctx.is_main:
         complete = end == args.steps
         atomic_json(args.output_dir / ("training_complete.json" if complete else "training_paused.json"),

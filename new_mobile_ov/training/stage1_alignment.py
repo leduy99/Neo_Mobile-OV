@@ -15,6 +15,7 @@ from torch.utils.checkpoint import checkpoint
 
 from new_mobile_ov.training.stage1_alignment_data import load_sources, read_alignment_sample
 from new_mobile_ov.training.neodragon_pyramid_flow import build_pyramid_flow_state
+from new_mobile_ov.training.stage2_history import corrupt_stage_history
 from tools.data_prepare.download_alignment_images import sha256_file
 
 TASKS = ("t2i", "t2v", "image_reconstruction")
@@ -121,13 +122,16 @@ class Stage1Dataset(Dataset):
 
 
 def flow_loss(dit, connector, layers, mask, latents, scheduler, *, stage, unit,
-              generator, gradient_checkpointing=True):
+              generator, gradient_checkpointing=True, history_corrupt_max=0.0,
+              preserve_first_anchor=False, history_generator=None, history_stats=None):
     from neodragon.utils.generation_utils import _prepare_past_condition_latents
     if not 0 <= unit < latents.shape[2]:
         raise ValueError("Invalid latent unit; first unit is 0, not 1")
     clean = latents[:, :, unit:unit + 1].float()
-    history = _prepare_past_condition_latents(
-        [latents[:, :, i:i + 1] for i in range(unit)], scheduler.config.stages, False)[stage]
+    past = [latents[:, :, i:i + 1] for i in range(unit)]
+    history = _prepare_past_condition_latents(past, scheduler.config.stages, False)[stage]
+    history = corrupt_stage_history(history, maximum=history_corrupt_max, generator=history_generator,
+                                    preserve_first_anchor=preserve_first_anchor, stats=history_stats)
     indices = torch.randint(scheduler.config.num_train_timesteps, (latents.shape[0],),
                             device=latents.device, generator=generator)
     sigma = scheduler.sigmas_per_stage[stage].to(latents.device, torch.float32)[indices]

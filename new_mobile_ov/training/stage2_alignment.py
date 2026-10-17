@@ -96,14 +96,23 @@ def initialize_from_stage2(payload, connector, dit, *, contract, args):
 
 class JointFlowModel(nn.Module):
     """One DDP graph owns both trainable components, including the flow objective."""
-    def __init__(self, connector, dit):
+    def __init__(self, connector, dit, *, history_corrupt_max=0.):
         super().__init__()
         self.connector, self.dit = connector, dit
+        self.history_corrupt_max = history_corrupt_max
+        self.last_history_stats = None
 
-    def forward(self, layers, mask, latent, scheduler, *, stage, unit, generator):
+    def forward(self, layers, mask, latent, scheduler, *, stage, unit, generator,
+                history_generator=None, preserve_first_anchor=False, history_stats=None):
         # DiT checkpoints each transformer block; do not also recompute the whole DiT.
-        return flow_loss(self.dit, self.connector, layers, mask, latent, scheduler,
-                         stage=stage, unit=unit, generator=generator, gradient_checkpointing=False)
+        self.last_history_stats = {} if self.history_corrupt_max else None
+        extra = dict(history_corrupt_max=self.history_corrupt_max, history_generator=history_generator,
+                     preserve_first_anchor=preserve_first_anchor, history_stats=self.last_history_stats) if self.history_corrupt_max else {}
+        loss = flow_loss(self.dit, self.connector, layers, mask, latent, scheduler,
+                         stage=stage, unit=unit, generator=generator, gradient_checkpointing=False, **extra)
+        if history_stats is not None and self.last_history_stats is not None:
+            history_stats.update(self.last_history_stats)
+        return loss
 
 
 def gradient_norm(module):
