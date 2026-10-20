@@ -28,6 +28,6 @@ COMMON=(--phase 2 --init-stage2 "${PARENT}" --expected-stage2-step 283977
         --integration-smoke --workers 1 --lr 2e-5 --warmup 50 --log-every 1
         --validation-samples 1 --validate-every 5000 --save-every 10000 --archive-every 10000 --verify-frozen)
 "${PYTHON}" -s tools/train_mobileov_stage1.py "${COMMON[@]}" --stop-after 283980
-"${PYTHON}" -s tools/train_mobileov_stage1.py "${COMMON[@]}" --stop-after 283983 --resume "${OUT}/train/stage2_resume.pt"
+"${PYTHON}" -s tools/train_mobileov_stage1.py "${COMMON[@]}" --stop-after 283982 --resume "${OUT}/train/stage2_resume.pt"
 test -s "${OUT}/train/history_corruption_audit.json"
 echo "Actual SmolVLM2 + NeoDragon history corruption/save/resume smoke passed; NOT a quality-training run: ${OUT}"
