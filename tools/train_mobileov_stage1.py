@@ -47,6 +47,7 @@ from tools.train_neodragon_dit_bridge import load_neodragon_train_modules, scale
 from new_mobile_ov.training import stage2_alignment as stage2
 from new_mobile_ov.training.stage1_vae import encode_posterior
 from new_mobile_ov.training import stage2_media_epochs as media_epochs
+from new_mobile_ov.training import stage2_epoch_extension as epoch_extension
 from new_mobile_ov.training.stage2_history import (
     HISTORY_SEED_OFFSET, MAX_HISTORY_SIGMA, history_contract, summarize_history,
 )
@@ -67,8 +68,16 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--processor", default="HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
     parser.add_argument("--steps", type=int, help="Total optimizer updates, not microbatches")
-    parser.add_argument("--media-epochs", type=int, choices=(1, 3),
+    parser.add_argument("--media-epochs", type=int, choices=(1, 3, 4, 5),
                         help="Fresh Stage 2: each image/video three times; rotate T2V/reference/anchor modes")
+    parser.add_argument("--extend-media-epochs", action="store_true",
+                        help="Resume original Stage-2 Adam state to four/five total media epochs; no recipe/warmup reset")
+    parser.add_argument("--repartition-media-batch", action="store_true",
+                        help="Explicit optimizer resume on twice as many GPUs with half the accumulation; batch/RNG unchanged")
+    parser.add_argument("--media-rng-world-size", type=int,
+                        help="Keep original per-example RNG rank/micro mapping when using a different DDP layout")
+    parser.add_argument("--fresh-media-history", action="store_true",
+                        help="Fresh Stage 2 from alignment + released DiT, with uniform sampling and history corruption")
     parser.add_argument("--media-start-epoch", type=int, default=0, help="Zero-based absolute media epoch; 3 only for --init-stage2")
     parser.add_argument("--t2v-first-probability", type=float,
                         help="Opt-in T2V unit-zero preference; reference/anchor sampling is unchanged")
@@ -122,8 +131,17 @@ def parse_args(argv=None):
             parser.error("Stage-2 fork requires Phase 2, one pass at epoch offset 3 and no Stage-1 init; "
                          "choose legacy first-unit .5/reconstruction .2, or positive history corruption/uniform units/reconstruction .1")
     elif (args.media_start_epoch or args.t2v_first_probability is not None or args.media_epochs == 1
-          or args.expected_stage2_sha256 or args.integration_smoke or args.history_corrupt_max):
+          or args.expected_stage2_sha256 or args.integration_smoke
+          or (args.history_corrupt_max and not args.fresh_media_history)):
         parser.error("First-frame fork options require --init-stage2; legacy recipes are unchanged")
+    if args.fresh_media_history and (args.phase != 2 or args.init_connector is None or args.init_stage2 is not None
+            or args.extend_media_epochs or args.media_epochs not in (3, 5) or args.history_corrupt_max <= 0
+            or args.reconstruction_weight != .1 or args.t2v_first_probability is not None):
+        parser.error("Fresh history recipe requires alignment initialization, 3/5 media epochs, uniform units, reconstruction .1 and positive history noise")
+    if args.repartition_media_batch and (not args.extend_media_epochs or args.media_rng_world_size is None):
+        parser.error("DDP repartition requires explicit epoch extension and original --media-rng-world-size")
+    if args.media_rng_world_size is not None and (not args.media_epochs or args.media_rng_world_size < 1):
+        parser.error("Sample RNG layout requires media epochs and a positive original world size")
     if args.expected_stage2_sha256 and not re.fullmatch(r"[0-9a-f]{64}", args.expected_stage2_sha256):
         parser.error("Parent digest must be a lowercase SHA256")
     if args.integration_smoke and (args.stop_after is None or
@@ -138,6 +156,14 @@ def parse_args(argv=None):
         parser.error("Expanded-data guards require --media-epochs")
     if args.min_train_videos < 1:
         parser.error("Minimum training video count must be positive")
+    if args.extend_media_epochs:
+        if (args.phase != 2 or args.resume is None or args.media_epochs not in (4, 5)
+                or args.init_connector is not None or args.init_stage2 is not None
+                or args.media_start_epoch or args.t2v_first_probability is not None
+                or args.history_corrupt_max or args.integration_smoke or args.reconstruction_weight != .1):
+            parser.error("Epoch extension requires --resume, four/five total epochs and unchanged reconstruction .1; no weights-only fork")
+    elif args.media_epochs in (4, 5) and not args.fresh_media_history:
+        parser.error("Four/five media epochs require --extend-media-epochs and original optimizer state")
     args.tasks = TASKS if args.phase == 1 else stage2.TASKS
     if args.steps is None:
         args.steps = 15000 if args.phase == 1 else 100000
@@ -155,7 +181,7 @@ def parse_args(argv=None):
         parser.error("VAE window must be a positive multiple of 8")
     if not math.isfinite(args.cuda_memory_limit_gib) or args.cuda_memory_limit_gib < 0:
         parser.error("Invalid CUDA memory limit")
-    if (args.phase == 2) != (args.init_connector is not None or args.init_stage2 is not None):
+    if (args.phase == 2) != (args.init_connector is not None or args.init_stage2 is not None or args.extend_media_epochs):
         parser.error("Phase 2 requires --init-connector or --init-stage2; Phase 1 starts randomly or resumes its own run")
     if args.max_runtime_seconds < 0 or args.expected_init_step < 1:
         parser.error("Invalid runtime limit or initialization step")
@@ -276,13 +302,18 @@ def atomic_torch_save(payload, path):
 
 
 def validate_resume(saved, contract, connector_spec, *, extend_steps=False, expected_step=None,
-                    enable_reconstruction=False):
+                    enable_reconstruction=False, extend_media_epochs=False, repartition=False):
     if saved.get("format") != contract["format"]:
         raise ValueError("Resume checkpoint format mismatch")
     previous = saved.get("contract", {})
     changed = sorted(key for key in set(previous) | set(contract)
                      if previous.get(key) != contract.get(key))
     allowed = set()
+    if extend_media_epochs:
+        epoch_extension.validate_extension(previous, contract, saved.get("step"), repartition=repartition)
+        allowed.update(("steps", "media_epochs"))
+        if repartition:
+            allowed.update(("world_size", "accumulation"))
     if (extend_steps and isinstance(previous.get("steps"), int)
             and contract["steps"] > previous["steps"]):
         allowed.add("steps")
@@ -313,7 +344,7 @@ def validate_resume(saved, contract, connector_spec, *, extend_steps=False, expe
     return step
 
 
-def save(args, step, connector, optimizer, contract, *, final=False, dit=None, rng_states=None):
+def save(args, step, connector, optimizer, contract, *, final=False, dit=None, rng_states=None, force_archive=False):
     payload = dict(format=contract["format"], step=step, connector_spec=connector.spec,
                    connector={key: value.detach().cpu() for key, value in connector.state_dict().items()},
                    contract=contract)
@@ -321,7 +352,7 @@ def save(args, step, connector, optimizer, contract, *, final=False, dit=None, r
     if dit is not None:
         payload["dit"] = {key: value.detach().cpu() for key, value in dit.state_dict().items()}
     latest = args.output_dir / f"{prefix}_latest.pt"
-    archive = (step - getattr(args, "checkpoint_origin", 0)) % args.archive_every == 0 or final
+    archive = (step - getattr(args, "checkpoint_origin", 0)) % args.archive_every == 0 or final or force_archive
     destination = args.output_dir / f"{prefix}_step{step:06d}.pt" if archive else latest
     atomic_torch_save(payload, destination)
     if archive:
@@ -368,7 +399,7 @@ def restore_rng_states(states, ctx):
 
 
 def validation_metrics(args, ctx, *stack):
-    states = capture_rng_states(ctx) if args.init_stage2 else None
+    states = capture_rng_states(ctx) if args.init_stage2 or args.extend_media_epochs or args.fresh_media_history else None
     try:
         return validate(args, ctx, *stack)
     finally:
@@ -431,22 +462,28 @@ def train(args, ctx):
         verify_release(args.data_root)
         if (args.output_dir / "run_contract.json").exists() and args.resume is None:
             raise ValueError("Output already contains a run; specify --resume or a new output directory")
+        if (args.extend_media_epochs and (args.output_dir / "run_contract.json").exists()
+                and args.resume.resolve() != (args.output_dir / "stage2_resume.pt").resolve()):
+            raise ValueError("Existing extension output must resume its OWN optimizer checkpoint; never rewind it")
     barrier()
     epoch_plan = None
+    extension_saved = None
     parent_step = args.expected_stage2_step if args.init_stage2 else 0
     args.checkpoint_origin = parent_step
     if args.media_epochs:
         epoch_plan = media_epochs.plan_from_release(
             args.data_root, world_size=ctx.world_size, accumulation=args.accumulation,
             epochs=args.media_epochs, seed=args.seed, min_videos=args.min_train_videos,
-            require_expansion=args.require_expanded_release, verify=False, start_epoch=args.media_start_epoch)
+            require_expansion=args.require_expanded_release, verify=False, start_epoch=args.media_start_epoch,
+            allow_partial_cycle=args.extend_media_epochs or args.fresh_media_history,
+            rng_world_size=args.media_rng_world_size)
         args.steps = parent_step + epoch_plan.steps
         if args.stop_after is not None and args.stop_after > args.steps:
             raise ValueError("Stop-after exceeds calculated epoch budget")
         if ctx.is_main:
             print(f"Exact media epoch plan: {json.dumps(epoch_plan.contract())}", flush=True)
     torch.manual_seed(args.seed)
-    if args.init_stage2:
+    if args.init_stage2 or args.extend_media_epochs or args.fresh_media_history:
         random.seed(args.seed)
         np.random.seed(args.seed)
     cfg, encoder, connector, dit, vae, scheduler = load_stack(args, ctx.device)
@@ -515,6 +552,15 @@ def train(args, ctx):
                 print("SmolVLM2 packaging SHA differs; accepting only because full loaded frozen weights "
                       "and processor identity match the parent exactly.", flush=True)
         del payload
+    elif args.extend_media_epochs:
+        extension_saved = torch.load(args.resume, map_location="cpu", weights_only=True, mmap=True)
+        if (extension_saved.get("contract", {}).get("media_epochs", {}).get("epochs") == 3
+                and args.output_dir.resolve() == args.resume.resolve().parent):
+            raise ValueError("Preserve the original three-epoch output; use a new extension directory")
+        contract = epoch_extension.contract_from_resume(extension_saved, contract, epoch_plan, initial_signatures,
+                                                       repartition=args.repartition_media_batch)
+        load_args = argparse.Namespace(**dict(vars(args), expected_stage2_step=extension_saved["step"]))
+        stage2.initialize_from_stage2(extension_saved, connector, dit, contract=contract, args=load_args)
     elif args.phase == 2:
         payload = torch.load(args.init_connector, map_location="cpu", weights_only=False)
         stage2.initialize_from_alignment(
@@ -545,16 +591,21 @@ def train(args, ctx):
                 contract.update(scope="uniform_history_integration_smoke_NOT_quality_training" if args.integration_smoke
                                 else "uniform_history_continuation_public_data_not_exact_UniVideo",
                                 video_units="T2V/reference:uniform0_to6; anchor:uniform1_to6; teacher_forced_corrupted_history")
+        if args.fresh_media_history:
+            contract.update(scope="fresh_multimodal_stage2_with_history_corruption; public_data; not_exact_UniVideo_recipe",
+                            history_corruption=history_contract(args.history_corrupt_max),
+                            video_units="T2V/reference:uniform0_to6; anchor:uniform1_to6; teacher_forced_corrupted_history")
     trainable = connector if args.phase == 1 else stage2.JointFlowModel(connector, dit, history_corrupt_max=args.history_corrupt_max)
     optimizer = torch.optim.AdamW(trainable.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-8,
                                   weight_decay=0, foreach=False)
     start = parent_step
     resume_rng = None
     if args.resume:
-        saved = torch.load(args.resume, map_location="cpu", weights_only=False)
+        saved = extension_saved if extension_saved is not None else torch.load(args.resume, map_location="cpu", weights_only=False)
         start = validate_resume(saved, contract, connector.spec, extend_steps=args.extend_steps,
                                 expected_step=args.expected_resume_step,
-                                enable_reconstruction=args.enable_reconstruction_on_resume)
+                                enable_reconstruction=args.enable_reconstruction_on_resume,
+                                extend_media_epochs=args.extend_media_epochs, repartition=args.repartition_media_batch)
         if "auxiliary_reconstruction" in contract and "auxiliary_reconstruction" not in saved["contract"]:
             if args.output_dir.resolve() == args.resume.resolve().parent or (args.output_dir / "run_contract.json").exists():
                 raise ValueError("Enabling reconstruction requires a new output directory; preserve the text-only baseline")
@@ -562,7 +613,23 @@ def train(args, ctx):
         if args.phase == 2:
             dit.load_state_dict(saved["dit"], strict=True)
         optimizer.load_state_dict(saved["optimizer"])
-        if args.init_stage2:
+        extension_audit = None
+        if args.extend_media_epochs:
+            extension_audit = epoch_extension.optimizer_audit(saved["optimizer"], start, args.lr,
+                                                             trainable.parameters())
+            resume_rng = saved.get("rng_states")
+            repartitioned = saved["contract"]["world_size"] != ctx.world_size
+            if repartitioned:
+                resume_rng = None
+            extension_audit.update(global_rng_restored=resume_rng is not None,
+                                   legacy_global_rng_unavailable=saved.get("rng_states") is None,
+                                   ddp_repartitioned=repartitioned,
+                                   source_world_size=saved["contract"]["world_size"], world_size=ctx.world_size,
+                                   sampler_next_micro=start * args.accumulation,
+                                   stateless_media_and_noise_position_preserved=True)
+            if saved["contract"]["media_epochs"]["epochs"] != 3 and resume_rng is None:
+                raise ValueError("Extension checkpoint is missing its per-rank RNG states")
+        if args.init_stage2 or args.fresh_media_history:
             resume_rng = saved["rng_states"]
         if ctx.is_main:
             atomic_json(args.output_dir / f"resume_from_step{start:06d}.json",
@@ -570,10 +637,16 @@ def train(args, ctx):
                              previous_target_steps=saved["contract"]["steps"], target_steps=args.steps,
                              optimizer_restored=True, previous_contract=saved["contract"],
                              changed_contract_fields=sorted(key for key in set(saved["contract"]) | set(contract)
-                                                           if saved["contract"].get(key) != contract.get(key))))
+                                                           if saved["contract"].get(key) != contract.get(key)),
+                             **({"epoch_extension": extension_audit} if extension_audit is not None else {})))
             print(f"Resumed optimizer + trained weights at step={start}; target={args.steps}; "
                   "sample sequence and warmup continue from the absolute step.", flush=True)
+            if extension_audit is not None and resume_rng is None:
+                print("Per-rank global RNG is unavailable or DDP was repartitioned. Adam/LR and deterministic media/noise position "
+                      "are preserved; do not claim bitwise continuation of stochastic layers. "
+                      "New extension checkpoints will save per-rank RNG.", flush=True)
         del saved
+        extension_saved = None
     end = args.stop_after if args.stop_after is not None else args.steps
     if end <= start:
         raise ValueError("Stop-after must be later than the resumed step")
@@ -643,7 +716,8 @@ def train(args, ctx):
         history_records = []
         for micro in range(args.accumulation):
             sample = next(batches)
-            rng = generator_for(ctx.device, args.seed, sample["micro"], ctx.rank)
+            rng_rank = sample.get("rng_rank", ctx.rank)
+            rng = generator_for(ctx.device, args.seed, sample["micro"], rng_rank)
             layers, mask, latent, dropped = encode_sample(encoder, vae, sample, ctx.device, rng, args.condition_dropout,
                                                          window_size=args.vae_window_size)
             # Independent draws avoid coupling image/video source order to a fixed stage.
@@ -662,7 +736,7 @@ def train(args, ctx):
                     history_args = {}
                     if args.history_corrupt_max:
                         history_args = dict(history_generator=generator_for(ctx.device, args.seed + HISTORY_SEED_OFFSET,
-                                                                           sample["micro"], ctx.rank),
+                                                                           sample["micro"], rng_rank),
                                             preserve_first_anchor=mode == "i2v_anchor")
                     loss = model(layers, mask, latent, scheduler, stage=stage, unit=unit, generator=rng, **history_args)
                     if args.history_corrupt_max:
@@ -679,7 +753,7 @@ def train(args, ctx):
                 if args.reconstruction_weight and sample["task"] == "t2i":
                     # Separate RNG and backward pass preserve text sampling and bound activation memory.
                     rec_rng = generator_for(ctx.device, args.seed + stage2.RECONSTRUCTION_SEED_OFFSET,
-                                            sample["micro"], ctx.rank)
+                                            sample["micro"], rng_rank)
                     rec_layers, rec_mask = stage2.reconstruction_condition(encoder, sample)
                     rec_stage = int(torch.randint(3, (), device=ctx.device, generator=rec_rng))
                     rec_loss = model(rec_layers, rec_mask, latent, scheduler, stage=rec_stage, unit=0, generator=rec_rng)
@@ -715,6 +789,9 @@ def train(args, ctx):
         if any(p.grad is not None for module in frozen.values() for p in module.parameters()):
             raise RuntimeError("Frozen backbone received gradients")
         optimizer.step()
+        if args.extend_media_epochs and step == start + 1 and ctx.is_main:
+            atomic_json(args.output_dir / f"first_update_optimizer_audit_step{step:06d}.json",
+                        dict(step=step, **epoch_extension.optimizer_audit(optimizer.state_dict(), step, args.lr)))
         optimizer.zero_grad(set_to_none=True)
         history_report = summarize_history(history_records, ctx, args.history_corrupt_max) if args.history_corrupt_max else None
         if history_report and not history_audited and history_report["changed_rms"] and history_report["changed_rms"] > 0:
@@ -749,17 +826,24 @@ def train(args, ctx):
                 print(json.dumps(report), flush=True)
                 with (args.output_dir / "history.jsonl").open("a") as stream:
                     stream.write(json.dumps(report) + "\n")
-        if local_step % args.validate_every == 0 or step == end:
+        epoch_boundary = bool((args.extend_media_epochs or args.fresh_media_history)
+                              and step % epoch_plan.steps_per_epoch == 0)
+        if local_step % args.validate_every == 0 or step == end or epoch_boundary:
             metrics = validation_metrics(args, ctx, encoder, connector, dit, vae, scheduler, dataset)
             if ctx.is_main:
                 atomic_json(args.output_dir / f"validation_step{step:06d}.json", metrics)
                 print(f"Validation step={step}: {json.dumps(metrics)}", flush=True)
-        if local_step % args.save_every == 0 or local_step % args.archive_every == 0 or step == end:
+        if local_step % args.save_every == 0 or local_step % args.archive_every == 0 or step == end or epoch_boundary:
             barrier()
-            rng_states = capture_rng_states(ctx) if args.init_stage2 else None
+            rng_states = capture_rng_states(ctx) if args.init_stage2 or args.extend_media_epochs or args.fresh_media_history else None
             if ctx.is_main:
                 save(args, step, connector, optimizer, contract, final=step == args.steps,
-                     dit=dit if args.phase == 2 else None, rng_states=rng_states)
+                     dit=dit if args.phase == 2 else None, rng_states=rng_states, force_archive=epoch_boundary)
+                if epoch_boundary:
+                    atomic_json(args.output_dir / f"epoch{step // epoch_plan.steps_per_epoch}_complete.json",
+                                dict(step=step, checkpoint=f"stage2_dit_connector_step{step:06d}.pt",
+                                     total_media_epochs=step // epoch_plan.steps_per_epoch,
+                                     optimizer_restored=args.resume is not None, warmup_restarted=False))
             barrier()
         if step == end:
             break

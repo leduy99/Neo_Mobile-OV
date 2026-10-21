@@ -32,14 +32,19 @@ class MediaEpochPlan:
     epochs: int = 3
     seed: int = 20260911
     start_epoch: int = 0
+    allow_partial_cycle: bool = False
+    rng_world_size: int | None = None
 
     def __post_init__(self):
         if min(self.images, self.videos, self.world_size, self.accumulation, self.epochs) < 1:
             raise ValueError("Media counts, batch size and epochs must be positive")
         if type(self.start_epoch) is not int or self.start_epoch < 0:
             raise ValueError("Start epoch must be a nonnegative integer")
-        if self.epochs % 3 and self.start_epoch == 0:
+        if self.epochs % 3 and self.start_epoch == 0 and not self.allow_partial_cycle:
             raise ValueError("Use complete three-epoch cycles so every video sees all three modes equally")
+        if self.rng_world_size is not None and (type(self.rng_world_size) is not int
+                or self.rng_world_size < 1 or self.global_batch % self.rng_world_size):
+            raise ValueError("RNG world size must divide the unchanged global batch")
 
     @property
     def global_batch(self):
@@ -86,9 +91,15 @@ class MediaEpochPlan:
         mode = "t2i" if source == "t2i" else VIDEO_MODES[(index + self.seed + epoch) % 3]
         # Averaged across all updates of one epoch: .5 E[image] + .5 E[video].
         coefficient = 0.0 if padding else self.steps_per_epoch * self.global_batch / (2 * count)
-        return dict(source=source, index=index, epoch=epoch, mode=mode, padding=padding,
+        slot = dict(source=source, index=index, epoch=epoch, mode=mode, padding=padding,
                     loss_scale=coefficient,
                     micro=(step + self.start_epoch * self.steps_per_epoch) * self.accumulation + micro)
+        if self.rng_world_size is not None:
+            # Preserve each example's old VAE/noise/stage draws when changing DDP layout.
+            ordinal = ((step + self.start_epoch * self.steps_per_epoch) * self.global_batch
+                       + micro * self.world_size + rank)
+            slot.update(micro=ordinal // self.rng_world_size, rng_rank=ordinal % self.rng_world_size)
+        return slot
 
     def contract(self):
         result = dict(recipe="media_epochs_i2v_v1", images=self.images, videos=self.videos,
@@ -109,21 +120,26 @@ class MediaEpochPlan:
         if self.start_epoch:
             result.update(start_epoch=self.start_epoch, end_epoch=self.start_epoch + self.epochs,
                           sampler_step_offset=self.start_epoch * self.steps_per_epoch)
-            if self.epochs % 3:
-                result.pop("per_video_mode_presentations")
-                result.pop("presentations_per_video_mode")
-                counts = {mode: 0 for mode in VIDEO_MODES}
-                for epoch in range(self.start_epoch, self.start_epoch + self.epochs):
-                    for position, mode in enumerate(VIDEO_MODES):
-                        residue = (position - self.seed - epoch) % len(VIDEO_MODES)
-                        counts[mode] += (self.videos + 2 - residue) // 3
-                result.update(presentations_by_video_mode=counts,
-                              per_video_mode_policy="one_mode_per_pass; not_all_three_in_this_partial_cycle")
+        if self.epochs % 3:
+            result.pop("per_video_mode_presentations")
+            result.pop("presentations_per_video_mode")
+            counts = {mode: 0 for mode in VIDEO_MODES}
+            for epoch in range(self.start_epoch, self.start_epoch + self.epochs):
+                for position, mode in enumerate(VIDEO_MODES):
+                    residue = (position - self.seed - epoch) % len(VIDEO_MODES)
+                    counts[mode] += (self.videos + 2 - residue) // 3
+            result.update(presentations_by_video_mode=counts,
+                          per_video_mode_policy="one_mode_per_pass; not_all_three_in_this_partial_cycle")
+        if self.rng_world_size is not None:
+            result["rng_layout"] = dict(world_size=self.rng_world_size,
+                                        accumulation=self.global_batch // self.rng_world_size,
+                                        mapping="global_batch_position_to_original_rank_and_micro")
         return result
 
 
 def plan_from_release(root, *, world_size, accumulation, epochs=3, seed=20260911,
-                      min_videos=1, require_expansion=False, verify=True, start_epoch=0):
+                      min_videos=1, require_expansion=False, verify=True, start_epoch=0,
+                      allow_partial_cycle=False, rng_world_size=None):
     root = Path(root)
     summary = verify_release(root) if verify else json.loads((root / "stage1_summary.json").read_text())
     if require_expansion:
@@ -141,7 +157,8 @@ def plan_from_release(root, *, world_size, accumulation, epochs=3, seed=20260911
             raise ValueError(f"Manifest row count differs from release summary: {task}")
     if counts["t2v"] < min_videos:
         raise ValueError(f"Only {counts['t2v']} training videos, require {min_videos}; do not silently use the old subset")
-    return MediaEpochPlan(counts["t2i"], counts["t2v"], world_size, accumulation, epochs, seed, start_epoch)
+    return MediaEpochPlan(counts["t2i"], counts["t2v"], world_size, accumulation, epochs, seed,
+                          start_epoch, allow_partial_cycle, rng_world_size)
 
 
 def validate_fork_parent(payload, plan, *, expected_step, data_summary_sha256, integration_smoke=False):

@@ -16,6 +16,9 @@ def main():
     parser.add_argument("--world-size", type=int, default=8)
     parser.add_argument("--accumulation", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--allow-partial-cycle", action="store_true",
+                        help="Declare a 4/5-pass budget without claiming equal video modes for each individual video")
+    parser.add_argument("--media-rng-world-size", type=int)
     parser.add_argument("--seed", type=int, default=20260911)
     parser.add_argument("--min-train-videos", type=int, default=500000)
     parser.add_argument("--require-expanded-release", action="store_true")
@@ -23,7 +26,8 @@ def main():
     args = parser.parse_args()
     plan = plan_from_release(args.data_root, world_size=args.world_size, accumulation=args.accumulation,
                              epochs=args.epochs, seed=args.seed, min_videos=args.min_train_videos,
-                             require_expansion=args.require_expanded_release)
+                             require_expansion=args.require_expanded_release,
+                             allow_partial_cycle=args.allow_partial_cycle, rng_world_size=args.media_rng_world_size)
     payload = dict(plan.contract(), data_summary_sha256=sha256_file(args.data_root / "stage1_summary.json"))
     if args.output:
         if args.output.exists() and json.loads(args.output.read_text()) != payload:
