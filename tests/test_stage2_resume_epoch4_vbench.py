@@ -274,3 +274,65 @@ for name in ("quicksr_ablation", "epoch4_vs_epoch3"):
     weight.unlink()
     result, argv = run()
     assert result.returncode != 0 and not argv and "no latest/HF fallback" in result.stderr
+
+
+@pytest.mark.parametrize("phase", ["warm-scores", "score-worker", "summarize", "help"])
+def test_scoring_processes_start_without_av_or_training_dependencies(tmp_path, phase):
+    contract, parent_report, assets = prepared_fixture(tmp_path)
+    output = tmp_path / "epoch4"
+    protocol.atomic_json(output / "run_contract.json", contract)
+    protocol.atomic_json(output / "score_assets.json", assets)
+    score = parent_report["scores"]["quicksr"][runner.previous.PARENT_SYSTEM]
+    protocol.atomic_json(output / "fixture_score.json", score)
+    for variant in runner.base.VARIANTS:
+        for dimension in protocol.DIMENSIONS:
+            protocol.atomic_json(output / variant / "scores" / dimension / "vbench" /
+                                 f"{dimension}_eval_results.json", {dimension: [.5, []]})
+    program = r'''
+import importlib.abc
+import json
+from pathlib import Path
+import runpy
+import sys
+from types import ModuleType
+
+script, phase, output = sys.argv[1:]
+output = Path(output)
+class NoAV(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "av" or fullname.startswith("av."):
+            raise ModuleNotFoundError("No module named 'av' (simulated isolated VBench environment)")
+sys.meta_path.insert(0, NoAV())
+namespace = runpy.run_path(script, run_name="isolated_vbench")
+assert not any(name == "new_mobile_ov.training" or name.startswith("new_mobile_ov.training.")
+               for name in sys.modules), "Scoring imported the training stack"
+scope = namespace["main"].__globals__
+events = []
+scope["base"].core.warm_scores = lambda args: events.append("warm-scores")
+scope["base"].verify_generation = lambda folder: events.append("verify-generation")
+def subprocess_run(argv, **kwargs):
+    events.append(argv[1])
+scope["subprocess"].run = subprocess_run
+tabulator = ModuleType("evaluate_vbench_resume")
+tabulator.tabulate = lambda folder: json.loads((output / "fixture_score.json").read_text())
+sys.modules["evaluate_vbench_resume"] = tabulator
+sys.argv = [script, "--help"] if phase == "help" else [script, "--phase", phase, "--output-dir", str(output)]
+try:
+    scope["main"]()
+except SystemExit as error:
+    assert phase == "help" and error.code == 0
+if phase == "warm-scores":
+    assert events == ["warm-scores"]
+elif phase == "score-worker":
+    assert events and all(name.endswith("evaluate_vbench_resume.py") for name in events)
+elif phase == "summarize":
+    assert (output / "epoch4_vs_epoch3.md").is_file()
+assert not any(name == "new_mobile_ov.training" or name.startswith("new_mobile_ov.training.")
+               for name in sys.modules), "Scoring imported the training stack"
+print("ISOLATED_VBENCH_OK", phase)
+'''
+    result = subprocess.run([sys.executable, "-c", program,
+                             str(ROOT / "tools/benchmark_mobileov_stage2_resume_epoch4_dual.py"),
+                             phase, str(output)], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"ISOLATED_VBENCH_OK {phase}" in result.stdout

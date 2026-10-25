@@ -18,8 +18,6 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
 import benchmark_mobileov_job_a_dual as previous  # noqa: E402
-from new_mobile_ov.training.stage2_epoch_extension import validate_extension  # noqa: E402
-from new_mobile_ov.training.stage2_media_epochs import MediaEpochPlan  # noqa: E402
 from vbench_joint_native_protocol import (  # noqa: E402
     atomic_json, bind_contract, fingerprint, output_lock, read_json, sha256,
 )
@@ -36,6 +34,10 @@ IMPLEMENTATION = ("tools/benchmark_mobileov_stage2_resume_epoch4_dual.py",
 
 
 def check_checkpoint(payload, *, allow_incomplete=False):
+    # Only the generation environment has training/data dependencies such as PyAV.
+    from new_mobile_ov.training.stage2_epoch_extension import validate_extension
+    from new_mobile_ov.training.stage2_media_epochs import MediaEpochPlan
+
     base.stage2.check_payload(payload, EPOCH_STEP)
     training = payload["contract"]
     plan = MediaEpochPlan(984636, 529902, 16, 1, epochs=5, allow_partial_cycle=True, rng_world_size=8)
@@ -62,6 +64,8 @@ def epoch4_policy():
 
 
 def compare_protocol(reference, current):
+    from new_mobile_ov.training.stage2_epoch_extension import validate_extension
+
     validate_extension(reference["training_contract"], current["training_contract"],
                        PARENT_STEP, repartition=True)
     # Reuse the existing settings/asset/AST audit without adding a fictitious parent to the checkpoint.
