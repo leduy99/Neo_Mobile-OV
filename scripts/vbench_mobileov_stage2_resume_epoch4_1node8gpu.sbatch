@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Exact epoch-4 archive, not the moving latest checkpoint of the ongoing training job.
+# Shared epoch-4/5 launcher; submit this file for epoch 4 or the epoch-5 wrapper.
 #SBATCH --job-name=mov-vb-res-ep4
 #SBATCH --partition=berzelius
 #SBATCH --nodes=1
@@ -15,7 +15,13 @@ set -Eeuo pipefail
 trap 'rc=$?; echo "ERROR: line=${LINENO} command=${BASH_COMMAND} exit=${rc}" >&2; exit "$rc"' ERR
 cd "${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:?Submit from the repo root}}"
 export ROOT="${PWD}"
-CHECKPOINT="${CHECKPOINT:-output/mobileov_stage2_resume5epochs16gpu/17892008/stage2_dit_connector_step378636.pt}"
+EVAL_EPOCH="${EVAL_EPOCH:-4}"
+case "${EVAL_EPOCH}" in
+    4) EPOCH_STEP=378636 ;;
+    5) EPOCH_STEP=473295 ;;
+    *) echo "EVAL_EPOCH must be 4 or 5." >&2; exit 1 ;;
+esac
+CHECKPOINT="${CHECKPOINT:-output/mobileov_stage2_resume5epochs16gpu/17892008/stage2_dit_connector_step${EPOCH_STEP}.pt}"
 REFERENCE_RUN="${REFERENCE_RUN:-output/vbench_mobileov_stage2_media3epochs_5x_dual}"
 SAMPLES_PER_PROMPT="${SAMPLES_PER_PROMPT:-5}"
 MAX_PROMPTS="${MAX_PROMPTS:-0}"
@@ -25,7 +31,7 @@ fi
 if [[ "${MAX_PROMPTS}" -eq 0 && "${SAMPLES_PER_PROMPT}" -ne 5 ]]; then
     echo "Full evaluation requires 5 videos/prompt." >&2; exit 1
 fi
-test -s "${CHECKPOINT}" || { echo "Missing archived epoch-4 checkpoint: ${CHECKPOINT}; no latest/HF fallback." >&2; exit 1; }
+test -s "${CHECKPOINT}" || { echo "Missing archived epoch-${EVAL_EPOCH} checkpoint: ${CHECKPOINT}; no latest/HF fallback." >&2; exit 1; }
 if [[ "${MAX_PROMPTS}" -eq 0 ]]; then
     for FILE in run_contract.json quicksr_ablation.json score_assets.json; do
         test -s "${REFERENCE_RUN}/${FILE}" || { echo "Missing completed epoch-3 reference: ${REFERENCE_RUN}/${FILE}" >&2; exit 1; }
@@ -33,7 +39,7 @@ if [[ "${MAX_PROMPTS}" -eq 0 ]]; then
 fi
 SUFFIX=""
 if [[ "${MAX_PROMPTS}" -gt 0 ]]; then SUFFIX="_smoke${MAX_PROMPTS}"; fi
-RUN_ROOT="${RUN_ROOT:-output/vbench_mobileov_stage2_resume_epoch4_step378636_${SAMPLES_PER_PROMPT}x_dual${SUFFIX}}"
+RUN_ROOT="${RUN_ROOT:-output/vbench_mobileov_stage2_resume_epoch${EVAL_EPOCH}_step${EPOCH_STEP}_${SAMPLES_PER_PROMPT}x_dual_v2${SUFFIX}}"
 module load buildenv-gcccuda/12.1.1-gcc12.3.0
 export CONDA_ENV="${CONDA_ENV:-/proj/cvl/users/x_fahkh2/envs/neo_mobileov}"
 export BASE_PYTHON="${CONDA_ENV}/bin/python"
@@ -56,17 +62,17 @@ test -x "${VBENCH_ENV}/bin/python"
 test -s "${VBENCH_REPO}/vbench/VBench_full_info.json"
 PIN_ARGS=()
 if [[ -n "${EXPECTED_SHA256:-}" ]]; then PIN_ARGS+=(--expected-sha256 "${EXPECTED_SHA256}"); fi
-echo "Pinned epoch4 step378636, training run17892008; eight evaluation GPUs; do not stop training."
+echo "Pinned epoch${EVAL_EPOCH} step${EPOCH_STEP}, training run17892008; eight evaluation GPUs."
 echo "944 prompts x 5 samples; same seeds, 20/10 steps per stage, CFG7/5; no external image anchor."
 echo "Generate once, evaluate raw 512x320 and QuickSR medium2x 1024x640. OUT=${RUN_ROOT}"
 srun --ntasks=1 --gres=gpu:8 "${BASE_PYTHON}" -u tools/benchmark_mobileov_stage2_resume_epoch4_dual.py \
-    --checkpoint "${CHECKPOINT}" --reference-run "${REFERENCE_RUN}" \
+    --epoch "${EVAL_EPOCH}" --checkpoint "${CHECKPOINT}" --reference-run "${REFERENCE_RUN}" \
     --config "${CONFIG:-configs/mobile_ov_neodragon.yaml}" --output-dir "${RUN_ROOT}" \
     --workers 8 --samples-per-prompt "${SAMPLES_PER_PROMPT}" --max-prompts "${MAX_PROMPTS}" \
     --seed "${SEED:-2026}" --vbench-repo "${VBENCH_REPO}" \
     --vbench-python "${VBENCH_ENV}/bin/python" "${PIN_ARGS[@]}"
 if [[ "${MAX_PROMPTS}" -eq 0 ]]; then
     test -s "${RUN_ROOT}/quicksr_ablation.json"
-    test -s "${RUN_ROOT}/epoch4_vs_epoch3.json"
-    cat "${RUN_ROOT}/epoch4_vs_epoch3.md"
+    test -s "${RUN_ROOT}/epoch${EVAL_EPOCH}_vs_epoch3.json"
+    cat "${RUN_ROOT}/epoch${EVAL_EPOCH}_vs_epoch3.md"
 fi

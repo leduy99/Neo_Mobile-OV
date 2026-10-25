@@ -55,7 +55,8 @@ def reference_fixture(tmp_path):
 
 def current_contract(reference):
     result = deepcopy(reference)
-    result.update(system=runner.SYSTEM, training_complete=False, training_contract=payload()["contract"],
+    result.update(system=runner.SYSTEM, training_complete=runner.EPOCH_STEP == runner.TARGET_STEP,
+        training_contract=payload()["contract"],
         checkpoint=dict(path=str(runner.DEFAULT_CHECKPOINT), sha256="a" * 64,
                         step=runner.EPOCH_STEP, final_step=runner.TARGET_STEP))
     return result
@@ -64,8 +65,8 @@ def current_contract(reference):
 def prepared_fixture(tmp_path):
     root, reference, report, assets = reference_fixture(tmp_path)
     result = current_contract(reference)
-    result["epoch4_evaluation"] = dict(kind="completed_epoch4_of_ongoing_five_epoch_resume",
-        epoch=4, expected_step=runner.EPOCH_STEP, planned_final_step=runner.TARGET_STEP,
+    result[f"epoch{runner.EPOCH}_evaluation"] = dict(kind=f"completed_epoch{runner.EPOCH}_of_five_epoch_resume",
+        epoch=runner.EPOCH, expected_step=runner.EPOCH_STEP, planned_final_step=runner.TARGET_STEP,
         reference_run=str(root), reference_verified=True,
         reference_contract_sha256=protocol.fingerprint(reference),
         reference_report_sha256=protocol.fingerprint(report))
@@ -119,7 +120,7 @@ def test_cli_uses_immutable_known_archive_eight_workers_and_both_versions():
         with pytest.raises(SystemExit):
             runner.parse_args(flags)
     smoke = runner.parse_args(["--max-prompts", "2", "--samples-per-prompt", "1"])
-    assert smoke.output_dir.name.endswith("_1x_dual_smoke2")
+    assert smoke.output_dir.name.endswith("_1x_dual_v2_smoke2")
 
 
 def test_epoch4_protocol_accepts_only_layout_and_total_epoch_changes(tmp_path):
@@ -220,7 +221,7 @@ def test_summary_has_all_dimensions_and_keeps_incomplete_five_epoch_status(tmp_p
 
 def test_full_orchestration_runs_eight_workers_for_generation_and_scoring(tmp_path, monkeypatch):
     contract, _, _ = prepared_fixture(tmp_path)
-    args = SimpleNamespace(phase="run", output_dir=tmp_path / "epoch4", workers=8, max_prompts=0,
+    args = SimpleNamespace(epoch=4, phase="run", output_dir=tmp_path / "epoch4", workers=8, max_prompts=0,
                            vbench_python=sys.executable, vbench_repo=tmp_path)
     monkeypatch.setattr(runner, "parse_args", lambda: args)
     monkeypatch.setattr(runner, "prepare", lambda _: contract)
@@ -265,7 +266,8 @@ for name in ("quicksr_ablation", "epoch4_vs_epoch3"):
     assert option(argv, "--checkpoint") == str(weight.relative_to(root))
     assert option(argv, "--workers") == "8" and option(argv, "--samples-per-prompt") == "5"
     assert option(argv, "--seed") == "2026" and "--allow-incomplete-checkpoint" not in argv
-    assert option(argv, "--output-dir").endswith("resume_epoch4_step378636_5x_dual")
+    assert option(argv, "--epoch") == "4"
+    assert option(argv, "--output-dir").endswith("resume_epoch4_step378636_5x_dual_v2")
     assert "mock epoch4 report" in result.stdout
     assert "#SBATCH --gres=gpu:8" in SCRIPT.read_text()
     assert "#SBATCH --nodes=1" in SCRIPT.read_text()
@@ -277,9 +279,11 @@ for name in ("quicksr_ablation", "epoch4_vs_epoch3"):
 
 
 @pytest.mark.parametrize("phase", ["warm-scores", "score-worker", "summarize", "help"])
-def test_scoring_processes_start_without_av_or_training_dependencies(tmp_path, phase):
-    contract, parent_report, assets = prepared_fixture(tmp_path)
-    output = tmp_path / "epoch4"
+@pytest.mark.parametrize("epoch", [4, 5])
+def test_scoring_processes_start_without_av_or_training_dependencies(tmp_path, phase, epoch):
+    with runner.evaluation_epoch(epoch):
+        contract, parent_report, assets = prepared_fixture(tmp_path)
+    output = tmp_path / f"epoch{epoch}"
     protocol.atomic_json(output / "run_contract.json", contract)
     protocol.atomic_json(output / "score_assets.json", assets)
     score = parent_report["scores"]["quicksr"][runner.previous.PARENT_SYSTEM]
@@ -296,7 +300,7 @@ import runpy
 import sys
 from types import ModuleType
 
-script, phase, output = sys.argv[1:]
+script, phase, output, epoch = sys.argv[1:]
 output = Path(output)
 class NoAV(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
@@ -316,7 +320,8 @@ scope["subprocess"].run = subprocess_run
 tabulator = ModuleType("evaluate_vbench_resume")
 tabulator.tabulate = lambda folder: json.loads((output / "fixture_score.json").read_text())
 sys.modules["evaluate_vbench_resume"] = tabulator
-sys.argv = [script, "--help"] if phase == "help" else [script, "--phase", phase, "--output-dir", str(output)]
+sys.argv = ([script, "--epoch", epoch, "--help"] if phase == "help" else
+            [script, "--epoch", epoch, "--phase", phase, "--output-dir", str(output)])
 try:
     scope["main"]()
 except SystemExit as error:
@@ -326,13 +331,13 @@ if phase == "warm-scores":
 elif phase == "score-worker":
     assert events and all(name.endswith("evaluate_vbench_resume.py") for name in events)
 elif phase == "summarize":
-    assert (output / "epoch4_vs_epoch3.md").is_file()
+    assert (output / f"epoch{epoch}_vs_epoch3.md").is_file()
 assert not any(name == "new_mobile_ov.training" or name.startswith("new_mobile_ov.training.")
                for name in sys.modules), "Scoring imported the training stack"
 print("ISOLATED_VBENCH_OK", phase)
 '''
     result = subprocess.run([sys.executable, "-c", program,
                              str(ROOT / "tools/benchmark_mobileov_stage2_resume_epoch4_dual.py"),
-                             phase, str(output)], cwd=tmp_path, capture_output=True, text=True)
+                             phase, str(output), str(epoch)], cwd=tmp_path, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"ISOLATED_VBENCH_OK {phase}" in result.stdout

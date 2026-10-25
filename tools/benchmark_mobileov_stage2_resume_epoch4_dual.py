@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Pinned epoch-4 VBench for the unchanged Adam-resumed five-epoch Stage-2 run."""
+"""Pinned epoch-4/5 VBench for the unchanged Adam-resumed Stage-2 run."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -23,14 +23,39 @@ from vbench_joint_native_protocol import (  # noqa: E402
 )
 
 base = previous.base
+EPOCH = 4
 SYSTEM = "stage2_resume_epoch4"
 PARENT_STEP, EPOCH_STEP, TARGET_STEP = 283977, 378636, 473295
-DEFAULT_CHECKPOINT = ROOT / "output/mobileov_stage2_resume5epochs16gpu/17892008/stage2_dit_connector_step378636.pt"
-DEFAULT_OUTPUT = ROOT / "output/vbench_mobileov_stage2_resume_epoch4_step378636_5x_dual"
+EPOCH_STEPS = {4: 378636, 5: 473295}
+
+
+def epoch_paths(epoch):
+    step = EPOCH_STEPS[epoch]
+    checkpoint = ROOT / f"output/mobileov_stage2_resume5epochs16gpu/17892008/stage2_dit_connector_step{step:06d}.pt"
+    output = ROOT / f"output/vbench_mobileov_stage2_resume_epoch{epoch}_step{step}_5x_dual_v2"
+    return checkpoint, output
+
+
+DEFAULT_CHECKPOINT, DEFAULT_OUTPUT = epoch_paths(EPOCH)
 IMPLEMENTATION = ("tools/benchmark_mobileov_stage2_resume_epoch4_dual.py",
                   "tools/benchmark_mobileov_job_a_dual.py", "tools/benchmark_mobileov_stage2_epoch_dual.py",
                   "new_mobile_ov/training/stage2_epoch_extension.py",
                   "new_mobile_ov/training/stage2_media_epochs.py")
+
+
+@contextmanager
+def evaluation_epoch(epoch):
+    global EPOCH, EPOCH_STEP, SYSTEM, DEFAULT_CHECKPOINT, DEFAULT_OUTPUT
+
+    if epoch not in EPOCH_STEPS:
+        raise ValueError("Evaluate only the pinned epoch-4 or epoch-5 archive")
+    original = EPOCH, EPOCH_STEP, SYSTEM, DEFAULT_CHECKPOINT, DEFAULT_OUTPUT
+    EPOCH, EPOCH_STEP, SYSTEM = epoch, EPOCH_STEPS[epoch], f"stage2_resume_epoch{epoch}"
+    DEFAULT_CHECKPOINT, DEFAULT_OUTPUT = epoch_paths(epoch)
+    try:
+        yield
+    finally:
+        EPOCH, EPOCH_STEP, SYSTEM, DEFAULT_CHECKPOINT, DEFAULT_OUTPUT = original
 
 
 def check_checkpoint(payload, *, allow_incomplete=False):
@@ -44,7 +69,7 @@ def check_checkpoint(payload, *, allow_incomplete=False):
     if (training.get("format") != base.stage2.FORMAT or training.get("media_epochs") != plan.contract()
             or training.get("steps") != TARGET_STEP or training.get("world_size") != 16
             or training.get("accumulation") != 1 or "optimizer" in payload or "smolvlm2_lora" in payload):
-        raise ValueError("Expected the archived epoch-4 inference weights of the 16-GPU five-epoch resume, not latest/resume/Job A/B/history")
+        raise ValueError(f"Expected the archived epoch-{EPOCH} inference weights of the 16-GPU five-epoch resume, not latest/resume/Job A/B/history")
     # Admission checks the canonical old layout; full evaluation also checks the actual parent below.
     original = dict(training, steps=PARENT_STEP, world_size=8, accumulation=2,
                     media_epochs=MediaEpochPlan(984636, 529902, 8, 2).contract())
@@ -53,7 +78,7 @@ def check_checkpoint(payload, *, allow_incomplete=False):
 
 
 @contextmanager
-def epoch4_policy():
+def epoch_policy():
     # Keep numerical inference/export unchanged; admit only this exact archived epoch.
     original_check, original_system = base.check_media_checkpoint, base.SYSTEM
     base.check_media_checkpoint, base.SYSTEM = check_checkpoint, SYSTEM
@@ -61,6 +86,10 @@ def epoch4_policy():
         yield
     finally:
         base.check_media_checkpoint, base.SYSTEM = original_check, original_system
+
+
+# Preserve the original epoch-4 Python entry point; the CLI selects both epochs.
+epoch4_policy = epoch_policy
 
 
 def compare_protocol(reference, current):
@@ -76,15 +105,16 @@ def compare_protocol(reference, current):
 
 def prepare(args):
     if args.output_dir.resolve() == args.reference_run.resolve():
-        raise ValueError("Use a separate epoch-4 output; preserve the epoch-3 reference")
+        raise ValueError(f"Use a separate epoch-{EPOCH} output; preserve the epoch-3 reference")
     reference_data = None if args.max_prompts else previous.read_reference(args.reference_run)
     asset_args = copy.copy(args)
     asset_args.output_dir = args.output_dir / "_asset_preflight"
-    with epoch4_policy():
+    with epoch_policy():
         contract = base.prepare(asset_args)
     helpers = compare_protocol(reference_data[0], contract) if reference_data else None
-    contract["epoch4_evaluation"] = dict(
-        kind="completed_epoch4_of_ongoing_five_epoch_resume", epoch=4, expected_step=EPOCH_STEP,
+    policy_key = f"epoch{EPOCH}_evaluation"
+    contract[policy_key] = dict(
+        kind=f"completed_epoch{EPOCH}_of_five_epoch_resume", epoch=EPOCH, expected_step=EPOCH_STEP,
         planned_final_step=TARGET_STEP, parent_step=PARENT_STEP, additional_updates=EPOCH_STEP - PARENT_STEP,
         reference_run=str(args.reference_run), reference_verified=reference_data is not None,
         reference_contract_sha256=fingerprint(reference_data[0]) if reference_data else None,
@@ -93,8 +123,9 @@ def prepare(args):
     )
     contract["implementation_sha256"].update({name: sha256(ROOT / name) for name in IMPLEMENTATION})
     contract["scope"] = (
-        "Exact completed media epoch 4, step378636, from the unchanged-recipe Adam continuation of epoch 3. "
-        "Planned final step473295 is still incomplete; this does not prevent evaluating the archived epoch. "
+        f"Exact completed media epoch {EPOCH}, step{EPOCH_STEP}, from the unchanged-recipe Adam continuation of epoch 3. "
+        + ("The epoch-4 archive is intermediate within the five-epoch budget. " if EPOCH == 4 else
+           "The epoch-5 archive completes the five-epoch budget at step473295. ") +
         "Frozen SmolVLM2 + trained MCP/monolithic DiT; every frame generated from text, including frame zero. "
         "No SSD1B/DreamLite anchor, vision reference, LoRA, history corruption or Hybrid inference. "
         "Same parent prompts/seeds, 20/10 steps per stage, CFG7/5, BF16 DiT and evaluator weights. "
@@ -105,7 +136,7 @@ def prepare(args):
     for name in ("vbench_info.json", "checkpoint_audit.json"):
         value = read_json(asset_args.output_dir / name)
         if name == "checkpoint_audit.json":
-            value["epoch4_evaluation"] = contract["epoch4_evaluation"]
+            value[policy_key] = contract[policy_key]
         atomic_json(args.output_dir / name, value)
     samples = read_json(asset_args.output_dir / "sample_plan.json")["samples"]
     atomic_json(args.output_dir / "sample_plan.json", dict(contract_sha256=digest, samples=samples))
@@ -114,16 +145,16 @@ def prepare(args):
 
 def checked_contract(output):
     contract = read_json(output / "run_contract.json")
-    checkpoint, policy = contract.get("checkpoint", {}), contract.get("epoch4_evaluation", {})
-    if (contract.get("system") != SYSTEM or contract.get("training_complete") is not False
+    checkpoint, policy = contract.get("checkpoint", {}), contract.get(f"epoch{EPOCH}_evaluation", {})
+    if (contract.get("system") != SYSTEM or contract.get("training_complete") is not (EPOCH_STEP == TARGET_STEP)
             or checkpoint.get("step") != EPOCH_STEP or checkpoint.get("final_step") != TARGET_STEP
-            or policy.get("epoch") != 4 or policy.get("expected_step") != EPOCH_STEP):
-        raise ValueError("Not the pinned epoch-4 resume benchmark")
+            or policy.get("epoch") != EPOCH or policy.get("expected_step") != EPOCH_STEP):
+        raise ValueError(f"Not the pinned epoch-{EPOCH} resume benchmark")
     return contract
 
 
 def verified_reference(contract):
-    policy = contract["epoch4_evaluation"]
+    policy = contract[f"epoch{EPOCH}_evaluation"]
     if not policy["reference_verified"]:
         raise ValueError("No full reference comparison for a generation smoke")
     reference, report, assets = previous.read_reference(Path(policy["reference_run"]))
@@ -142,15 +173,15 @@ def verify_score_assets(output, contract):
 
 def generation_worker(args, *, device=None):
     checked_contract(args.output_dir)
-    with epoch4_policy():
+    with epoch_policy():
         base.generation_worker(args, device=device)
 
 
 def comparison(output, contract, scores):
     _, parent, _ = verified_reference(contract)
     metrics = ("quality_score", "semantic_score", "total_score")
-    lines = ["# Epoch 4 vs Epoch 3: Unchanged Training Recipe", "", contract["scope"], "",
-             "| Score (%) | Epoch 3 Raw | Epoch 4 Raw | Change (pp) | Epoch 3 QuickSR | Epoch 4 QuickSR | Change (pp) |",
+    lines = [f"# Epoch {EPOCH} vs Epoch 3: Unchanged Training Recipe", "", contract["scope"], "",
+             f"| Score (%) | Epoch 3 Raw | Epoch {EPOCH} Raw | Change (pp) | Epoch 3 QuickSR | Epoch {EPOCH} QuickSR | Change (pp) |",
              "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
     rows = {}
     for name in (*metrics, *base.DIMENSIONS):
@@ -160,13 +191,13 @@ def comparison(output, contract, scores):
             a, b = (a[name], b[name]) if name in metrics else (a["raw"][name], b["raw"][name])
             if not all(isinstance(value, (int, float)) and math.isfinite(value) for value in (a, b)):
                 raise ValueError(f"Non-finite comparison score: {variant}/{name}")
-            row[variant] = dict(epoch3=a, epoch4=b, difference_pp=100 * (b - a))
+            row[variant] = {"epoch3": a, f"epoch{EPOCH}": b, "difference_pp": 100 * (b - a)}
             values.extend((f"{100*a:.2f}", f"{100*b:.2f}", f"{100*(b-a):+.2f}"))
         rows[name] = row
         lines.append(f"| {name} | " + " | ".join(values) + " |")
-    atomic_json(output / "epoch4_vs_epoch3.json", dict(status="complete", rows=rows,
-                epoch4_evaluation=contract["epoch4_evaluation"]))
-    (output / "epoch4_vs_epoch3.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_json(output / f"epoch{EPOCH}_vs_epoch3.json", dict(status="complete", rows=rows,
+                **{f"epoch{EPOCH}_evaluation": contract[f"epoch{EPOCH}_evaluation"]}))
+    (output / f"epoch{EPOCH}_vs_epoch3.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def summarize(args):
@@ -176,7 +207,7 @@ def summarize(args):
     if contract["max_prompts"] or contract["samples_per_prompt"] != 5:
         raise ValueError("No full score for a subset/single-sample smoke")
     verify_score_assets(args.output_dir, contract)
-    with epoch4_policy():
+    with epoch_policy():
         base.verify_generation(args.output_dir)
     scores = {}
     for variant in base.VARIANTS:
@@ -194,30 +225,38 @@ def summarize(args):
     report.update(protocol=contract, evaluation_assets=read_json(args.output_dir / "score_assets.json"), scope=contract["scope"])
     atomic_json(args.output_dir / "quicksr_ablation.json", report)
     markdown = markdown.replace("Identical generated RGB frames and anchors;", "Identical generated RGB frames; no external anchor;")
-    (args.output_dir / "quicksr_ablation.md").write_text("# Stage-2 Resume: Exact Epoch 4\n\n" + markdown, encoding="utf-8")
+    (args.output_dir / "quicksr_ablation.md").write_text(f"# Stage-2 Resume: Exact Epoch {EPOCH}\n\n" + markdown, encoding="utf-8")
     comparison(args.output_dir, contract, scores)
-    print(f"Completed epoch-4 VBench: {args.output_dir}", flush=True)
+    print(f"Completed epoch-{EPOCH} VBench: {args.output_dir}", flush=True)
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--epoch", type=int, choices=(4, 5), default=4)
     parser.add_argument("--reference-run", type=Path, default=previous.REFERENCE)
     extra, rest = parser.parse_known_args(sys.argv[1:] if argv is None else argv)
     if "--help" in rest or "-h" in rest:
         print(__doc__ + "\n" + parser.format_help())
     args = base.parse_args(rest)
+    args.epoch = extra.epoch
     args.reference_run = extra.reference_run.resolve()
     if args.phase in ("run", "prepare"):
+        checkpoint, output = epoch_paths(args.epoch)
         if not any(item == "--checkpoint" or item.startswith("--checkpoint=") for item in rest):
-            args.checkpoint = DEFAULT_CHECKPOINT
+            args.checkpoint = checkpoint
         if not any(item == "--output-dir" or item.startswith("--output-dir=") for item in rest):
-            suffix = f"_{args.samples_per_prompt}x_dual_smoke{args.max_prompts}" if args.max_prompts else "_5x_dual"
-            args.output_dir = DEFAULT_OUTPUT.with_name(DEFAULT_OUTPUT.name.removesuffix("_5x_dual") + suffix)
+            suffix = f"_{args.samples_per_prompt}x_dual_v2_smoke{args.max_prompts}" if args.max_prompts else "_5x_dual_v2"
+            args.output_dir = output.with_name(output.name.removesuffix("_5x_dual_v2") + suffix)
     return args
 
 
 def main():
     args = parse_args()
+    with evaluation_epoch(args.epoch):
+        run(args)
+
+
+def run(args):
     if args.phase == "generation-worker":
         generation_worker(args)
         return
@@ -226,7 +265,7 @@ def main():
         return
     if args.phase == "score-worker":
         checked_contract(args.output_dir)
-        with epoch4_policy():
+        with epoch_policy():
             base.score_worker(args)
         return
     if args.phase == "summarize":
@@ -242,26 +281,26 @@ def main():
         if args.phase == "prepare":
             return
         if not args.max_prompts:
-            subprocess.run([args.vbench_python, str(Path(__file__).resolve()), "--phase", "warm-scores",
+            subprocess.run([args.vbench_python, str(Path(__file__).resolve()), "--epoch", str(EPOCH), "--phase", "warm-scores",
                             "--output-dir", str(args.output_dir), "--vbench-repo", str(args.vbench_repo)],
                            cwd=args.vbench_repo, check=True)
             verify_score_assets(args.output_dir, contract)
         previous_handler = signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
         try:
-            commands = [[sys.executable, str(Path(__file__).resolve()), "--phase", "generation-worker",
+            commands = [[sys.executable, str(Path(__file__).resolve()), "--epoch", str(EPOCH), "--phase", "generation-worker",
                          "--output-dir", str(args.output_dir), "--rank", str(rank), "--workers", str(args.workers)]
                         for rank in range(args.workers)]
             base.core.run_processes(commands, devices, args.output_dir / "logs/generation")
-            with epoch4_policy():
+            with epoch_policy():
                 base.verify_generation(args.output_dir)
             if args.max_prompts:
-                print("Epoch-4 generation smoke passed; no full scores claimed.", flush=True)
+                print(f"Epoch-{EPOCH} generation smoke passed; no full scores claimed.", flush=True)
                 return
-            commands = [[args.vbench_python, str(Path(__file__).resolve()), "--phase", "score-worker",
+            commands = [[args.vbench_python, str(Path(__file__).resolve()), "--epoch", str(EPOCH), "--phase", "score-worker",
                          "--output-dir", str(args.output_dir), "--vbench-repo", str(args.vbench_repo),
                          "--rank", str(rank), "--workers", str(args.workers)] for rank in range(args.workers)]
             base.core.run_processes(commands, devices, args.output_dir / "logs/scoring", cwd=args.vbench_repo)
-            subprocess.run([args.vbench_python, str(Path(__file__).resolve()), "--phase", "summarize",
+            subprocess.run([args.vbench_python, str(Path(__file__).resolve()), "--epoch", str(EPOCH), "--phase", "summarize",
                             "--output-dir", str(args.output_dir)], cwd=args.vbench_repo, check=True)
         finally:
             signal.signal(signal.SIGTERM, previous_handler)
