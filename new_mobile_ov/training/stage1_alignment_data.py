@@ -36,6 +36,9 @@ def load_sources(manifest_root: Path) -> dict[str, Path]:
 
 def read_alignment_sample(record: dict, sources: dict[str, Path], *, num_video_frames: int = 49) -> dict:
     """Return PIL targets and VLM inputs; images are not clean DiT conditioning latents."""
+    if "exp2_transform" in record:
+        from new_mobile_ov.training.exp2_data import read_exp2_sample
+        return read_exp2_sample(record, sources, num_video_frames=num_video_frames)
     task, target = record["task"], record["target"]
     payload = read_media_bytes(sources, target)
     if task in {"t2i", "image_reconstruction"}:

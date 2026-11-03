@@ -27,6 +27,11 @@ def verify_release(root: Path):
         raise ValueError("Stage-1 data release is incomplete or modified")
     if summary["status"] != "raw_data_ready" or set(summary["tasks"]) != set(TASKS):
         raise ValueError("Stage-1 requires all three raw-data tasks")
+    if summary.get("format") == "mobileov_exp2_data_v1":
+        if summary.get("preview_only"):
+            raise ValueError("Exp-2 preview is not a full training release")
+        if sha256_file(root / "exp2_contract.json") != summary["exp2_contract_sha256"]:
+            raise ValueError("Modified Exp-2 preprocessing/caption policy")
     if sha256_file(root / "sources.json") != summary["sources_sha256"]:
         raise ValueError("Modified source references")
     for name, artifact in summary["manifests"].items():
@@ -80,9 +85,14 @@ def prepare_sample(record, sources, short_side=320, long_side=512):
     square = (int(round(math.sqrt(short_side * long_side) / 64)) * 64,) * 2
     buckets = ((long_side, short_side), (short_side, long_side), square)
     size = min(buckets, key=lambda dims: abs(math.log((w / h) / (dims[0] / dims[1]))))
-    frames = [im.resize(size, Image.Resampling.LANCZOS) for im in sample["target_frames"]]
-    # Resize the entire view rather than crop away captioned objects. Reconstruction
-    # sees the same resized image as the target, only through the frozen VLM.
+    if sample.get("preprocessing_format") == "mobileov_exp2_data_v1":
+        if (w, h) not in buckets:
+            raise ValueError("Exp-2 crop does not match the training resolution buckets")
+        frames = sample["target_frames"]
+    else:
+        # Preserve legacy preprocessing for all existing runs/releases.
+        frames = [im.resize(size, Image.Resampling.LANCZOS) for im in sample["target_frames"]]
+    # Reconstruction sees exactly the transformed target view through the VLM only.
     sample["image"] = frames[0] if record["task"] == "image_reconstruction" else None
     sample["video"] = torch.from_numpy(np.stack([np.asarray(im) for im in frames])).permute(3, 0, 1, 2).float() / 127.5 - 1
     sample["sample_id"] = record["sample_id"]
