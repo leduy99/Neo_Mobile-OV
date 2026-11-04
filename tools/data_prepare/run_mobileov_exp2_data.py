@@ -14,6 +14,41 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOL = ROOT / "tools/data_prepare/prepare_mobileov_exp2.py"
+PYAV_REQUIREMENT = "av==16.1.0"
+
+
+def prepare_runtime_env(python, env, output, role):
+    """Provide PyAV without installing into an existing training/VBench env."""
+    tag = subprocess.run([python, "-c", "import sys; print(sys.implementation.cache_tag)"],
+                         check=True, env=env, capture_output=True, text=True).stdout.strip()
+    library = output / "runtime" / f"{role}_{tag}"
+    worker_env = dict(env, PYTHONPATH=f"{library}:{env.get('PYTHONPATH', '')}")
+    probe = [python, "-c", 'import av; assert "mpeg4" in av.codecs_available; print(av.__version__)']
+    result = subprocess.run(probe, env=worker_env, capture_output=True, text=True)
+    if result.returncode:
+        print(f"{role}: PyAV unavailable in {python}; installing {PYAV_REQUIREMENT} into {library}", flush=True)
+        print(result.stderr.strip(), flush=True)
+        subprocess.run([python, "-m", "pip", "install", "--no-deps", "--only-binary=:all:",
+                        "--upgrade", "--target", str(library), PYAV_REQUIREMENT], check=True, env=env)
+        result = subprocess.run(probe, check=True, env=worker_env, capture_output=True, text=True)
+    print(f"{role}: PyAV {result.stdout.strip()} ready; python={python}", flush=True)
+    return worker_env
+
+
+def preflight_workers(args, env, output, phases):
+    environments = {}
+    for phase in phases:
+        python = args.quality_python if phase == "quality" else args.caption_python
+        worker_env = prepare_runtime_env(python, env, output, phase)
+        imports = ("import clip, pyiqa; from scenedetect.detectors import AdaptiveDetector"
+                   if phase == "quality" else
+                   "from transformers import AutoModelForMultimodalLM, AutoProcessor, AutoConfig")
+        # Import the actual reader in both environments, not just model loaders.
+        subprocess.run([python, "-c", "import tools.data_prepare.prepare_mobileov_exp2; " + imports
+                        + f'; print("{phase} reader and model imports ready")'],
+                       check=True, env=worker_env, cwd=ROOT)
+        environments[phase] = worker_env
+    return environments
 
 
 def gpu_groups(devices, size):
@@ -105,6 +140,7 @@ def main():
                 "--limit-per-manifest", str(args.limit_per_manifest)]
         subprocess.run(plan, check=True, env=env, cwd=ROOT)
         # No implicit model download or in-place changes to training/evaluation environments.
+        environments = preflight_workers(args, env, output, phases)
         if "caption" in phases:
             subprocess.run([args.caption_python, "-c",
                             "from transformers import AutoModelForMultimodalLM, AutoProcessor, AutoConfig; "
@@ -112,7 +148,7 @@ def main():
                             f"p=json.loads(pathlib.Path({str(args.policy)!r}).read_text()); "
                             "[AutoConfig.from_pretrained(p[k],revision=p[k.replace('_model','_revision')],local_files_only=True) "
                             "for k in ('qwen_model','siglip_model')]; print(cached_snapshot_info(p))"],
-                           check=True, env=env)
+                           check=True, env=environments["caption"], cwd=ROOT)
         deadline = time.monotonic() + args.max_runtime_seconds if args.max_runtime_seconds else None
         for phase in phases:
             groups = quality_groups if phase == "quality" else caption_groups
@@ -121,7 +157,7 @@ def main():
             for rank, group in enumerate(groups):
                 command = [python, "-u", str(TOOL), "--phase", phase, *common, "--rank", str(rank),
                            "--vbench-cache", args.vbench_cache, "--vbench-repo", args.vbench_repo]
-                commands.append((command, dict(env, CUDA_VISIBLE_DEVICES=",".join(group)),
+                commands.append((command, dict(environments[phase], CUDA_VISIBLE_DEVICES=",".join(group)),
                                  output / "logs" / f"{phase}_{rank:03d}.log"))
             print(f"Starting {phase}: {len(groups)} workers; logs={output / 'logs'}", flush=True)
             code = run_group(commands, deadline=deadline)

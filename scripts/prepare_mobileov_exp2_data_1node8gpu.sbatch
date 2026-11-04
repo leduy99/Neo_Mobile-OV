@@ -42,8 +42,8 @@ if ! PYTHONPATH="${SCENE_LIB}:${ROOT}" "${QUALITY_PYTHON}" -c 'from scenedetect.
 fi
 flock -u 9
 export PYTHONPATH="${SCENE_LIB}:${ROOT}:${PYTHONPATH:-}"
-"${QUALITY_PYTHON}" -c 'import av, cv2, clip, pyiqa; from scenedetect.detectors import AdaptiveDetector; print("Quality dependencies ready")'
-"${CAPTION_PYTHON}" -c 'from transformers import AutoModelForMultimodalLM; print("Caption loader ready")'
+# The launcher supplies missing PyAV in per-interpreter runtime directories,
+# then checks both worker environments before starting the quality pass.
 
 set +e
 srun --ntasks=1 --gres=gpu:8 "${BASE_PYTHON}" -u tools/data_prepare/run_mobileov_exp2_data.py \
