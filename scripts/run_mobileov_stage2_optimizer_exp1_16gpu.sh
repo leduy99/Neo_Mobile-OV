@@ -2,21 +2,30 @@
 set -Eeuo pipefail
 trap 'rc=$?; echo "ERROR: line=${LINENO} command=${BASH_COMMAND} exit=${rc}" >&2; exit "$rc"' ERR
 cd "${PROJECT_ROOT:?}"
+export EXP1_NODES="${EXP1_NODES:-2}" EXP1_ACCUMULATION="${EXP1_ACCUMULATION:-4}"
+if [[ "${EXP1_NODES}:${EXP1_ACCUMULATION}" != 2:4 && "${EXP1_NODES}:${EXP1_ACCUMULATION}" != 1:8 ]]; then
+    echo "Exp 1 supports only 16 GPUs x4 or 8 GPUs x8; batch64 is unchanged." >&2; exit 1
+fi
 if [[ "${1:-}" == --node ]]; then
     ARGS=()
     if [[ -n "${RESUME:-}" ]]; then ARGS+=(--resume "${RESUME}"); fi
-    exec "${CONDA_ENV}/bin/torchrun" --nnodes=2 --nproc_per_node=8 \
+    exec "${CONDA_ENV}/bin/torchrun" --nnodes="${EXP1_NODES}" --nproc_per_node=8 \
         --node_rank="${SLURM_NODEID:?}" --master_addr="${MASTER_ADDR:?}" --master_port="${MASTER_PORT:?}" \
         --max_restarts=0 tools/train_mobileov_stage2_optimizer_exp1.py \
         --parent-resume "${PARENT_RESUME}" --config "${CONFIG:-configs/mobile_ov_neodragon.yaml}" \
         --data-root "${DATA_ROOT}" --output-dir "${OUT}" --steps 20000 --decay-steps 20000 \
-        --ema-decay .9995 --accumulation 4 --expected-parent-step 283977 \
+        --ema-decay .9995 --accumulation "${EXP1_ACCUMULATION}" --expected-parent-step 283977 \
         --save-every 2000 --evaluate-every 10000 --validate-every "${VALIDATE_EVERY:-2000}" \
         --validation-samples "${VALIDATION_SAMPLES:-1}" --workers "${WORKERS:-2}" \
         --max-runtime-seconds "${MAX_RUNTIME_SECONDS:-244800}" "${ARGS[@]}"
 fi
-if [[ "${SLURM_NNODES:-0}" != 2 ]]; then
-    echo "Exp 1 requires two nodes with eight GPUs each." >&2; exit 1
+if [[ "${SLURM_NNODES:-0}" != "${EXP1_NODES}" ]]; then
+    echo "Exp 1 requires ${EXP1_NODES} node(s) with eight GPUs each for this launcher." >&2; exit 1
+fi
+if [[ "${EXP1_NODES}" == 1 ]]; then
+    export EXP1_SUBMIT_SCRIPT=scripts/train_mobileov_stage2_optimizer_exp1_1node8gpu.sbatch
+else
+    export EXP1_SUBMIT_SCRIPT=scripts/train_mobileov_stage2_optimizer_exp1_2node16gpu.sbatch
 fi
 if [[ -n "${LR:-}" || -n "${STEPS:-}" || -n "${ACCUMULATION:-}" || -n "${INIT_STAGE2:-}" ]]; then
     echo "Exp 1 is pinned: epoch-3 Adam, 20K additional updates, batch64, 2e-5->0, EMA .9995." >&2; exit 1
@@ -44,12 +53,12 @@ else
 fi
 mkdir -p logs "${TMPDIR}"
 mapfile -t HOSTS < <(scontrol show hostnames "${SLURM_JOB_NODELIST:?}")
-if [[ "${#HOSTS[@]}" != 2 ]]; then echo "Expected two allocated hosts." >&2; exit 1; fi
+if [[ "${#HOSTS[@]}" != "${EXP1_NODES}" ]]; then echo "Allocated host count differs from launcher." >&2; exit 1; fi
 export MASTER_ADDR="${HOSTS[0]}" MASTER_PORT="$((20000 + SLURM_JOB_ID % 20000))"
-echo "Advisor Exp1: 16 GPUs x accumulation4 = global batch64; 20K additional updates; LR2e-5->0, no warmup."
+echo "Advisor Exp1: $((EXP1_NODES * 8)) GPUs x accumulation${EXP1_ACCUMULATION} = global batch64; 20K additional updates; LR2e-5->0, no warmup."
 echo "Original epoch3 Adam is preserved. No data, flow-loss or history-noise changes. OUT=${OUT}"
 echo "10K/20K RAW+EMA archives; latest inference=EMA. CPU FP32 EMA avoids another full DiT in GPU RAM."
-srun --nodes=2 --ntasks=2 --ntasks-per-node=1 --kill-on-bad-exit=1 \
+srun --nodes="${EXP1_NODES}" --ntasks="${EXP1_NODES}" --ntasks-per-node=1 --kill-on-bad-exit=1 \
     --cpus-per-task="${SLURM_CPUS_PER_TASK:-128}" \
     bash scripts/run_mobileov_stage2_optimizer_exp1_16gpu.sh --node
 if [[ -s "${OUT}/training_paused.json" && ! -e "${OUT}/training_complete.json" ]]; then
@@ -57,7 +66,7 @@ if [[ -s "${OUT}/training_paused.json" && ! -e "${OUT}/training_complete.json" ]
     test -s "${RESUME}"
     if [[ "${AUTO_CONTINUE}" == 1 ]]; then
         NEXT_JOB="$(sbatch --parsable --dependency="afterok:${SLURM_JOB_ID}" --export=ALL \
-            scripts/train_mobileov_stage2_optimizer_exp1_2node16gpu.sbatch)"
+            "${EXP1_SUBMIT_SCRIPT}")"
         printf '%s\n' "${NEXT_JOB}" >> "${OUT}/continuation_jobs.txt"
         echo "Queued ${NEXT_JOB}; same OUT, Adam/EMA/scheduler/RNG/dataset cursor."
     else

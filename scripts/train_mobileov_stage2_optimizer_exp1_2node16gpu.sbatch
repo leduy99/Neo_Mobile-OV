@@ -14,4 +14,6 @@
 set -Eeuo pipefail
 cd "${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:?Submit from the repo root}}"
 export PROJECT_ROOT="${PWD}"
+export EXP1_NODES=2 EXP1_ACCUMULATION=4
+export EXP1_SUBMIT_SCRIPT=scripts/train_mobileov_stage2_optimizer_exp1_2node16gpu.sbatch
 exec bash scripts/run_mobileov_stage2_optimizer_exp1_16gpu.sh

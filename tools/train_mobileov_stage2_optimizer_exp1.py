@@ -60,8 +60,8 @@ def parse_args(argv=None):
             args.validation_samples, args.log_every, args.expected_parent_step) < 1
             or args.decay_steps > args.steps or args.workers < 0 or args.max_runtime_seconds < 0):
         parser.error("Invalid budget, interval, worker count or runtime")
-    if args.accumulation != 4 or not 0 < args.ema_decay < 1:
-        parser.error("Exp 1 requires accumulation 4 and an EMA decay in (0,1)")
+    if args.accumulation not in (4, 8) or not 0 < args.ema_decay < 1:
+        parser.error("Exp 1 requires accumulation 4 (16 GPUs) or 8 (8 GPUs) and EMA decay in (0,1)")
     if args.integration_smoke:
         if args.steps > 10:
             parser.error("Integration smoke is limited to ten additional updates")
@@ -114,7 +114,7 @@ def save(args, ctx, modules, optimizer, ema, contract, update, *, archive):
         atomic_json(manifest_path, manifest)
     resume = dict(payload, format=exp1.FORMAT, optimizer=optimizer.state_dict(), ema=ema.state_dict(),
                   scheduler=dict(contract["lr_schedule"], completed_updates=update),
-                  sampler_cursor=origin + update * args.accumulation, rng_states=rng)
+                  sampler_cursor=exp1.media_cursor(contract, update), rng_states=rng)
     legacy.atomic_torch_save(resume, args.output_dir / "exp1_resume.pt")
     print(f"Saved Exp1 update={update}, Adam step={origin + update}, EMA updates={ema.updates}; "
           f"raw+EMA archive={archive}.", flush=True)
@@ -137,8 +137,8 @@ def validation(args, ctx, encoder, modules, vae, scheduler, dataset, ema, *, inc
 
 def train(args, ctx):
     launched = time.monotonic()
-    if not args.integration_smoke and ctx.world_size != 16:
-        raise ValueError("Production Exp 1 requires 16 GPUs, accumulation 4, global batch 64")
+    if not args.integration_smoke and (ctx.world_size, args.accumulation) not in ((16, 4), (8, 8)):
+        raise ValueError("Production Exp 1 requires 16 GPUs x4 or 8 GPUs x8; global batch 64")
     source = args.resume or args.parent_resume
     if args.resume is None and args.output_dir.resolve() == source.resolve().parent:
         raise ValueError("Use a separate Exp-1 output; never overwrite the epoch-3 run")
@@ -295,8 +295,8 @@ def train(args, ctx):
             means, counts = media.distributed_loss_means(losses, ctx)
             report = dict(step=args.expected_parent_step + update, exp1_update=update, lr=lr, ema_updates=update,
                 global_batch=ctx.world_size * args.accumulation,
-                sampler_cursor=args.expected_parent_step + update * args.accumulation,
-                original_media_epochs=(args.expected_parent_step + update * args.accumulation) / parent["media_epochs"]["steps_per_epoch"],
+                sampler_cursor=exp1.media_cursor(contract, update),
+                original_media_epochs=exp1.media_cursor(contract, update) / parent["media_epochs"]["steps_per_epoch"],
                 loss=means, valid_samples_in_update=counts, weighted_loss=scalar_mean(weighted, ctx),
                 grad_norm=scalar_mean(norm, ctx), component_grad_norm={k: scalar_mean(v, ctx) for k, v in norms.items()},
                 elapsed_seconds=time.monotonic() - launched, rank0_samples=observations, memory_by_rank=legacy.memory_report(ctx))

@@ -51,7 +51,8 @@ def test_fp32_ema_math_restore_and_swap_exception():
     same(model.state_dict(), raw)
 
 
-def test_grouped_batch64_preserves_exact_original_media_and_noise_ids(monkeypatch):
+@pytest.mark.parametrize("world_size,accumulation", [(16, 4), (8, 8)])
+def test_grouped_batch64_preserves_exact_original_media_and_noise_ids(monkeypatch, world_size, accumulation):
     old = media.MediaEpochPlan(984636, 529902, 8, 2)
     parent = dict(media_epochs=old.contract(), steps=old.steps)
 
@@ -66,13 +67,18 @@ def test_grouped_batch64_preserves_exact_original_media_and_noise_ids(monkeypatc
     plan = exp1.parent_plan(parent)
     assert plan.steps == 378636
     for update in (0, 9999, 19999):
-        for rank in range(16):
-            ds = exp1.GroupedMediaDataset("unused", parent=parent, rank=rank, world_size=16, start_update=update)
-            assert len(ds) == (20000 - update) * 4
-            for micro in range(4):
+        observed = []
+        for rank in range(world_size):
+            ds = exp1.GroupedMediaDataset("unused", parent=parent, rank=rank, world_size=world_size,
+                                         accumulation=accumulation, start_update=update)
+            assert len(ds) == (20000 - update) * accumulation
+            for micro in range(accumulation):
                 slot = ds[micro]
-                expected = plan.slot(old.steps + update * 4 + micro, rank // 8, rank % 8)
+                batch, position = divmod(micro * world_size + rank, old.global_batch)
+                expected = plan.slot(old.steps + update * 4 + batch, position // 8, position % 8)
                 assert slot == dict(expected, rng_rank=rank % 8)
+                observed.append((slot["micro"], slot["rng_rank"]))
+        assert len(observed) == len(set(observed)) == 64
     assert (old.steps + 20000 * 4) / old.steps_per_epoch == pytest.approx(3.8451399233)
 
 
@@ -156,23 +162,55 @@ def test_reject_inference_reset_wrong_source_and_missing_ema(training_environmen
         run_exp1(env, "paused")
 
 
+def test_original_gpu_count_with_eight_accumulations_pauses_and_resumes_exactly(training_environment, monkeypatch):
+    env = training_environment
+    monkeypatch.setattr(media.MediaEpochDataset, "sources", {}, raising=False)
+    parent = env.run("parent")  # Two original microsteps per old optimizer update.
+    extra = ["--expected-parent-step", "57", "--accumulation", "8"]
+    full = run_exp1(env, "eight_micro_full", extra)
+    paused = run_exp1(env, "eight_micro_paused", [*extra, "--stop-after", "2"])
+    run_exp1(env, "eight_micro_paused", [*extra, "--resume", str(paused / "exp1_resume.pt")])
+    a, b = [torch.load(out / "exp1_resume.pt", weights_only=True) for out in (full, paused)]
+    same(a, b)
+    assert a["sampler_cursor"] == 57 + 6 * 4  # Not 57 + 6 * accumulation8.
+    assert a["contract"]["optimizer_exp1"]["original_media_batches_consumed"] == 24
+    assert a["contract"]["media_epochs"]["end_media_cursor"] == 81
+    assert a["optimizer"]["param_groups"][0]["lr"] == 0
+    source = torch.load(parent / "stage2_resume.pt", weights_only=True)
+    assert max(state["step"].item() for state in source["optimizer"]["state"].values()) == 57
+
+
 def test_production_cli_is_explicit_and_pinned():
     args = trainer.parse_args(["--output-dir", "unused"])
     assert (args.steps, args.decay_steps, args.ema_decay, args.accumulation) == (20000, 20000, .9995, 4)
+    assert trainer.parse_args(["--output-dir", "unused", "--accumulation", "8"]).accumulation == 8
     for extra in (["--accumulation", "1"], ["--steps", "100000"], ["--ema-decay", "nan"],
                   ["--decay-steps", "10000"], ["--expected-parent-step", "473295"]):
         with pytest.raises(SystemExit):
             trainer.parse_args(["--output-dir", "unused", *extra])
 
 
-def test_new_contract_retains_learned_i2v_capabilities_without_fake_epoch_count():
+@pytest.mark.parametrize("world_size,accumulation", [(16, 4), (8, 8)])
+def test_new_contract_retains_learned_i2v_capabilities_without_fake_epoch_count(world_size, accumulation):
     from tools.infer_mobileov_stage1 import verify_i2v_request
     original = media.MediaEpochPlan(984636, 529902, 8, 2)
     parent = dict(steps=original.steps, media_epochs=original.contract())
-    contract = exp1.continuation_contract(parent, parent_sha256="a" * 64, world_size=16, accumulation=4,
+    contract = exp1.continuation_contract(parent, parent_sha256="a" * 64, world_size=world_size, accumulation=accumulation,
         total=20000, decay_steps=20000, ema_decay=.9995)
     args = SimpleNamespace(first_frame=Path("image.png"), reconstruct_image=None, validation_task=None,
                            frames=49, prompt="A car moves.", i2v_mode="anchor")
     verify_i2v_request(args, contract)
     assert contract["media_epochs"]["global_batch"] == 64 and "epochs" not in contract["media_epochs"]
     assert contract["media_epochs"]["end_media_cursor"] == 363977
+    assert contract["optimizer_exp1"]["original_media_batches_consumed"] == 80000
+    assert exp1.media_cursor(contract, 10000) == 323977
+    assert exp1.media_cursor(contract, 20000) == 363977
+
+
+@pytest.mark.parametrize("world_size,accumulation", [(8, 4), (16, 8), (4, 16)])
+def test_wrong_gpu_accumulation_pair_is_rejected(world_size, accumulation):
+    original = media.MediaEpochPlan(984636, 529902, 8, 2)
+    parent = dict(steps=original.steps, media_epochs=original.contract())
+    with pytest.raises(ValueError):
+        exp1.continuation_contract(parent, parent_sha256="a" * 64, world_size=world_size,
+            accumulation=accumulation, total=20000, decay_steps=20000, ema_decay=.9995)

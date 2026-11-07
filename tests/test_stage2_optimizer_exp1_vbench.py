@@ -28,9 +28,13 @@ def payload(update=10000, variant="ema"):
 
 
 @pytest.mark.parametrize("update,variant", [(10000, "raw"), (10000, "ema"), (20000, "raw"), (20000, "ema")])
-def test_snapshot_reader_requires_exact_raw_or_ema_and_never_uses_latest(tmp_path, update, variant):
+@pytest.mark.parametrize("world_size,accumulation", [(16, 4), (8, 8)])
+def test_snapshot_reader_requires_exact_raw_or_ema_and_never_uses_latest(tmp_path, update, variant,
+                                                                      world_size, accumulation):
     path = tmp_path / "snapshot.pt"
-    torch.save(payload(update, variant), path)
+    candidate = payload(update, variant)
+    candidate["contract"].update(world_size=world_size, accumulation=accumulation)
+    torch.save(candidate, path)
     before = runner.base.SYSTEM, runner.base.check_media_checkpoint
     with runner.case_policy(update, variant):
         value, digest, target = runner.base.read_checkpoint(path)
@@ -39,6 +43,14 @@ def test_snapshot_reader_requires_exact_raw_or_ema_and_never_uses_latest(tmp_pat
         with pytest.raises(ValueError, match="SHA256"):
             runner.base.read_checkpoint(path, expected_sha="0" * 64)
     assert before == (runner.base.SYSTEM, runner.base.check_media_checkpoint)
+
+
+@pytest.mark.parametrize("world_size,accumulation", [(8, 4), (16, 8), (4, 16)])
+def test_snapshot_reader_rejects_wrong_training_layout(world_size, accumulation):
+    candidate = payload()
+    candidate["contract"].update(world_size=world_size, accumulation=accumulation)
+    with pytest.raises(ValueError):
+        runner.check_checkpoint(candidate, 10000, "ema")
 
 
 @pytest.mark.parametrize("change", ["variant", "update", "ema", "batch", "history", "optimizer", "nan", "loss"])

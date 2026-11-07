@@ -55,11 +55,16 @@ class GroupedMediaDataset(torch.utils.data.Dataset):
     def __init__(self, root, *, parent, rank, world_size, accumulation=4, total=UPDATES,
                  start_update=0, short_side=320, long_side=512):
         old = parent["media_epochs"]
-        if world_size != old["global_batch"] or not 0 <= start_update < total:
-            raise ValueError("Use one original global batch per distributed microstep")
+        if (world_size not in (old["world_size"], old["global_batch"])
+                or world_size * accumulation != 4 * old["global_batch"]
+                or not 0 <= rank < world_size or not 0 <= start_update < total):
+            raise ValueError("Group four original batches per update using the original or doubled GPU count")
         self.total, self.start, self.accumulation = total, start_update, accumulation
         self.parent_accumulation = old["accumulation"]
-        self.virtual_micro, self.virtual_rank = divmod(rank, old["world_size"])
+        self.virtual_rank = rank % old["world_size"]
+        self.world_size, self.parent_world_size = world_size, old["world_size"]
+        self.microsteps_per_old_batch = old["global_batch"] // world_size
+        self.rank = rank
         self.plan = parent_plan(parent, total=total, global_batch=world_size * accumulation)
         self.original = media.MediaEpochDataset(root, plan=self.plan, rank=self.virtual_rank,
             start_step=parent["steps"], short_side=short_side, long_side=long_side)
@@ -71,8 +76,9 @@ class GroupedMediaDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         if not 0 <= index < len(self):
             raise IndexError(index)
-        old_offset = self.start * self.accumulation + index
-        sample = self.original[old_offset * self.parent_accumulation + self.virtual_micro]
+        old_offset, part = divmod(self.start * self.accumulation + index, self.microsteps_per_old_batch)
+        virtual_micro = (part * self.world_size + self.rank) // self.parent_world_size
+        sample = self.original[old_offset * self.parent_accumulation + virtual_micro]
         return dict(sample, rng_rank=sample.get("rng_rank", self.virtual_rank))
 
 
@@ -145,8 +151,10 @@ def ema_weights(modules, ema, ctx):
 
 def continuation_contract(parent, *, parent_sha256, world_size, accumulation, total, decay_steps, ema_decay):
     old = parent["media_epochs"]
-    if world_size != old["global_batch"] or accumulation != 4:
-        raise ValueError("Exp 1 groups four original batch-16 updates on sixteen GPUs")
+    if (world_size not in (old["world_size"], old["global_batch"])
+            or world_size * accumulation != 4 * old["global_batch"]):
+        raise ValueError("Exp 1 requires four original batches per update; use 16 GPUs x4 or 8 GPUs x8")
+    consumed_batches = total * 4
     contract = copy.deepcopy(parent)
     contract.update(scope=POLICY, parent_contract=copy.deepcopy(parent), parent_resume_sha256=parent_sha256,
         steps=parent["steps"] + total, world_size=world_size, accumulation=accumulation, warmup=0,
@@ -158,15 +166,20 @@ def continuation_contract(parent, *, parent_sha256, world_size, accumulation, to
             global_batch=world_size * accumulation, original_global_batch=old["global_batch"],
             updates_are="additional_optimizer_updates; not_original_media_steps",
             sampler="four_consecutive_original_global_batches_per_update; source_and_loss_weights_unchanged",
-            original_media_batches_consumed=total * accumulation,
+            original_media_batches_consumed=consumed_batches,
             media_presentations_including_zero_weight_padding=total * world_size * accumulation,
             bitwise_parent_continuation=False, default_inference_weights="ema"))
     # Keep the learned I2V routes discoverable without labelling 20K updates a full epoch.
     contract["media_epochs"] = dict(recipe="media_epochs_i2v_v1", continuation_policy=POLICY,
         global_batch=world_size * accumulation, video_modes=list(media.VIDEO_MODES),
         original_steps_per_epoch=old["steps_per_epoch"], start_media_cursor=parent["steps"],
-        end_media_cursor=parent["steps"] + total * accumulation, complete_media_passes=False)
+        end_media_cursor=parent["steps"] + consumed_batches, complete_media_passes=False)
     return contract
+
+
+def media_cursor(contract, update):
+    spec = contract["optimizer_exp1"]
+    return spec["parent_step"] + update * (spec["global_batch"] // spec["original_global_batch"])
 
 
 def validate_own_resume(saved, contract, *, parameters=None):
@@ -180,7 +193,7 @@ def validate_own_resume(saved, contract, *, parameters=None):
     schedule = contract["lr_schedule"]
     if saved.get("scheduler") != dict(schedule, completed_updates=count):
         raise ValueError("Missing or inconsistent LR scheduler state")
-    if saved.get("sampler_cursor") != origin + count * contract["accumulation"]:
+    if saved.get("sampler_cursor") != media_cursor(contract, count):
         raise ValueError("Missing or inconsistent dataset cursor")
     if saved.get("ema", {}).get("updates") != count or saved["ema"].get("decay") != contract["ema"]["decay"]:
         raise ValueError("Missing or inconsistent EMA state")

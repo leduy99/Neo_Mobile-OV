@@ -36,7 +36,7 @@ def check_checkpoint(payload, update, variant, *, allow_incomplete=False):
             or training.get("ema", {}).get("decay") != .9995
             or training.get("lr_schedule", {}).get("decay_steps") != 20000
             or training.get("parent_contract", {}).get("steps") != 283977
-            or training.get("world_size") != 16 or training.get("accumulation") != 4
+            or (training.get("world_size"), training.get("accumulation")) not in ((16, 4), (8, 8))
             or training.get("warmup") != 0 or training.get("lr") != 2e-5
             or training.get("auxiliary_reconstruction", {}).get("weight") != .1
             or any(key in training for key in ("history_corruption", "first_frame_focus", "lora_spec"))
