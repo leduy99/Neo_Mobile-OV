@@ -1,6 +1,7 @@
 from copy import deepcopy
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from tools import vbench_joint_native_protocol as protocol
 import test_stage2_media3epochs_dual_vbench as helpers
 import test_berzelius_vbench_launch as launch_helpers
 from test_berzelius_vbench_launch import launch, option
+from test_optimizer_exp1_archive_audit import write_training_run
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -97,8 +99,9 @@ def test_prepare_pins_manifest_hash_and_updates_sample_contract(tmp_path, monkey
 
 def test_sweep_summary_has_both_exports_and_three_scores(tmp_path):
     system = "stage2_exp1_ema_10000"
-    contract = dict(system=system)
-    values = dict(quality_score=.8, semantic_score=.6, total_score=.76)
+    contract = dict(system=system, exp1_evaluation=dict(weights="ema", additional_updates=10000))
+    values = dict(quality_score=.8, semantic_score=.6, total_score=.76,
+                  raw={name: .5 for name in runner.DIMENSIONS})
     scores = {variant: {system: values} for variant in runner.base.VARIANTS}
     child = tmp_path / "ema_10000"
     protocol.atomic_json(child / "quicksr_ablation.json", dict(status="complete", protocol=contract, scores=scores))
@@ -109,6 +112,10 @@ def test_sweep_summary_has_both_exports_and_three_scores(tmp_path):
     assert {row["output"] for row in rows} == {"quicksr", "no_quicksr"}
     assert rows[0]["quality_score"] == 80 and rows[0]["semantic_score"] == 60
     assert rows[0]["total_vs_parent_pp"] == pytest.approx(1.)
+    dimensions = protocol.read_json(tmp_path / "dimensions.json")["scores"]
+    assert set(dimensions) == {"quicksr", "no_quicksr"}
+    assert dimensions["quicksr"]["scene"] == {"Epoch-3 parent": 50., "EMA +10K": 50.}
+    assert "Epoch-3 parent (reused)" in (tmp_path / "comparison.md").read_text()
 
 
 def test_full_sweep_runs_four_cases_with_eight_workers_each(tmp_path, monkeypatch):
@@ -155,20 +162,38 @@ runner.main()
     assert "isolated-scores-ok" in result.stdout
 
 
-def test_eval_slurm_job_passes_explicit_run_and_both_milestones(launch, monkeypatch):
-    monkeypatch.setattr(launch_helpers, "SCRIPT", ROOT / "scripts/vbench_mobileov_stage2_optimizer_exp1_1node8gpu.sbatch")
+@pytest.mark.parametrize("pinned", [False, True])
+def test_eval_slurm_job_passes_explicit_run_and_both_milestones(launch, monkeypatch, pinned):
+    generic = "scripts/vbench_mobileov_stage2_optimizer_exp1_1node8gpu.sbatch"
+    script = "scripts/vbench_mobileov_optimizer_exp1_18162255_1node8gpu.sbatch" if pinned else generic
+    monkeypatch.setattr(launch_helpers, "SCRIPT", ROOT / script)
     root, env, run = launch
-    train = root / "train output"
-    protocol.atomic_json(train / "evaluation_checkpoints.json", {})
+    train = write_training_run(root / ("output/mobileov_stage2_optimizer_exp1/18162255" if pinned else "train output"))
+    (root / "tools").mkdir()
+    shutil.copyfile(ROOT / "tools/audit_mobileov_optimizer_exp1.py", root / "tools/audit_mobileov_optimizer_exp1.py")
+    shutil.copyfile(ROOT / generic, root / generic)
     python = Path(env["CONDA_ENV"]) / "bin/python"
-    python.write_text(f"#!{sys.executable}\n" + '''import json,os,pathlib,sys
+    python.write_text(f"#!{sys.executable}\n" + '''import json,os,pathlib,runpy,sys
 argv=sys.argv[1:]
+if argv[0] == 'tools/audit_mobileov_optimizer_exp1.py':
+    sys.argv = argv
+    runpy.run_path(argv[0], run_name='__main__')
+    raise SystemExit(0)
 pathlib.Path(os.environ['ARGV_LOG']).write_text(json.dumps(argv))
 out=pathlib.Path(argv[argv.index('--output-dir')+1]);out.mkdir(parents=True,exist_ok=True)
 (out/'comparison.md').write_text('mock Exp1 comparison')
 ''')
-    result, argv = run(EXP1_RUN=str(train))
+    result, argv = run() if pinned else run(EXP1_RUN=str(train))
     assert result.returncode == 0, result.stderr
-    assert option(argv, "--exp1-run") == str(train)
+    assert Path(option(argv, "--exp1-run")).name == train.name
     assert argv[argv.index("--updates") + 1:argv.index("--reference-run")] == ["10000", "20000"]
     assert option(argv, "--workers") == "8" and option(argv, "--samples-per-prompt") == "5"
+    receipt = protocol.read_json(root / option(argv, "--output-dir") / "training_audit.json")
+    assert receipt["training_world_size"] == 16 and len(receipt["archives"]) == 4
+    if pinned:
+        assert receipt["completion"]["exp1_update"] == 20000
+        assert option(argv, "--output-dir").endswith("optimizer_exp1_18162255_5x_dual")
+        (train / "training_complete.json").unlink()
+        Path(env["SETUP_LOG"]).unlink()
+        result, _ = run()
+        assert result.returncode != 0 and not Path(env["SETUP_LOG"]).exists()

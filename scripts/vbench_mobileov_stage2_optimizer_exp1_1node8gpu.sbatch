@@ -16,6 +16,7 @@ trap 'rc=$?; echo "ERROR: line=${LINENO} command=${BASH_COMMAND} exit=${rc}" >&2
 cd "${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:?Submit from the repo root}}"
 export ROOT="${PWD}"
 : "${EXP1_RUN:?Set EXP1_RUN to output/mobileov_stage2_optimizer_exp1/TRAIN_JOB_ID}"
+read -r -a UPDATES <<< "${EVAL_UPDATES:-10000 20000}"
 REFERENCE_RUN="${REFERENCE_RUN:-output/vbench_mobileov_stage2_media3epochs_5x_dual}"
 RUN_ROOT="${RUN_ROOT:-output/vbench_mobileov_stage2_optimizer_exp1_5x_dual}"
 module load buildenv-gcccuda/12.1.1-gcc12.3.0
@@ -29,13 +30,16 @@ export PYTHONPATH="${ROOT}:${VBENCH_REPO}:${PYTHONPATH:-}"
 export PYTHONNOUSERSITE=1 TOKENIZERS_PARALLELISM=false HF_HUB_DISABLE_XET=1
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 mkdir -p logs "${RUN_ROOT}" "${TMPDIR}" "${VBENCH_CACHE_DIR}" "$(dirname "${VBENCH_ENV}")"
-test -s "${EXP1_RUN}/evaluation_checkpoints.json"
+AUDIT_ARGS=()
+if [[ "${REQUIRE_EXP1_COMPLETE:-0}" == 1 ]]; then AUDIT_ARGS+=(--require-complete); fi
+if [[ -n "${EXPECTED_TRAIN_WORLD_SIZE:-}" ]]; then AUDIT_ARGS+=(--expected-world-size "${EXPECTED_TRAIN_WORLD_SIZE}"); fi
+"${CONDA_ENV}/bin/python" tools/audit_mobileov_optimizer_exp1.py --run "${EXP1_RUN}" \
+    --updates "${UPDATES[@]}" --output "${RUN_ROOT}/training_audit.json" "${AUDIT_ARGS[@]}"
 exec 9>"${VBENCH_ENV}.mobileov_setup.lock"
 flock 9
 bash scripts/install_vbench_env.sh
 flock -u 9
 exec 9>&-
-read -r -a UPDATES <<< "${EVAL_UPDATES:-10000 20000}"
 echo "Exp1 RAW+EMA checkpoint sweep; text only, no external anchor; shared raw/QuickSR frames."
 srun --ntasks=1 --gres=gpu:8 "${CONDA_ENV}/bin/python" -u tools/benchmark_mobileov_stage2_optimizer_exp1_dual.py \
     --exp1-run "${EXP1_RUN}" --updates "${UPDATES[@]}" --reference-run "${REFERENCE_RUN}" \

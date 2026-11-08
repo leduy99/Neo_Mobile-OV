@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
 import benchmark_mobileov_job_a_dual as previous
-from vbench_joint_native_protocol import atomic_json, bind_contract, fingerprint, output_lock, read_json, sha256
+from vbench_joint_native_protocol import DIMENSIONS, atomic_json, bind_contract, fingerprint, output_lock, read_json, sha256
 
 base = previous.base
 POLICY = "epoch3_adam_resume_batch64_linear_decay_ema_v1"
@@ -121,11 +121,16 @@ def summarize_sweep(args, cases, reference):
         "Matched text-only generation; no external anchor. Raw and QuickSR also differ in output resolution.", "",
         "| Setting | Output | Quality (%) | Semantic (%) | Total (%) | Total vs Parent (pp) |",
         "| --- | --- | ---: | ---: | ---: | ---: |"]
-    rows = []
+    rows, reports = [], []
+    for variant in ("no_quicksr", "quicksr"):
+        parent = reference[1]["scores"][variant][previous.PARENT_SYSTEM]
+        lines.append(f"| Epoch-3 parent (reused) | {variant} | "
+                     + " | ".join(f"{100 * parent[name]:.2f}" for name in METRICS) + " | +0.00 |")
     for folder, contract in cases:
         report = read_json(folder / "quicksr_ablation.json")
         if fingerprint(report.get("protocol")) != fingerprint(contract) or report.get("status") != "complete":
             raise ValueError("Incomplete or mismatched Exp-1 score report")
+        reports.append((contract, report))
         for variant in ("no_quicksr", "quicksr"):
             scores = report["scores"][variant][contract["system"]]
             parent = reference[1]["scores"][variant][previous.PARENT_SYSTEM]
@@ -136,6 +141,30 @@ def summarize_sweep(args, cases, reference):
             rows.append(dict(setting=contract["system"], output=variant,
                              **dict(zip(METRICS, values)), total_vs_parent_pp=difference))
             lines.append(f"| {contract['system']} | {variant} | " + " | ".join(f"{v:.2f}" for v in values) + f" | {difference:+.2f} |")
+    dimensions = ["# Optimizer Exp 1: All VBench Dimensions", "",
+                  "Epoch-3 scores are reused under the verified matched protocol. Dimension scores are raw VBench percentages.",
+                  "Raw vs QuickSR also changes output resolution; this is not SR at fixed resolution.", ""]
+    dimension_reports = {}
+    for variant in ("no_quicksr", "quicksr"):
+        labels = ["Epoch-3 parent"]
+        values = [reference[1]["scores"][variant][previous.PARENT_SYSTEM]]
+        for contract, report in reports:
+            setting = contract["exp1_evaluation"]
+            labels.append(f"{setting['weights'].upper()} +{setting['additional_updates'] // 1000}K")
+            values.append(report["scores"][variant][contract["system"]])
+        dimensions.extend([f"## {variant}", "", "| Score (%) | " + " | ".join(labels) + " |",
+                           "| --- | " + " | ".join("---:" for _ in labels) + " |"])
+        result = {}
+        for name in (*METRICS, *DIMENSIONS):
+            numbers = [100 * (score[name] if name in METRICS else score["raw"][name]) for score in values]
+            if not all(math.isfinite(value) for value in numbers):
+                raise ValueError(f"Non-finite Exp-1 dimension: {name}")
+            result[name] = dict(zip(labels, numbers))
+            dimensions.append(f"| {name} | " + " | ".join(f"{value:.2f}" for value in numbers) + " |")
+        dimensions.append("")
+        dimension_reports[variant] = result
+    atomic_json(args.output_dir / "dimensions.json", dict(status="complete", scores=dimension_reports))
+    (args.output_dir / "dimensions.md").write_text("\n".join(dimensions) + "\n", encoding="utf-8")
     atomic_json(args.output_dir / "comparison.json", dict(status="complete", rows=rows))
     (args.output_dir / "comparison.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
