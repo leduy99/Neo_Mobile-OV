@@ -43,8 +43,13 @@ def preflight_workers(args, env, output, phases):
         imports = ("import clip, pyiqa; from scenedetect.detectors import AdaptiveDetector"
                    if phase == "quality" else
                    "from transformers import AutoModelForMultimodalLM, AutoProcessor, AutoConfig")
-        # Import the actual reader in both environments, not just model loaders.
-        subprocess.run([python, "-c", "import tools.data_prepare.prepare_mobileov_exp2; " + imports
+        package_check = ("import tools; from pathlib import Path; "
+                         "origin = getattr(tools, '__file__', None); "
+                         f"assert origin and Path(origin).resolve() == Path({str(ROOT / 'tools/__init__.py')!r}), "
+                         "'Exp2 imported an unrelated tools package: ' + str(origin); "
+                         f"print('{phase}: repository tools:', origin, flush=True); ")
+        # Check the package origin and actual reader, not just third-party loaders.
+        subprocess.run([python, "-c", package_check + "import tools.data_prepare.prepare_mobileov_exp2; " + imports
                         + f'; print("{phase} reader and model imports ready")'],
                        check=True, env=worker_env, cwd=ROOT)
         environments[phase] = worker_env

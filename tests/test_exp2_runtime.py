@@ -74,6 +74,7 @@ def test_reader_imports_are_checked_in_both_worker_environments(tmp_path, monkey
     assert set(environments) == {"quality", "caption"}
     assert [kwargs["env"]["ROLE"] for _, kwargs in calls] == ["quality", "caption"]
     assert all("import tools.data_prepare.prepare_mobileov_exp2" in command[-1] for command, _ in calls)
+    assert all("Exp2 imported an unrelated tools package" in command[-1] for command, _ in calls)
 
 
 def test_quality_cannot_start_when_caption_preflight_fails(tmp_path, monkeypatch):
